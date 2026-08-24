@@ -1,0 +1,28 @@
+[package]
+name = "lsbx-backend-libvirt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel = { workspace = true }
+lsbx-backend-testkit = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+# Local libvirt bindings — see SPEC.md §9. Needs libvirt-dev/libvirt-devel
+# headers + a libvirt.pc on PKG_CONFIG_PATH to build (documented in this
+# crate's PR description; not available by default in a bare CI container
+# without installing the system package first).
+virt = "0.4.3"
+# Resolves the guest-SSH identity-file placeholder's home-directory
+# fallback (see `resolve_identity_file` in src/lib.rs) — used by both
+# source candidates for the same purpose.
+dirs = "6.0"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
