@@ -1,0 +1,36 @@
+[package]
+name = "lsbx-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel = { workspace = true }
+lsbx-store = { workspace = true }
+lsbx-golden = { workspace = true }
+lsbx-lifecycle = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Every one of this crate's own tests exercises `LsbxOps` against
+# `DemoBackend` — no libvirt headers or real infrastructure needed (see
+# this crate's own PR description for why `lsbx-backend-libvirt` is
+# deliberately never pulled into this crate's dependency graph, dev or
+# otherwise).
+lsbx-backend-demo = { workspace = true }
+tempfile = { workspace = true }
+# `FakeClock` is gated behind `#[cfg(any(test, feature = "testing"))]` in
+# lsbx-kernel — invisible to a downstream crate's own tests unless that
+# crate also turns the feature on for its dev-dependency edge (same reason
+# lsbx-lifecycle's own Cargo.toml does this). This crate's own reap test
+# needs a `FakeClock` to force a lease into the past deterministically.
+lsbx-kernel = { workspace = true, features = ["testing"] }
+# Used directly in tests/test_all_operations.rs's reap test to construct an
+# already-past RFC3339 timestamp for a directly-aged SandboxRecord.
+chrono = { workspace = true }
+
+[lints]
+workspace = true
