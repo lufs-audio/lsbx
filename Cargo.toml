@@ -3,6 +3,7 @@ members = [
     "crates/lsbx-kernel",
     "crates/lsbx-store",
     "crates/lsbx-keys",
+    "crates/lsbx-backend-testkit",
 ]
 resolver = "2"
 
@@ -18,6 +19,7 @@ repository = "https://github.com/lufs-audio/lsbx"
 lsbx-kernel = { path = "crates/lsbx-kernel" }
 lsbx-store = { path = "crates/lsbx-store" }
 lsbx-keys = { path = "crates/lsbx-keys" }
+lsbx-backend-testkit = { path = "crates/lsbx-backend-testkit" }
 
 # Async & Runtime
 tokio = { version = "1.43", features = ["full"] }
