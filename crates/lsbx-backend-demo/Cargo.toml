@@ -1,0 +1,21 @@
+[package]
+name = "lsbx-backend-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+sha2 = { workspace = true }
+hex = "0.4"
+
+[dev-dependencies]
+lsbx-backend-testkit = { path = "../lsbx-backend-testkit" }
+
+[lints]
+workspace = true
