@@ -3,7 +3,16 @@
 **Coordinator Pane:** `w7:p2` (Carnyx, Herdr workspace `w7`)  
 **Status:** PAUSED — model quota exhausted during Phase 3 fan-out. Jules cloud sessions preserved (see full session registry below). Zero active lsbx VMs. Zero pending snuze alarms.
 
-**Last updated:** After cleanup, a second script dispatched Jules sessions for all 13 previously-missing units. Units 02–09 succeeded fully; units 10 got 1/2 sessions created; units 12, 13, 16, 17, 18, 20 hit Jules concurrent session cap (FAILED_PRECONDITION) and still need sessions dispatched when cap clears.
+**Last updated:** After cleanup, a second script dispatched Jules sessions for all 13 previously-missing units. Units 02–09 succeeded fully; units 10 got 1/2 sessions created; units 12, 13, 16, 17, 18, 20 hit Jules concurrent session cap (FAILED_PRECONDITION). A rolling queue manager script (`~/Downloads/pi/jules-job-queue/jules-queue.py`) was then created and launched — it immediately dispatched 5 more sessions (units 10, 12×2, 13×2) and is continuing to roll through the remaining 8 queued jobs (units 16×2, 17×2, 18×2, 20×2) as Jules slots free up. All 20 units now have sessions either completed, in-progress, or queued in the rolling manager.
+
+### Rolling Queue Manager
+
+**Script:** `~/Downloads/pi/jules-job-queue/jules-queue.py`  
+**Queue file:** `~/Downloads/pi/jules-job-queue/queue.jsonl` (8 jobs remaining when last checked)  
+**Log file:** `~/Downloads/pi/jules-job-queue/jules-queue.log`  
+**PID:** Running in background on Carnyx (started at 2026-08-24T19:14:21Z, poll interval 45s)
+
+The script polls `jules remote list --session`, counts active sessions account-wide, and dispatches queued jobs up to the cap (15). It logs every STATUS check, DISPATCH, and DISPATCHED event with UTC timestamps. On resume, check if the process is still running (`pgrep -f jules-queue.py`) and inspect the log to see what fired.
 
 ---
 
@@ -135,25 +144,31 @@ defaults:
 | **09** | `11352793020615018169` | Queued | Dispatched by cleanup script |
 | **09** | `3506671044121175488` | Queued | Dispatched by cleanup script |
 | **10** | `7295021564164277501` | Queued | 1/2 created — second hit Jules cap |
-| **10** | *(missing)* | **NEEDS SESSION** | Jules concurrent cap hit; dispatch when cap clears |
+| **10** | `3970481168093992448` | Queued | Dispatched by jules-queue.py rolling manager |
 | **11** | `8316947393045505161` | In Progress | Unit 11 primary session |
 | **11** | `8966963252613110249` | In Progress | Unit 11 parallel session |
-| **12** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
-| **13** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
+| **12** | `14710042952481607452` | Queued | Dispatched by jules-queue.py rolling manager |
+| **12** | `12793693670302516452` | Queued | Dispatched by jules-queue.py rolling manager |
+| **13** | `5220785875413615865` | Queued | Dispatched by jules-queue.py rolling manager |
+| **13** | `12095828171266109296` | Queued | Dispatched by jules-queue.py rolling manager |
 | **14** | `14320737975867761183` | In Progress | Unit 14 primary session |
 | **14** | `12678483283444687143` | Planning | Unit 14 parallel session |
 | **15** | `11058924284088788058` | In Progress | Unit 15 primary session |
 | **15** | `8536988726104054070` | Planning | Unit 15 parallel session |
-| **16** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
-| **17** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
-| **18** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
+| **16** | `pending` | Queued | In jules-queue.py rolling queue |
+| **16** | `pending` | Queued | In jules-queue.py rolling queue |
+| **17** | `pending` | Queued | In jules-queue.py rolling queue |
+| **17** | `pending` | Queued | In jules-queue.py rolling queue |
+| **18** | `pending` | Queued | In jules-queue.py rolling queue |
+| **18** | `pending` | Queued | In jules-queue.py rolling queue |
 | **19** | `15006469986655575256` | In Progress | Unit 19 secondary session |
 | **19** | `18405219519005312023` | **COMPLETED** | Unit 19 — ready to pull immediately |
-| **20** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
+| **20** | `pending` | Queued | In jules-queue.py rolling queue |
+| `pending` | `pending` | Queued | In jules-queue.py rolling queue |
 
-**Units fully covered (sessions dispatched for both slots):** 01, 02, 03, 04, 05, 06, 07, 08, 09, 11, 14, 15, 19  
-**Units partially covered (1 session only):** 10  
-**Units with no sessions yet (need dispatch when Jules cap clears):** 12, 13, 16, 17, 18, 20
+**Units fully covered (sessions dispatched for both slots):** 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15, 19  
+**Units being managed by rolling queue (will auto-dispatch as slots free):** 16, 17, 18, 20  
+**Units with no sessions yet:** none — all 20 units are either completed, in-progress, or queued in the rolling manager.
 
 ### lufs-audio/snuze Sessions (previous project — reference only, do NOT pull into lsbx)
 
@@ -272,7 +287,7 @@ Sessions expected to complete within ~30–60 minutes of session creation (check
 
 ### Step 2: Dispatch Remaining Jules Sessions
 
-Units 02–09 are now covered (dispatched during cleanup). Only units 10 (needs 1 more), 12, 13, 16, 17, 18, and 20 still need sessions — all failed due to Jules concurrent session cap. Wait for existing sessions to complete and free up slots, then dispatch the remaining units:
+All remaining sessions are being managed automatically by the rolling queue manager (see below). No manual dispatch needed unless the queue manager has exited.
 
 ```bash
 # Example for Unit 02 (repeat for each missing unit, adjusting NN and slug):
@@ -293,15 +308,16 @@ Prompting Guardrails:
 Remaining units needing sessions (cap-blocked):
 | Unit | Contract file | Crate | Sessions needed |
 |------|--------------|-------|----------------|
-| 10 | `10-shared-operations-facade.md` | `lsbx-ops` | 1 more |
-| 12 | `12-ratatui-tui-dashboard-and-wizard.md` | `lsbx-tui` | 2 |
-| 13 | `13-axum-http-gateway.md` | `lsbx-gateway` | 2 |
 | 16 | `16-ci-broker-github-app-auth-and-repo-discovery.md` | `lsbx-broker` | 2 |
 | 17 | `17-ci-broker-queue-polling-and-label-matching.md` | `lsbx-broker` | 2 |
 | 18 | `18-ci-broker-job-vm-reconciliation.md` | `lsbx-broker` | 2 |
 | 20 | `20-workspace-manifest-ci-workflow-and-compat-fixtures.md` | workspace root | 2 |
 
-Use the same dispatch script from `/tmp/dispatch_all_units.py` (or re-run the one-liner loop from Step 2 targeting only these unit IDs) once `jules list` shows fewer concurrent active sessions.
+To manually re-queue any unit, add a line to `~/Downloads/pi/jules-job-queue/queue.jsonl` and the running queue manager will pick it up on next poll. Or restart the queue manager if it has exited:
+```bash
+cd ~/Downloads/pi/jules-job-queue
+python3 jules-queue.py --poll 45 &
+```
 
 ### Step 3: Fan-Out Builder Panes (Same-Tab, Split Layout)
 
