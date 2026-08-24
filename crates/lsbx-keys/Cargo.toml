@@ -1,0 +1,20 @@
+[package]
+name = "lsbx-keys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+tempfile = { workspace = true }
+# Not in [workspace.dependencies] (Unit 03 is the only consumer so far);
+# pinned to the 0.6 line to match the ed25519-dalek 2.x conversions this
+# crate relies on (`Ed25519Keypair::from(&SigningKey)` etc. — see keygen.rs).
+ssh-key = { version = "0.6", features = ["ed25519"] }
+
+[lints]
+workspace = true

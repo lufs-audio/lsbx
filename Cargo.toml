@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lsbx-kernel",
+    "crates/lsbx-keys",
 ]
 resolver = "2"
 
@@ -14,6 +15,7 @@ repository = "https://github.com/lufs-audio/lsbx"
 [workspace.dependencies]
 # Workspace crates
 lsbx-kernel = { path = "crates/lsbx-kernel" }
+lsbx-keys = { path = "crates/lsbx-keys" }
 
 # Async & Runtime
 tokio = { version = "1.43", features = ["full"] }
