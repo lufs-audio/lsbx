@@ -5,6 +5,7 @@ members = [
     "crates/lsbx-keys",
     "crates/lsbx-backend-testkit",
     "crates/lsbx-backend-demo",
+    "crates/lsbx-backend-exedev",
 ]
 resolver = "2"
 
@@ -22,6 +23,7 @@ lsbx-store = { path = "crates/lsbx-store" }
 lsbx-keys = { path = "crates/lsbx-keys" }
 lsbx-backend-testkit = { path = "crates/lsbx-backend-testkit" }
 lsbx-backend-demo = { path = "crates/lsbx-backend-demo" }
+lsbx-backend-exedev = { path = "crates/lsbx-backend-exedev" }
 
 # Async & Runtime
 tokio = { version = "1.43", features = ["full"] }

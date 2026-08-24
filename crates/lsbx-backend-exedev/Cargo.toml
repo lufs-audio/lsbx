@@ -1,0 +1,43 @@
+[package]
+name = "lsbx-backend-exedev"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel = { workspace = true }
+# Unit 07's own dependency line in SPEC.md's unit table reads "01, 04, 03
+# (key-comment convention only)" and this crate's own acceptance criterion
+# says orphaned-key reconciliation goes "via Unit 03's
+# `reconcile_orphaned_keys`" by name — Unit 03's own closing PR note
+# confirms this is the intended real dependency ("Units 06/07 ... each build
+# their own backend-specific TaggedKey listing and call this in their own
+# reap loops"), not just an informally-copied string convention.
+lsbx-keys = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Pure-Rust, Tokio-native SSH — see SPEC.md §9 for why this is preferred over
+# shelling out to `ssh`. Pinned to the 0.44 line (not the newer 0.6x major
+# available on crates.io at implementation time) because 0.44's API is the
+# one actually verified to compile against in this unit's own probe; jumping
+# to an unverified newer major on an AI-authored SSH client is exactly the
+# kind of thing SPEC.md §9's ed25519-dalek note warns against doing on faith.
+russh = "0.44"
+russh-keys = "0.44"
+
+[dev-dependencies]
+# `tokio` itself is already a normal [dependencies] entry (this crate's own
+# `src/` needs it, not just its tests), so it's available to
+# tests/test_auth_modes.rs's and tests/test_conformance.rs's `#[tokio::test]`
+# without a separate dev-dependency entry.
+lsbx-backend-testkit = { path = "../lsbx-backend-testkit" }
+
+[lints]
+workspace = true
