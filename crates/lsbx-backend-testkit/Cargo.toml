@@ -1,0 +1,22 @@
+[package]
+name = "lsbx-backend-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel = { workspace = true }
+# Only exercised by the fake `Backend` implementations in
+# tests/test_kit_self_check.rs — this crate's own src/ implements no
+# Backend itself (see the crate's Boundaries in the Unit 04 contract). Kept
+# under [dependencies] rather than [dev-dependencies] because this crate's
+# test binary is a separate compilation unit from its lib target, and a
+# dev-dependency is linked into every --all-targets target either way — the
+# distinction buys no real isolation here, only lint-order fragility.
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
