@@ -8,11 +8,26 @@
 ### Rolling Queue Manager
 
 **Script:** `~/Downloads/pi/jules-job-queue/jules-queue.py`  
-**Queue file:** `~/Downloads/pi/jules-job-queue/queue.jsonl` (8 jobs remaining when last checked)  
+**Queue file:** `~/Downloads/pi/jules-job-queue/queue.jsonl` (6 jobs remaining: units 17×2, 18×2, 20×2)  
 **Log file:** `~/Downloads/pi/jules-job-queue/jules-queue.log`  
-**PID:** Running in background on Carnyx (started at 2026-08-24T19:14:21Z, poll interval 45s)
+**PID file:** `~/Downloads/pi/jules-job-queue/queue.pid`  
+**Status:** Running via `nohup`, poll interval 45s. Cap-blocked dispatches are auto-requeued and retried. Units 10, 12×2, 13×2, 16×2 confirmed dispatched. Units 17, 18, 20 retrying as slots free.
 
-The script polls `jules remote list --session`, counts active sessions account-wide, and dispatches queued jobs up to the cap (15). It logs every STATUS check, DISPATCH, and DISPATCHED event with UTC timestamps. On resume, check if the process is still running (`pgrep -f jules-queue.py`) and inspect the log to see what fired.
+To check status at any time:
+```bash
+cat ~/Downloads/pi/jules-job-queue/queue.pid   # PID
+ps -p $(cat ~/Downloads/pi/jules-job-queue/queue.pid)  # is it alive?
+tail -20 ~/Downloads/pi/jules-job-queue/jules-queue.log  # recent activity
+wc -l ~/Downloads/pi/jules-job-queue/queue.jsonl  # jobs remaining
+```
+
+To restart if dead:
+```bash
+nohup python3 ~/Downloads/pi/jules-job-queue/jules-queue.py --poll 45 \
+  --log ~/Downloads/pi/jules-job-queue/jules-queue.log \
+  >> ~/Downloads/pi/jules-job-queue/nohup.out 2>&1 &
+echo $! > ~/Downloads/pi/jules-job-queue/queue.pid
+```
 
 ---
 
