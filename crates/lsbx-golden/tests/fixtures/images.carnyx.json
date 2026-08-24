@@ -1,0 +1,34 @@
+{
+  "images": [
+    {
+      "key": "lsbx-agent-v1",
+      "os": "linux",
+      "arch": "x86_64",
+      "iso_path": "/var/lib/lufs-sandbox/isos/lsbx-agent-v1.iso",
+      "description": "Carnyx-fleet agent base install image."
+    }
+  ],
+  "goldens": [
+    {
+      "key": "agent-base",
+      "flavor": "agent",
+      "os": "linux",
+      "base": "lsbx-agent-v1",
+      "mode": "copy",
+      "cpu": 2,
+      "memory": "2G",
+      "disk": null,
+      "streaming": "none",
+      "capabilities": [],
+      "healthcheck": ["test -f /etc/hostname"],
+      "repo": null,
+      "content_hash": null,
+      "description": "Base agent golden (images.carnyx.json variant)."
+    }
+  ],
+  "profiles": {
+    "agent-default": {
+      "golden": "agent-base"
+    }
+  }
+}
