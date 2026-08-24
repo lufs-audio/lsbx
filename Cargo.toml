@@ -9,6 +9,7 @@ members = [
     "crates/lsbx-backend-libvirt",
     "crates/lsbx-golden",
     "crates/lsbx-lifecycle",
+    "crates/lsbx-ops",
 ]
 resolver = "2"
 
@@ -30,6 +31,7 @@ lsbx-backend-exedev = { path = "crates/lsbx-backend-exedev" }
 lsbx-backend-libvirt = { path = "crates/lsbx-backend-libvirt" }
 lsbx-golden = { path = "crates/lsbx-golden" }
 lsbx-lifecycle = { path = "crates/lsbx-lifecycle" }
+lsbx-ops = { path = "crates/lsbx-ops" }
 
 # Async & Runtime
 tokio = { version = "1.43", features = ["full"] }
