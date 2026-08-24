@@ -7,12 +7,17 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-async-trait = { workspace = true }
-regex = { workspace = true }
-chrono = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
 
-[dev-dependencies]
-tokio = { workspace = true }
+[features]
+# Exposes test doubles (currently `clock::FakeClock`) to downstream crates'
+# own test code. Bare `#[cfg(test)]` only makes an item visible within this
+# crate's own tests, not to a dependent crate's tests — Unit 09's lease-expiry
+# tests need `FakeClock` from outside this crate, hence this feature.
+testing = []
+
+[lints]
+workspace = true
