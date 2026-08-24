@@ -1,0 +1,31 @@
+[package]
+name = "lsbx-lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel = { workspace = true }
+lsbx-store = { workspace = true }
+lsbx-keys = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `FakeClock` is gated behind `#[cfg(any(test, feature = "testing"))]` in
+# lsbx-kernel — invisible to a downstream crate's own tests unless that
+# crate also turns the feature on for its dev-dependency edge (bare
+# `#[cfg(test)]` only makes an item visible inside lsbx-kernel's own test
+# compilation, never to a dependent crate). Unit 09's own lease-expiry tests
+# construct a `FakeClock` from outside lsbx-kernel, hence this.
+lsbx-kernel = { workspace = true, features = ["testing"] }
+lsbx-backend-demo = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
