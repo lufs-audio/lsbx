@@ -1,7 +1,9 @@
 # All-Hands Checkpoint: lsbx Rust Rewrite
 **Date:** 2026-08-24  
 **Coordinator Pane:** `w7:p2` (Carnyx, Herdr workspace `w7`)  
-**Status:** PAUSED — model quota exhausted during Phase 3 fan-out. Jules cloud sessions preserved. Zero active lsbx VMs. Zero pending snuze alarms.
+**Status:** PAUSED — model quota exhausted during Phase 3 fan-out. Jules cloud sessions preserved (see full session registry below). Zero active lsbx VMs. Zero pending snuze alarms.
+
+**Last updated:** After cleanup, a second script dispatched Jules sessions for all 13 previously-missing units. Units 02–09 succeeded fully; units 10 got 1/2 sessions created; units 12, 13, 16, 17, 18, 20 hit Jules concurrent session cap (FAILED_PRECONDITION) and still need sessions dispatched when cap clears.
 
 ---
 
@@ -112,24 +114,46 @@ defaults:
 
 ### lufs-audio/lsbx Sessions (this project)
 
-| Unit | Session ID | Status | Notes |
-|------|-----------|--------|-------|
+| Unit | Session ID | Status at Checkpoint | Notes |
+|------|-----------|----------------------|-------|
 | **01** | `14622108228430678535` | In Progress | Orphaned session (short prompt) — use only as fallback |
 | **01** | `4930751401300752340` | In Progress | Primary Unit 01 session (full prompt with contract) |
+| **02** | `14660834679459844287` | Queued | Dispatched by cleanup script |
+| **02** | `8592869360312067092` | Queued | Dispatched by cleanup script |
+| **03** | `14240344095433919176` | Queued | Dispatched by cleanup script |
+| **03** | `10767391331729986746` | Queued | Dispatched by cleanup script |
+| **04** | `13395581159927621522` | Queued | Dispatched by cleanup script |
+| **04** | `11217053293692221412` | Queued | Dispatched by cleanup script |
+| **05** | `12064770904241601518` | Queued | Dispatched by cleanup script |
+| **05** | `12471402252077525735` | Queued | Dispatched by cleanup script |
+| **06** | `9041659912122881825` | Queued | Dispatched by cleanup script |
+| **06** | `10304284500134610529` | Queued | Dispatched by cleanup script |
 | **07** | `2148388395169262465` | In Progress | Unit 07 primary session |
 | **07** | `15704269077695342019` | In Progress | Unit 07 parallel session |
 | **08** | `5954891827529830623` | In Progress | Unit 08 primary session |
 | **08** | `9855640727537104102` | In Progress | Unit 08 parallel session |
+| **09** | `11352793020615018169` | Queued | Dispatched by cleanup script |
+| **09** | `3506671044121175488` | Queued | Dispatched by cleanup script |
+| **10** | `7295021564164277501` | Queued | 1/2 created — second hit Jules cap |
+| **10** | *(missing)* | **NEEDS SESSION** | Jules concurrent cap hit; dispatch when cap clears |
 | **11** | `8316947393045505161` | In Progress | Unit 11 primary session |
 | **11** | `8966963252613110249` | In Progress | Unit 11 parallel session |
+| **12** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
+| **13** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
 | **14** | `14320737975867761183` | In Progress | Unit 14 primary session |
 | **14** | `12678483283444687143` | Planning | Unit 14 parallel session |
 | **15** | `11058924284088788058` | In Progress | Unit 15 primary session |
 | **15** | `8536988726104054070` | Planning | Unit 15 parallel session |
+| **16** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
+| **17** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
+| **18** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
 | **19** | `15006469986655575256` | In Progress | Unit 19 secondary session |
 | **19** | `18405219519005312023` | **COMPLETED** | Unit 19 — ready to pull immediately |
+| **20** | *(none)* | **NEEDS 2 SESSIONS** | Jules cap hit; dispatch when cap clears |
 
-**Units with NO Jules sessions yet (02, 03, 04, 05, 06, 09, 10, 12, 13, 16, 17, 18, 20):** Builders shut down before dispatching Jules. These 13 units need fresh Jules sessions when re-fanning out.
+**Units fully covered (sessions dispatched for both slots):** 01, 02, 03, 04, 05, 06, 07, 08, 09, 11, 14, 15, 19  
+**Units partially covered (1 session only):** 10  
+**Units with no sessions yet (need dispatch when Jules cap clears):** 12, 13, 16, 17, 18, 20
 
 ### lufs-audio/snuze Sessions (previous project — reference only, do NOT pull into lsbx)
 
@@ -246,9 +270,9 @@ Sessions expected to complete within ~30–60 minutes of session creation (check
 - **Unit 15:** `11058924284088788058`, `8536988726104054070`
 - **Unit 19:** `15006469986655575256` (secondary)
 
-### Step 2: Dispatch Fresh Jules Sessions for Missing Units
+### Step 2: Dispatch Remaining Jules Sessions
 
-Units 02, 03, 04, 05, 06, 09, 10, 12, 13, 16, 17, 18, 20 have no Jules sessions yet. Dispatch 2 parallel sessions per unit using the contract file paths:
+Units 02–09 are now covered (dispatched during cleanup). Only units 10 (needs 1 more), 12, 13, 16, 17, 18, and 20 still need sessions — all failed due to Jules concurrent session cap. Wait for existing sessions to complete and free up slots, then dispatch the remaining units:
 
 ```bash
 # Example for Unit 02 (repeat for each missing unit, adjusting NN and slug):
@@ -266,22 +290,18 @@ Prompting Guardrails:
 5. Place all code under crates/<crate-name>/src/ and tests under crates/<crate-name>/tests/."
 ```
 
-Missing units and their contract filenames:
-| Unit | Contract file | Crate |
-|------|--------------|-------|
-| 02 | `02-atomic-state-store-and-lock-sentinels.md` | `lsbx-store` |
-| 03 | `03-ephemeral-ed25519-key-management.md` | `lsbx-keys` |
-| 04 | `04-backend-conformance-test-kit.md` | `lsbx-backend-testkit` |
-| 05 | `05-demo-mock-backend.md` | `lsbx-backend-demo` |
-| 06 | `06-local-and-remote-libvirt-backend.md` | `lsbx-backend-libvirt` |
-| 09 | `09-vm-lifecycle-orchestration-and-reaper.md` | `lsbx-lifecycle` |
-| 10 | `10-shared-operations-facade.md` | `lsbx-ops` |
-| 12 | `12-ratatui-tui-dashboard-and-wizard.md` | `lsbx-tui` |
-| 13 | `13-axum-http-gateway.md` | `lsbx-gateway` |
-| 16 | `16-ci-broker-github-app-auth-and-repo-discovery.md` | `lsbx-broker` |
-| 17 | `17-ci-broker-queue-polling-and-label-matching.md` | `lsbx-broker` |
-| 18 | `18-ci-broker-job-vm-reconciliation.md` | `lsbx-broker` |
-| 20 | `20-workspace-manifest-ci-workflow-and-compat-fixtures.md` | workspace root |
+Remaining units needing sessions (cap-blocked):
+| Unit | Contract file | Crate | Sessions needed |
+|------|--------------|-------|----------------|
+| 10 | `10-shared-operations-facade.md` | `lsbx-ops` | 1 more |
+| 12 | `12-ratatui-tui-dashboard-and-wizard.md` | `lsbx-tui` | 2 |
+| 13 | `13-axum-http-gateway.md` | `lsbx-gateway` | 2 |
+| 16 | `16-ci-broker-github-app-auth-and-repo-discovery.md` | `lsbx-broker` | 2 |
+| 17 | `17-ci-broker-queue-polling-and-label-matching.md` | `lsbx-broker` | 2 |
+| 18 | `18-ci-broker-job-vm-reconciliation.md` | `lsbx-broker` | 2 |
+| 20 | `20-workspace-manifest-ci-workflow-and-compat-fixtures.md` | workspace root | 2 |
+
+Use the same dispatch script from `/tmp/dispatch_all_units.py` (or re-run the one-liner loop from Step 2 targeting only these unit IDs) once `jules list` shows fewer concurrent active sessions.
 
 ### Step 3: Fan-Out Builder Panes (Same-Tab, Split Layout)
 
