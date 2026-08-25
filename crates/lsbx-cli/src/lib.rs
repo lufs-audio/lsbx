@@ -292,10 +292,15 @@ async fn connect_libvirt(state_dir: &std::path::Path) -> Result<LibvirtBackend, 
         .map(PathBuf::from)
         .unwrap_or_else(|_| state_dir.join("vms"));
 
+    let username = std::env::var("LSBX_LIBVIRT_USER")
+        .or_else(|_| std::env::var("LUFSS_LIBVIRT_USER"))
+        .unwrap_or_else(|_| "exedev".to_string());
+
     let backend = LibvirtBackend::connect(transport)
         .await?
         .with_images_dir(images_dir)
-        .with_work_dir(vm_dir);
+        .with_work_dir(vm_dir)
+        .with_guest_username(username);
     Ok(backend)
 }
 
@@ -1504,10 +1509,20 @@ async fn dispatch_ci_broker(args: &Cli, action: &CiBrokerCommand) -> Result<i32,
                 lsbx_broker::poll::PollConfig::from_queue_label_and_env(&queue_label_value);
 
             let github = build_github_client().await?;
+            let runner = lsbx_broker::reconcile::RunnerConfig::from_env(
+                match backend {
+                    BackendChoice::Libvirt => "libvirt",
+                    BackendChoice::Exedev => "exedev",
+                    BackendChoice::Demo => "demo",
+                    BackendChoice::Auto => "exedev",
+                },
+                &queue_label_value,
+            )?;
 
             let broker_config = lsbx_broker::reconcile::BrokerConfig {
                 poll: poll_config,
                 lease: DEFAULT_CI_BROKER_LEASE,
+                runner: Some(runner),
             };
 
             lsbx_broker::reconcile::run_broker(&job_store, &ops, &github, broker_config, None)
@@ -1523,8 +1538,12 @@ async fn dispatch_ci_broker(args: &Cli, action: &CiBrokerCommand) -> Result<i32,
 /// otherwise. See [`dispatch_ci_broker`]'s own doc comment for the full
 /// design writeup.
 async fn build_github_client() -> Result<lsbx_broker::github_client::GitHubClient, LsbxError> {
-    let app_id = std::env::var(GITHUB_APP_ID_ENV).ok();
-    let private_key_path = std::env::var(GITHUB_APP_PRIVATE_KEY_PATH_ENV).ok();
+    let app_id = std::env::var(GITHUB_APP_ID_ENV)
+        .or_else(|_| std::env::var("GITHUB_APP_ID"))
+        .ok();
+    let private_key_path = std::env::var(GITHUB_APP_PRIVATE_KEY_PATH_ENV)
+        .or_else(|_| std::env::var("GITHUB_APP_KEY"))
+        .ok();
 
     match (app_id, private_key_path) {
         (Some(app_id_str), Some(key_path)) => {
@@ -1539,6 +1558,7 @@ async fn build_github_client() -> Result<lsbx_broker::github_client::GitHubClien
                 ))
             })?;
             let installation_id = std::env::var(GITHUB_APP_INSTALLATION_ID_ENV)
+                .or_else(|_| std::env::var("GITHUB_INSTALLATION_ID"))
                 .ok()
                 .map(|s| {
                     s.parse::<u64>().map_err(|_| {
@@ -1548,13 +1568,15 @@ async fn build_github_client() -> Result<lsbx_broker::github_client::GitHubClien
                     })
                 })
                 .transpose()?;
-            let owner = std::env::var(GITHUB_APP_OWNER_ENV).map_err(|_| {
-                LsbxError::Usage(format!(
-                    "{GITHUB_APP_OWNER_ENV} is required when {GITHUB_APP_ID_ENV} and \
+            let owner = std::env::var(GITHUB_APP_OWNER_ENV)
+                .or_else(|_| std::env::var("GITHUB_OWNER"))
+                .map_err(|_| {
+                    LsbxError::Usage(format!(
+                        "{GITHUB_APP_OWNER_ENV} is required when {GITHUB_APP_ID_ENV} and \
                      {GITHUB_APP_PRIVATE_KEY_PATH_ENV} are set (the installation-token \
                      exchange is scoped per-owner)"
-                ))
-            })?;
+                    ))
+                })?;
 
             let auth = lsbx_broker::auth::GitHubAppAuth::new(lsbx_broker::auth::GitHubAppConfig {
                 app_id,

@@ -19,6 +19,7 @@ fn test_fallback_delay() {
         job_id: 1,
         run_id: 1,
         repository: "foo/bar".to_string(),
+        name: None,
         labels: vec![FALLBACK_QUEUE_LABEL.to_string()],
         created_at: Some((now_chrono - ChronoDuration::seconds(30)).to_rfc3339()),
     };
@@ -27,6 +28,7 @@ fn test_fallback_delay() {
         job_id: 2,
         run_id: 1,
         repository: "foo/bar".to_string(),
+        name: None,
         labels: vec![FALLBACK_QUEUE_LABEL.to_string()],
         created_at: Some((now_chrono - ChronoDuration::seconds(65)).to_rfc3339()),
     };
@@ -46,6 +48,7 @@ fn test_fallback_delay() {
         job_id: 3,
         run_id: 1,
         repository: "foo/bar".to_string(),
+        name: None,
         labels: vec![FALLBACK_QUEUE_LABEL.to_string()],
         created_at: Some((now_chrono - ChronoDuration::seconds(60)).to_rfc3339()),
     };

@@ -76,12 +76,14 @@ impl CiJobStore {
 
     pub fn save(&self, record: &CiJobRecord) -> Result<(), LsbxError> {
         let store_dir = self.store_dir();
-        fs::create_dir_all(&store_dir).map_err(|e| map_io_err("failed to create ci-broker dir", e))?;
+        fs::create_dir_all(&store_dir)
+            .map_err(|e| map_io_err("failed to create ci-broker dir", e))?;
         let mut perms = fs::metadata(&store_dir)
             .map_err(|e| map_io_err("failed to stat ci-broker dir", e))?
             .permissions();
         perms.set_mode(0o700);
-        fs::set_permissions(&store_dir, perms).map_err(|e| map_io_err("failed to chmod ci-broker dir", e))?;
+        fs::set_permissions(&store_dir, perms)
+            .map_err(|e| map_io_err("failed to chmod ci-broker dir", e))?;
 
         let dest_path = store_dir.join(format!("{}.json", record.job_id));
         let mut temp_file = NamedTempFile::new_in(&store_dir)
@@ -106,9 +108,9 @@ impl CiJobStore {
             .set_permissions(perms)
             .map_err(|e| map_io_err("failed to chmod temp file", e))?;
 
-        temp_file
-            .persist(&dest_path)
-            .map_err(|e| LsbxError::ContractViolated(format!("failed to atomically rename into place: {}", e)))?;
+        temp_file.persist(&dest_path).map_err(|e| {
+            LsbxError::ContractViolated(format!("failed to atomically rename into place: {}", e))
+        })?;
         Ok(())
     }
 
@@ -132,7 +134,9 @@ impl CiJobStore {
         }
 
         let mut records = Vec::new();
-        for entry in fs::read_dir(&store_dir).map_err(|e| map_io_err("failed to read ci-broker dir", e))? {
+        for entry in
+            fs::read_dir(&store_dir).map_err(|e| map_io_err("failed to read ci-broker dir", e))?
+        {
             let entry = entry.map_err(|e| map_io_err("failed to read ci-broker dir entry", e))?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
@@ -147,10 +151,36 @@ impl CiJobStore {
         Ok(records)
     }
 
-    /// `<state_dir>/ci-broker.lock`, built from `LockSentinel::try_acquire`
+    /// Removes a terminal or successfully-cleaned job record. Missing files
+    /// are treated as already cleaned, making broker cleanup idempotent.
+    pub fn delete(&self, job_id: &str) -> Result<(), LsbxError> {
+        match fs::remove_file(self.record_path(job_id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(map_io_err("failed to delete ci job record", e)),
+        }
+    }
+
     /// — not a second hand-rolled mechanism. This is the point of the unit.
     pub fn broker_lock(&self) -> Result<LockGuard, LsbxError> {
-        fs::create_dir_all(&self.state_dir).map_err(|e| map_io_err("failed to create state dir", e))?;
-        LockSentinel::try_acquire(&self.state_dir.join("ci-broker.lock"))
+        fs::create_dir_all(&self.state_dir)
+            .map_err(|e| map_io_err("failed to create state dir", e))?;
+        let lock_path = self.state_dir.join("ci-broker.lock");
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| map_io_err("failed to create ci-broker lock", e))?;
+        {
+            let metadata = fs::metadata(&lock_path)
+                .map_err(|e| map_io_err("failed to stat ci-broker lock", e))?;
+            let mut permissions = metadata.permissions();
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o600);
+            fs::set_permissions(&lock_path, permissions)
+                .map_err(|e| map_io_err("failed to chmod ci-broker lock", e))?;
+        }
+        LockSentinel::try_acquire(&lock_path)
     }
 }

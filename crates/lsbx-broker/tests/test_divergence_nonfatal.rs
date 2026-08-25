@@ -38,6 +38,7 @@ fn sample_job() -> QueuedJob {
         job_id: 111,
         run_id: 555,
         repository: "lufs-audio/lsbx".to_string(),
+        name: None,
         labels: vec!["lsbx-default".to_string()],
         created_at: Some(chrono::Utc::now().to_rfc3339()),
     }
@@ -140,9 +141,15 @@ async fn check_divergence_sets_diverged_true_and_returns_ok_on_mismatch() {
     let result = reconciler.check_divergence(&mut record).await;
 
     // Divergence is never fatal: the call itself must succeed.
-    assert!(result.is_ok(), "check_divergence must return Ok even on a divergence finding");
+    assert!(
+        result.is_ok(),
+        "check_divergence must return Ok even on a divergence finding"
+    );
 
-    assert!(record.diverged, "diverged must be set true when GitHub's actual job_for_runner differs");
+    assert!(
+        record.diverged,
+        "diverged must be set true when GitHub's actual job_for_runner differs"
+    );
     assert_eq!(record.actual_job_id, Some(actual_job_id.to_string()));
 
     // The record must still be loadable afterward (process keeps running,
@@ -163,7 +170,14 @@ async fn check_divergence_leaves_diverged_false_when_job_ids_match() {
 
     // GitHub reports the runner assigned to the SAME job_id lsbx dispatched
     // for — no divergence.
-    mock_job_for_runner_response(&server, "lufs-audio/lsbx", 777, dispatched_job_id, runner_name).await;
+    mock_job_for_runner_response(
+        &server,
+        "lufs-audio/lsbx",
+        777,
+        dispatched_job_id,
+        runner_name,
+    )
+    .await;
 
     let github = GitHubClient::from_installation_token_with_base_uri(
         "fake-installation-token".to_string(),

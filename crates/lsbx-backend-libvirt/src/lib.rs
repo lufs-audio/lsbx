@@ -21,10 +21,22 @@ use lsbx_kernel::backend::{
     Backend, BackendCapabilities, CommandOutput, CreateFromGoldenRequest, CreatedVm,
 };
 use lsbx_kernel::error::LsbxError;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use transport::LibvirtTransport;
 use virt::connect::Connect;
 use virt::domain::Domain;
 use virt::error::{Error as VirtError, ErrorNumber};
+
+/// Compiled regex for parsing `virsh domifaddr` output — captures the IPv4
+/// address from lines like `1:  eth0      ipv4  192.168.122.100/24`.
+fn domifaddr_ipv4_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        #[allow(clippy::unwrap_used)]
+        regex::Regex::new(r"ipv4\s+([0-9.]+)/").unwrap()
+    })
+}
 
 /// How a new VM's disk relates to its golden's qcow2 — mirrors Unit 08's
 /// (not-yet-built) `GoldenMode::Copy | New` exactly, so the eventual
@@ -84,6 +96,10 @@ pub struct LibvirtBackend {
     vm_disks: VmDiskConfig,
     disk_mode: DiskMode,
     guest_username: String,
+    /// Per-sandbox guest SSH identities registered by the lifecycle layer.
+    /// The persisted SandboxRecord remains the restart-safe source of truth;
+    /// this map is only the backend's process-local lookup cache.
+    vm_key_paths: Arc<Mutex<HashMap<String, std::path::PathBuf>>>,
 }
 
 /// A libvirt `ErrorNumber` that means "the domain you asked about does not
@@ -134,7 +150,8 @@ impl LibvirtBackend {
                 work_dir: std::path::PathBuf::from("/var/lib/lsbx/vms"),
             },
             disk_mode: DiskMode::default(),
-            guest_username: "lsbx".to_string(),
+            guest_username: "exedev".to_string(),
+            vm_key_paths: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -169,7 +186,7 @@ impl LibvirtBackend {
     }
 
     /// Sets the guest OS username used for `run`/`put_file`/`get_file`
-    /// (default `"lsbx"`, matching the existing system's convention).
+    /// (default `"exedev"`, matching the Carnyx goldens and Python backend).
     #[must_use]
     pub fn with_guest_username(mut self, username: impl Into<String>) -> Self {
         self.guest_username = username.into();
@@ -185,27 +202,195 @@ impl LibvirtBackend {
         &self.transport
     }
 
-    /// Resolves the guest hostname/IP `run`/`put_file`/`get_file` should
-    /// target for a given `vm_tag`.
+    /// Resolves the guest hostname/IP for a given `vm_tag` by polling
+    /// `virsh domifaddr` — first via the QEMU guest agent, then via
+    /// the DHCP lease source. This matches the Python reference
+    /// implementation's `_wait_for_ip()` pattern.
     ///
-    /// This backend uses `vm_tag` itself as the SSH hostname/IP — i.e. the
-    /// caller (eventually `lsbx-lifecycle`, Unit 09) is expected to hand
-    /// `create_from_golden` a `name` that already resolves to the guest's
-    /// address (a DHCP-registered hostname on the libvirt `default`
-    /// network, a static IP baked into the golden, etc.), rather than this
-    /// crate performing its own DHCP-lease-to-IP lookup via
-    /// `virConnectListAllInterfaces`-style APIs. Doing real lease-lookup
-    /// integration is a reasonable follow-up but is judged out of scope
-    /// here — flagged in the PR description alongside the pubkey/cloud-init
-    /// gap, since both are instances of the same underlying question
-    /// ("how does this backend learn a guest's real network identity")
-    /// that a fuller implementation would need to answer once.
-    fn guest_host_for(&self, vm_tag: &str) -> String {
-        vm_tag.to_string()
+    /// Requires the QEMU guest agent channel in the domain XML
+    /// (`org.qemu.guest_agent.0`) for the `--source agent` path to work.
+    /// Falls back to `--source lease` if the agent isn't available yet.
+    async fn guest_host_for(&self, vm_tag: &str) -> Result<String, LsbxError> {
+        let timeout = std::time::Duration::from_secs(180);
+        let interval = std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + timeout;
+
+        let ipv4_re = domifaddr_ipv4_regex();
+
+        while std::time::Instant::now() < deadline {
+            for source in &["agent", "lease"] {
+                let output = self
+                    .run_virsh(&["domifaddr", vm_tag, "--source", source])
+                    .await;
+                if let Ok(out) = output {
+                    if let Some(caps) = ipv4_re.captures(&out) {
+                        return Ok(caps[1].to_string());
+                    }
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+
+        Err(LsbxError::BackendUnavailable(format!(
+            "guest {vm_tag} did not obtain an IP within {timeout:?}"
+        )))
+    }
+
+    /// Runs a virsh command against this backend's connection, returning
+    /// the combined stdout as a `String`. Error messages are logged but
+    /// not surfaced as hard errors — callers like `guest_host_for` try
+    /// multiple sources and treat failure as "try the next one."
+    async fn run_virsh(&self, args: &[&str]) -> Result<String, LsbxError> {
+        let uri = self.transport.to_connect_uri();
+        let virsh_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let uri_str = uri.clone();
+
+        let output = tokio::task::spawn_blocking(move || {
+            let mut full_args = vec![];
+            if !uri_str.is_empty() && uri_str != "qemu:///system" {
+                full_args.push(format!("--connect={uri_str}"));
+            }
+            full_args.extend(virsh_args);
+
+            std::process::Command::new("virsh")
+                .args(&full_args)
+                .stdin(std::process::Stdio::null())
+                .output()
+        })
+        .await
+        .map_err(|e| LsbxError::BackendUnavailable(format!("virsh task panicked: {e}")))?
+        .map_err(|e| LsbxError::BackendUnavailable(format!("virsh exec failed: {e}")))?;
+
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(LsbxError::BackendUnavailable(format!(
+                "virsh {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )))
+        }
     }
 
     fn lookup_domain(&self, vm_tag: &str) -> Result<Domain, LsbxError> {
         Domain::lookup_by_name(&self.conn, vm_tag).map_err(map_virt_err)
+    }
+
+    /// Creates a cloud-init seed ISO for the given VM name and public key.
+    ///
+    /// Matches the Python reference's `_seed_iso` path: writes `user-data`
+    /// (cloud-init YAML with SSH pubkey + user config) and `meta-data`
+    /// (instance-id + hostname) into a temp directory, then calls xorriso
+    /// in mkisofs mode to produce a FAT9660 `cidata` ISO.
+    ///
+    /// The ISO is placed in the VM work directory and its path is returned
+    /// so the caller can reference it in the domain XML and clean it up on
+    /// destroy.
+    async fn create_seed_iso(
+        &self,
+        vm_name: &str,
+        pubkey: &str,
+    ) -> Result<std::path::PathBuf, LsbxError> {
+        let seed_iso_path = self.vm_disks.work_dir.join(format!("{vm_name}-seed.iso"));
+        let user_data = format!(
+            "#cloud-config\n\
+             users:\n\
+             \x20 - name: {username}\n\
+             \x20 \x20 sudo: ALL=(ALL) NOPASSWD:ALL\n\
+             \x20 \x20 shell: /bin/bash\n\
+             \x20 \x20 ssh_authorized_keys:\n\
+             \x20 \x20 \x20 - {pubkey}\n\
+             ssh_pwauth: false\n",
+            username = self.guest_username,
+            pubkey = pubkey.trim(),
+        );
+        let meta_data = format!(
+            "instance-id: {vm_name}\n\
+             local-hostname: {vm_name}\n"
+        );
+
+        let seed_dir = tempfile::Builder::new()
+            .prefix("lsbx-seed-")
+            .tempdir_in(&self.vm_disks.work_dir)
+            .map_err(|e| {
+                LsbxError::BackendUnavailable(format!(
+                    "failed to create seed directory in '{}': {e}",
+                    self.vm_disks.work_dir.display()
+                ))
+            })?;
+        let seed_dir_path = seed_dir.path().to_path_buf();
+        std::fs::write(seed_dir.path().join("user-data"), &user_data).map_err(|e| {
+            LsbxError::BackendUnavailable(format!("failed to write user-data: {e}"))
+        })?;
+        std::fs::write(seed_dir.path().join("meta-data"), &meta_data).map_err(|e| {
+            LsbxError::BackendUnavailable(format!("failed to write meta-data: {e}"))
+        })?;
+
+        let seed_dir_clone = seed_dir_path.clone();
+        let seed_iso_clone = seed_iso_path.clone();
+        let configured_tool = std::env::var("LSBX_LIBVIRT_SEED_TOOL")
+            .or_else(|_| std::env::var("LUFSS_LIBVIRT_SEED_TOOL"))
+            .ok();
+        let seed_tool = configured_tool
+            .into_iter()
+            .chain([
+                "cloud-localds".to_string(),
+                "genisoimage".to_string(),
+                "xorriso".to_string(),
+                "mkisofs".to_string(),
+            ])
+            .find(|candidate| {
+                std::process::Command::new(candidate)
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok()
+            })
+            .ok_or_else(|| {
+                LsbxError::BackendUnavailable(
+                    "no cloud-init seed tool found (tried cloud-localds, genisoimage, xorriso, mkisofs)"
+                        .to_string(),
+                )
+            })?;
+        let seed_tool_name = seed_tool.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            let mut command = std::process::Command::new(&seed_tool);
+            if seed_tool == "cloud-localds" {
+                command
+                    .arg(&seed_iso_clone)
+                    .arg(seed_dir_clone.join("user-data"))
+                    .arg(seed_dir_clone.join("meta-data"));
+            } else if seed_tool == "xorriso" {
+                command
+                    .args(["-as", "mkisofs", "-o"])
+                    .arg(&seed_iso_clone)
+                    .args(["-V", "cidata", "-J", "-R"])
+                    .arg(&seed_dir_clone);
+            } else {
+                command
+                    .args(["-o"])
+                    .arg(&seed_iso_clone)
+                    .args(["-V", "cidata", "-J", "-R"])
+                    .arg(&seed_dir_clone);
+            }
+            command.stdin(std::process::Stdio::null()).output()
+        })
+        .await
+        .map_err(|e| LsbxError::BackendUnavailable(format!("xorriso task panicked: {e}")))?
+        .map_err(|e| LsbxError::BackendUnavailable(format!("xorriso exec failed: {e}")))?;
+
+        // `TempDir` removes the staging directory on every path, including
+        // xorriso failure; the generated ISO remains until destroy.
+
+        if !output.status.success() {
+            return Err(LsbxError::BackendUnavailable(format!(
+                "libvirt seed tool '{seed_tool_name}' failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        Ok(seed_iso_path)
     }
 }
 
@@ -250,12 +435,18 @@ impl Backend for LibvirtBackend {
             }
         }
 
+        // Create cloud-init seed ISO (matching Python's `_seed_iso` path).
+        // Uses xorriso in mkisofs mode to produce a FAT9660 cidata ISO
+        // containing user-data (SSH pubkey + user config) and meta-data.
+        let seed_iso_path = self.create_seed_iso(req.name, req.pubkey).await?;
+
         let xml = domain_xml::render_domain_xml(
             &domain_xml::DomainXmlParams {
                 name: req.name,
                 cpu: req.cpu,
                 memory: req.memory,
                 disk_path: &vm_disk_path,
+                seed_iso: Some(&seed_iso_path),
             },
             req.pubkey,
         )?;
@@ -272,14 +463,6 @@ impl Backend for LibvirtBackend {
         Ok(CreatedVm {
             vm_tag,
             host,
-            // This backend's console capability is real (libvirt exposes a
-            // VNC graphics device on every domain this crate creates — see
-            // `domain_xml::render_domain_xml`), but rendering that into an
-            // actual reachable `https_url` is Unit 14's job (the
-            // WebSocket/noVNC proxy sits in front of the raw VNC port this
-            // backend exposes) — this backend has no HTTP server of its
-            // own to mint that URL from. Left `None` here rather than
-            // fabricating a URL this crate can't actually serve.
             https_url: None,
         })
     }
@@ -306,11 +489,17 @@ impl Backend for LibvirtBackend {
         // yet".
         self.lookup_domain(vm_tag)?;
 
-        let identity_file = self.identity_file_placeholder();
+        let resolved_identity = self
+            .vm_key_paths
+            .lock()
+            .ok()
+            .and_then(|keys| keys.get(vm_tag).cloned())
+            .unwrap_or_else(|| self.identity_file_placeholder());
+        let host = self.guest_host_for(vm_tag).await?;
         let target = guest_ssh::GuestSshTarget {
-            host: &self.guest_host_for(vm_tag),
+            host: &host,
             username: &self.guest_username,
-            identity_file: &identity_file,
+            identity_file: &resolved_identity,
         };
         guest_ssh::run_command(&target, command, timeout).await
     }
@@ -322,11 +511,17 @@ impl Backend for LibvirtBackend {
         destination: &str,
     ) -> Result<(), LsbxError> {
         self.lookup_domain(vm_tag)?;
-        let identity_file = self.identity_file_placeholder();
+        let resolved_identity = self
+            .vm_key_paths
+            .lock()
+            .ok()
+            .and_then(|keys| keys.get(vm_tag).cloned())
+            .unwrap_or_else(|| self.identity_file_placeholder());
+        let host = self.guest_host_for(vm_tag).await?;
         let target = guest_ssh::GuestSshTarget {
-            host: &self.guest_host_for(vm_tag),
+            host: &host,
             username: &self.guest_username,
-            identity_file: &identity_file,
+            identity_file: &resolved_identity,
         };
         guest_ssh::put_file(&target, source, destination).await
     }
@@ -338,11 +533,17 @@ impl Backend for LibvirtBackend {
         destination: &std::path::Path,
     ) -> Result<(), LsbxError> {
         self.lookup_domain(vm_tag)?;
-        let identity_file = self.identity_file_placeholder();
+        let resolved_identity = self
+            .vm_key_paths
+            .lock()
+            .ok()
+            .and_then(|keys| keys.get(vm_tag).cloned())
+            .unwrap_or_else(|| self.identity_file_placeholder());
+        let host = self.guest_host_for(vm_tag).await?;
         let target = guest_ssh::GuestSshTarget {
-            host: &self.guest_host_for(vm_tag),
+            host: &host,
             username: &self.guest_username,
-            identity_file: &identity_file,
+            identity_file: &resolved_identity,
         };
         guest_ssh::get_file(&target, source, destination).await
     }
@@ -351,16 +552,38 @@ impl Backend for LibvirtBackend {
         let domain = self.lookup_domain(vm_tag)?;
         domain.destroy().map_err(map_virt_err)?;
 
-        // Best-effort cleanup of the per-VM working disk this backend
-        // created in `create_from_golden`. A failure here is deliberately
-        // not surfaced as an error: the domain is already gone (the part
-        // this method's contract is actually about), and the conformance
-        // suite's `destroy_idempotent` check requires a *second* destroy
-        // of the same `vm_tag` to return `Ok(())` or `NotFound` — a stray
-        // leftover qcow2 file should never turn that into a hard failure.
+        // Best-effort cleanup of the per-VM working disk and cloud-init
+        // seed artifacts this backend created in `create_from_golden`.
+        // Failures are deliberately not surfaced as errors: the domain
+        // is already gone.
         let vm_disk_path = self.vm_disks.work_dir.join(format!("{vm_tag}.qcow2"));
         let _ = std::fs::remove_file(vm_disk_path);
+        let seed_iso = self.vm_disks.work_dir.join(format!("{vm_tag}-seed.iso"));
+        let _ = std::fs::remove_file(seed_iso);
+        if let Ok(mut keys) = self.vm_key_paths.lock() {
+            keys.remove(vm_tag);
+        }
 
+        Ok(())
+    }
+
+    async fn register_vm_key(
+        &self,
+        vm_tag: &str,
+        key_path: &std::path::Path,
+    ) -> Result<(), LsbxError> {
+        if !key_path.is_file() {
+            return Err(LsbxError::BackendUnavailable(format!(
+                "ephemeral SSH key does not exist: {}",
+                key_path.display()
+            )));
+        }
+        self.vm_key_paths
+            .lock()
+            .map_err(|_| {
+                LsbxError::ContractViolated("libvirt VM key map was poisoned".to_string())
+            })?
+            .insert(vm_tag.to_string(), key_path.to_path_buf());
         Ok(())
     }
 

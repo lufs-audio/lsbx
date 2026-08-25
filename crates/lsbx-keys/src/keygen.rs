@@ -14,9 +14,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 /// An ephemeral Ed25519 keypair generated for a single sandbox lease.
 ///
 /// The private key lives on disk only inside `private_key_path`'s parent
-/// directory (0700, `lsbx-key-*` prefix); nothing here is ever handed to
-/// `lsbx-store` — the state store only persists `key_path`/`key_dir` as
-/// string references (see Unit 01's `SandboxRecord`), never key bytes.
+/// directory (0700, `lsbx-key-*` prefix). The default helper uses the system
+/// temp directory; lifecycle sandboxes use their shared state directory so
+/// systemd `PrivateTmp` namespaces cannot orphan persisted records.
 pub struct EphemeralKeypair {
     /// 0600, inside a 0700 temp directory prefixed `lsbx-key-`.
     pub private_key_path: PathBuf,
@@ -33,14 +33,44 @@ pub struct EphemeralKeypair {
 /// half as a complete OpenSSH line tagged `lsbx:<label>` — the same
 /// key-comment convention the `exedev` backend's reaper pattern-matches on.
 pub fn generate_ephemeral_keypair(label: &str) -> Result<EphemeralKeypair, LsbxError> {
-    let signing_key = SigningKey::generate(&mut OsRng);
+    generate_ephemeral_keypair_in(&std::env::temp_dir(), label)
+}
 
-    let temp_dir = Builder::new().prefix("lsbx-key-").tempdir().map_err(|e| {
+/// Generates a keypair under a caller-owned directory. The key directory is
+/// still uniquely named and 0700, but it is no longer tied to a systemd
+/// `PrivateTmp` namespace, so a broker/gateway restart can reuse persisted
+/// sandbox records safely.
+pub fn generate_ephemeral_keypair_in(
+    base_dir: &std::path::Path,
+    label: &str,
+) -> Result<EphemeralKeypair, LsbxError> {
+    fs::create_dir_all(base_dir).map_err(|e| {
         LsbxError::ContractViolated(format!(
-            "failed to create temp dir for ephemeral key: {}",
+            "failed to create base directory for ephemeral key: {}",
             e
         ))
     })?;
+    #[cfg(unix)]
+    if base_dir != std::env::temp_dir() {
+        fs::set_permissions(base_dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            LsbxError::ContractViolated(format!(
+                "failed to set key base directory permissions: {}",
+                e
+            ))
+        })?;
+    }
+
+    let signing_key = SigningKey::generate(&mut OsRng);
+
+    let temp_dir = Builder::new()
+        .prefix("lsbx-key-")
+        .tempdir_in(base_dir)
+        .map_err(|e| {
+            LsbxError::ContractViolated(format!(
+                "failed to create temp dir for ephemeral key: {}",
+                e
+            ))
+        })?;
 
     #[cfg(unix)]
     fs::set_permissions(temp_dir.path(), fs::Permissions::from_mode(0o700)).map_err(|e| {

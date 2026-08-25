@@ -172,6 +172,9 @@ pub async fn put_file(
     destination: &str,
 ) -> Result<(), LsbxError> {
     let mut args = base_ssh_args(target);
+    if source.is_dir() {
+        args.insert(0, "-r".into());
+    }
     args.push(source.as_os_str().to_owned());
     args.push(format!("{}@{}:{}", target.username, target.host, destination).into());
     run_scp(&args, target.host).await

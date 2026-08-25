@@ -26,7 +26,7 @@ You are replacing both with services from `lufs-audio/lsbx` (Rust):
 | `lsbx-serve.service` | `/usr/local/bin/lsbx serve --host 100.122.170.73 --port 8244 ...` | `lsbx-gateway-exedev.service` |
 | `lsbx-ci-broker-exe.service` | `/usr/local/bin/lsbx ci-broker run --backend=exedev` | `lsbx-ci-broker-exe.service` (same unit name — generated for you by `lsbx bootstrap`) |
 
-**A real, load-bearing fact about this host you must not break:** Molimo runs **its own** general-purpose Caddy instance (`~/repos/molimo-proxy`) that does double duty — it fronts Molimo's own gateway for public HTTPS, and it *also* reverse-proxies **Carnyx's** gateway/stream-proxy (`molimo.exe.xyz:8246` → Carnyx `100.125.210.60:8243`, `:8247` → Carnyx `:8244`). This migration does not touch Carnyx or Molimo's Caddy config — but because your gateway's port (`8244`) and bind address (`100.122.170.73`) are not changing, the existing Caddy routes should keep working unmodified. Verify this in §9 rather than assuming it, and if you ever do need to touch `~/repos/molimo-proxy`'s config for an unrelated reason while this migration is in flight, know that a mistake there can take down Carnyx's public reachability too, not just Molimo's.
+**A real, load-bearing fact about this host you must not break:** Molimo runs **its own** general-purpose Caddy instance (`~/repos/molimo-proxy`) that does double duty — it fronts Molimo's own **plain-HTTP** gateway listener on local/public port 8243, and it *also* reverse-proxies **Carnyx's** gateway/stream-proxy (`molimo.exe.xyz:8246` → Carnyx `100.125.210.60:8243`, `:8247` → Carnyx `:8244`). The prior HTTPS check for port 8243 was incorrect: Caddy's `:8243` site has no TLS configuration, while the separate exe.dev edge may terminate TLS for other exposed VM ports. This migration does not touch Carnyx or Molimo's Caddy config — but because your gateway's port (`8244`) and bind address (`100.122.170.73`) are not changing, the existing Caddy routes should keep working unmodified. Verify this in §9 rather than assuming it, and if you ever do need to touch `~/repos/molimo-proxy`'s config for an unrelated reason while this migration is in flight, know that a mistake there can take down Carnyx's public reachability too, not just Molimo's.
 
 ---
 
@@ -74,7 +74,7 @@ Same guidance as the Carnyx document: decide and document whether to wait for na
 ```bash
 TOKEN=$(grep -oP '(?<=LUFSS_GATEWAY_TOKEN=).*' /home/exedev/repos/lufs-sandbox-server/.env 2>/dev/null || echo "")
 curl -sf -H "Authorization: Bearer $TOKEN" http://100.122.170.73:8244/health
-curl -sf https://molimo.exe.xyz:8243/health   # the public Caddy-proxied path — separate from the Carnyx-proxying ports 8246/8247, this one fronts Molimo's OWN gateway
+curl -sf http://molimo.exe.xyz:8243/health   # the public Caddy-proxied path is plain HTTP on this port; TLS termination is not configured here
 ```
 
 Record both as your **before** baseline.
@@ -364,7 +364,7 @@ If either new service fails to start or crash-loops, execute the rollback in §1
 
 ```bash
 curl -sf -H "Authorization: Bearer $LSBX_GATEWAY_TOKEN" http://100.122.170.73:8244/health
-curl -sf https://molimo.exe.xyz:8243/health   # Molimo's own public Caddy-fronted path
+curl -sf http://molimo.exe.xyz:8243/health   # Molimo's own public Caddy-fronted path; this listener is plain HTTP
 ```
 
 Full functional round trip via the live gateway's REST API (not just direct CLI):

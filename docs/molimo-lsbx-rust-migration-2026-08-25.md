@@ -17,7 +17,7 @@ and `lufs-runner@*.service` remain untouched.
 - Old sandbox inventory: empty (`[]`).
 - Old CI broker state directory: empty.
 - Old local gateway health: HTTP 200, `ok: true`.
-- Public `https://molimo.exe.xyz:8243/health`: TLS failed with `wrong version number`; the listener is currently plain HTTP according to the host's Caddy configuration. Unauthenticated HTTP returned 401. This remains a deployment/exposure issue to resolve separately; Caddy was not changed here.
+- Public `http://molimo.exe.xyz:8243/health`: reached the Caddy proxy; TLS is intentionally not configured on this listener, and an HTTPS probe fails with `wrong version number`. Unauthenticated HTTP returned 401. The Rust gateway should remain plain HTTP here, matching the Python service and Caddy's current `:8243` site configuration.
 - GitHub App id: `4377007`; live PEM path retained at `/home/exedev/.lufs-sandbox/lufs-audio-ci-app.pem`, owner/mode `exedev:exedev`, `0600`. PEM contents were not copied or logged.
 - `gh auth status` as `exedev`: invalid token; App auth is therefore required for the future Rust broker cutover.
 - exe.dev control plane via the existing `exe.dev` SSH alias: reachable. Live registered golden VMs included `lsbx-default-v1`, `lsbx-web-v1`, and `lsbx-ci-v1`; no legacy `agent-*` golden was observed.

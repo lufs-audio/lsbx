@@ -207,7 +207,8 @@ pub async fn create(
     let id = uuid_like_id(clock);
     let name = req.name.unwrap_or(id.as_str()).to_string();
 
-    let keypair = lsbx_keys::keygen::generate_ephemeral_keypair(&id)?;
+    let keypair =
+        lsbx_keys::keygen::generate_ephemeral_keypair_in(&store.state_dir().join("keys"), &id)?;
 
     let golden = golden_key_for_profile(&req);
     let create_result = backend
