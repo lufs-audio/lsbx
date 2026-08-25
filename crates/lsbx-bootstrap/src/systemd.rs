@@ -133,29 +133,29 @@ fn render_unit(config: &BootstrapConfig, description: &str, backend: &str) -> St
         .unwrap_or_else(|| base.join("broker.env").display().to_string());
 
     format!(
-        "[Unit]\n\\
-         Description={description}\n\\
-         After=network-online.target\n\\
-         Wants=network-online.target\n\\
-         \n\\
-         [Service]\n\\
-         Type=simple\n\\
-         User={user}\n\\
-         Group={user}\n\\
-         WorkingDirectory={working_directory}\n\\
-         Environment=HOME={home}\n\\
-         Environment=PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin\n\\
-         Environment=LSBX_STATE_DIR={base_display}\n\\
-         EnvironmentFile=-{environment_file}\n\\
-         ExecStart={binary} --images={images} --state-dir={base_display} ci-broker run --backend={backend}\n\\
-         Restart=on-failure\n\\
-         RestartSec=5\n\\
-         NoNewPrivileges=true\n\\
-         PrivateTmp=true\n\\
-         ProtectSystem=full\n\\
-         ReadWritePaths={base_display}\n\\
-         \n\\
-         [Install]\n\\
+        "[Unit]\n\
+         Description={description}\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         User={user}\n\
+         Group={user}\n\
+         WorkingDirectory={working_directory}\n\
+         Environment=HOME={home}\n\
+         Environment=PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin\n\
+         Environment=LSBX_STATE_DIR={base_display}\n\
+         EnvironmentFile=-{environment_file}\n\
+         ExecStart={binary} --images={images} --state-dir={base_display} ci-broker run --backend={backend}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         NoNewPrivileges=true\n\
+         PrivateTmp=true\n\
+         ProtectSystem=full\n\
+         ReadWritePaths={base_display}\n\
+         \n\
+         [Install]\n\
          WantedBy=multi-user.target\n"
     )
 }

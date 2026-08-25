@@ -57,6 +57,16 @@ Using a fresh state directory and the existing `exe.dev` SSH alias:
 - Cross-process Rust file `put`, `exec`, and `get`: passed; downloaded content matched.
 - Final temporary VM inventory: empty.
 
+
+Additional side-by-side work completed after the initial evidence capture:
+
+- Built the complete release workspace and installed `/usr/local/bin/lsbx` (`lsbx 0.1.0`).
+- Bootstrapped fresh `/home/exedev/lsbx-state` with 0700 state subdirectories; no old state was reused.
+- Created mode-0600, `exedev`-owned `serve.env` and `broker.env`; the broker file references the existing PEM path and contains no PEM material.
+- Authored and daemon-reloaded `/etc/systemd/system/lsbx-serve.service`, left disabled and stopped because the old gateway still owns port 8244.
+- Verified the generated broker unit in an isolated unit directory: it contains `User=exedev`, the Rust working directory, explicit images/state paths, broker environment file, hardening, and `--backend=exedev`.
+- Ran the Rust gateway side-by-side on `127.0.0.1:18244` as `exedev`; authenticated health, REST create, REST exec, REST delete, and final remote inventory all passed.
+
 ## Current status
 
 This branch is **not a cutover approval**. The Rust gateway and broker still need
