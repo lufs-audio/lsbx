@@ -133,7 +133,66 @@ impl HasGatewayConfig for GatewayState {
 /// `GET /console` is the sole unauthenticated route (the browser-facing
 /// HTML page, per this unit's acceptance criteria) — every other route,
 /// including `GET /health`, requires `AuthedRequest` to resolve.
+///
+/// This is this crate's own standalone router, unchanged from how Unit 13
+/// originally shipped it (including its own `GET /console`/
+/// `GET /consoles/{id}` handlers) — used directly by this crate's own
+/// tests (`tests/test_routes.rs`, `tests/test_auth_fail_closed.rs`,
+/// `tests/test_rate_limit.rs`) and by any caller that wants this crate's
+/// REST surface in isolation, with no `lsbx-stream` mounted alongside it.
+/// See [`build_router_for_merge`] for the variant `lib.rs`'s Gap 1 merge
+/// path actually uses.
 pub fn build_router(ops: Arc<LsbxOps>, config: GatewayConfig) -> Router {
+    build_router_inner(ops, config, true)
+}
+
+/// The Gap 1 merge variant: identical to [`build_router`] except it omits
+/// this crate's own `GET /console` and `GET /consoles/{id}` handlers.
+///
+/// ## Why this exists: a real route-ownership collision found while wiring
+/// Gap 1
+///
+/// This crate (Unit 13) and `lsbx-stream` (Unit 14) were built
+/// independently, before either could see the other's real, merged source,
+/// and **both** built their own `GET /console` and `GET /consoles/{id}`
+/// handlers — each unit's own contract named those exact paths as part of
+/// its acceptance criteria, with no coordination between the two (Unit 13's
+/// contract calls `/console` "the sole unauthenticated exception" for a
+/// browser-facing HTML page resolving a `target` query param to a console
+/// URL; Unit 14's contract calls `/console` the bundled noVNC static page,
+/// and `/consoles/{id}` a `ConsoleDetail` JSON response including a
+/// `console_password` field). Attempting to `.merge()` `lsbx_stream::router`
+/// with this crate's own full `build_router` output panics at router-build
+/// time with axum's own "Overlapping method route" error — a real,
+/// reproducible conflict, not a hypothetical one (confirmed by this crate's
+/// own `tests::merged_router_serves_both_gateway_and_stream_routes` test,
+/// which caught exactly this panic before this function existed).
+///
+/// This pass's task description is explicit that the merged gateway should
+/// serve "the REST API and the `/stream/*`, `/console`, `/consoles/*`
+/// routes together" — naming `/console`/`/consoles/*` as routes that come
+/// *from* the `lsbx-stream` mount, not as gateway-owned routes to be
+/// preserved verbatim alongside a colliding stream implementation. Given
+/// that framing, and that Unit 14's own contract is the one that literally
+/// names `/console`/`/consoles/{id}` as its canonical implementation (this
+/// crate's own module doc comment already says Unit 13 "mounts Unit 14's
+/// router as a sub-router rather than reimplementing it" for the console
+/// experience specifically), the resolution taken here is: **`lsbx-stream`'s
+/// versions of `/console` and `/consoles/{id}` are authoritative in the
+/// merged router**, and this crate's own colliding registrations for those
+/// two exact paths are omitted when building for the merge.
+///
+/// This crate's other, non-colliding routes are unaffected: `GET /consoles`
+/// (the list-of-all-console-URLs endpoint, no `{id}` — `lsbx-stream` has no
+/// equivalent, since its own `/consoles/{id}` is a single-sandbox detail
+/// lookup, not a list) is still registered here and still reachable in the
+/// merged router, alongside every other REST route this crate owns
+/// (`/health`, `/images`, `/sandboxes/*`, etc.).
+pub(crate) fn build_router_for_merge(ops: Arc<LsbxOps>, config: GatewayConfig) -> Router {
+    build_router_inner(ops, config, false)
+}
+
+fn build_router_inner(ops: Arc<LsbxOps>, config: GatewayConfig, include_own_console_routes: bool) -> Router {
     let rate_limiter = Arc::new(TokenBucket::new(config.rate_limit));
     let state = GatewayState {
         ops,
@@ -141,13 +200,12 @@ pub fn build_router(ops: Arc<LsbxOps>, config: GatewayConfig) -> Router {
         rate_limiter,
     };
 
-    let authenticated_routes = Router::new()
+    let mut authenticated_routes = Router::new()
         .route("/health", get(health))
         .route("/images", get(images))
         .route("/profiles", get(profiles))
         .route("/capabilities", get(capabilities))
         .route("/consoles", get(consoles))
-        .route("/consoles/{id}", get(console_by_id))
         .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route(
             "/sandboxes/{id}",
@@ -161,7 +219,17 @@ pub fn build_router(ops: Arc<LsbxOps>, config: GatewayConfig) -> Router {
         .route("/sandboxes/{id}/check", post(check_sandbox))
         .route("/sandboxes/{id}/info", post(info_sandbox))
         .route("/sandboxes/{id}/renew", post(renew_sandbox))
-        .route("/sandboxes/{id}/console", post(console_for_sandbox))
+        .route("/sandboxes/{id}/console", post(console_for_sandbox));
+
+    if include_own_console_routes {
+        // See `build_router_for_merge`'s doc comment: this crate's own
+        // `/consoles/{id}` collides with `lsbx-stream`'s real,
+        // already-merged implementation of the same path, so it is only
+        // registered on the standalone (non-merge) router.
+        authenticated_routes = authenticated_routes.route("/consoles/{id}", get(console_by_id));
+    }
+
+    let authenticated_routes = authenticated_routes
         // Mutating routes only: the audit log records "every mutating
         // request" (acceptance criteria), not read-only ones, so this
         // layer sits under the mutating-route group rather than the
@@ -172,7 +240,13 @@ pub fn build_router(ops: Arc<LsbxOps>, config: GatewayConfig) -> Router {
         // outer router (added after this call) do not.
         .layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware));
 
-    let unauthenticated_routes = Router::new().route("/console", get(browser_console));
+    let mut unauthenticated_routes = Router::new();
+    if include_own_console_routes {
+        // See `build_router_for_merge`'s doc comment: this crate's own
+        // `/console` collides with `lsbx-stream`'s real, already-merged
+        // implementation of the same path.
+        unauthenticated_routes = unauthenticated_routes.route("/console", get(browser_console));
+    }
 
     authenticated_routes
         .merge(unauthenticated_routes)

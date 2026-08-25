@@ -23,6 +23,12 @@ async-trait = { workspace = true }
 # real LsbxOps::put/get's filesystem-`&Path` signatures — production code,
 # not test-only, hence a normal dependency rather than a dev-dependency.
 tempfile = { workspace = true }
+# Gap 1 (final integration wiring): mounts lsbx-stream's router alongside
+# this crate's own — see lib.rs's module doc comment for the design.
+lsbx-stream = { workspace = true }
+# Gap 1: builds the second, independent SandboxStore lsbx-stream's router
+# needs (SandboxStore has no Clone — see lib.rs's module doc comment).
+lsbx-store = { workspace = true }
 
 [dev-dependencies]
 # Every test in this crate constructs a real LsbxOps against a real
@@ -30,7 +36,6 @@ tempfile = { workspace = true }
 # own tests/test_all_operations.rs construction pattern — never a bare
 # Arc::new(LsbxOps) unit value.
 lsbx-backend-demo = { workspace = true }
-lsbx-store = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
