@@ -1,0 +1,33 @@
+[package]
+name = "lsbx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lsbx"
+path = "src/main.rs"
+
+[dependencies]
+lsbx-kernel = { workspace = true }
+lsbx-store = { workspace = true }
+lsbx-keys = { workspace = true }
+lsbx-golden = { workspace = true }
+lsbx-lifecycle = { workspace = true }
+lsbx-ops = { workspace = true }
+lsbx-backend-demo = { workspace = true }
+lsbx-backend-libvirt = { workspace = true }
+lsbx-backend-exedev = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
