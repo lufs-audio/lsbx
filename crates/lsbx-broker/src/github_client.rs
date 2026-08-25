@@ -38,6 +38,52 @@
 //! machinery — the same "typed response, hand-rolled shape" idiom
 //! `installation_repositories_via_octocrab` below already uses for
 //! `InstallationRepositories`.
+//!
+//! # Unit 18 addition: `runner_name` on `JobSummary`, and `job_for_runner`
+//!
+//! Unit 18's divergence detection needs to know which `job_id` GitHub has
+//! *actually* assigned a given runner to, to compare against the `job_id`
+//! `lsbx` dispatched a VM for (GitHub assigns runners to jobs by label
+//! match, not by any id `lsbx` controls — the two can diverge). That
+//! requires a field this struct did not carry as of Unit 17:
+//! [`JobSummary::runner_name`].
+//!
+//! Verified directly against GitHub's real REST API schema for
+//! `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs` (the `Job` object,
+//! confirmed via the current `workflow-jobs` REST reference) rather than
+//! assumed: the field is literally named `runner_name` (`string | null`,
+//! null until a runner has been assigned) — the same name this file already
+//! uses for the concept elsewhere, so no remapping is needed. Added as
+//! `#[serde(default)] Option<String>`, matching this struct's existing
+//! permissive-parse convention (see the module doc comment above) — a job
+//! response missing `runner_name` entirely (an older API version, or a
+//! shape this crate hasn't seen) must not fail the whole page the way a
+//! non-optional field would.
+//!
+//! [`GitHubClient::job_for_runner`] is the new authenticated call this
+//! unit's `Reconciler::check_divergence` needs. Design note on *why* it
+//! takes `(repo, runner_name)` rather than `(repo, run_id, runner_name)`
+//! even though every other new-in-this-file method threads a `run_id`
+//! through: at the point `check_divergence` runs, the caller knows the
+//! *dispatched* `job_id` (from `CiJobRecord.job_id`) and the runner name
+//! learned by tailing the log (`CiJobRecord.runner_name`, populated by
+//! `tail_and_update` parsing `Runner registered: (\S+)`) — but the real
+//! `CiJobRecord` schema (confirmed against `lsbx-store`'s merged
+//! `ci_job_store.rs`, which this unit's own ground truth forbids modifying)
+//! has no `run_id` field to round-trip the original dispatch's run through.
+//! Rather than overload an unrelated existing field (e.g. stuffing a run id
+//! into `dispatched_job_name`, which would be a surprising, undocumented
+//! reuse of a field with its own real meaning) or add a field to a schema
+//! this unit was told is already complete, `job_for_runner` re-derives the
+//! answer by scanning `repo`'s currently queued+in-progress runs' jobs for
+//! one whose `runner_name` matches — the same two-step
+//! `workflow_runs`-then-`run_jobs` traversal `poll::queued_jobs` already
+//! uses, just filtering on `runner_name` instead of `status`+`labels`. This
+//! answers the actual question divergence detection needs ("what job is
+//! GitHub's ground truth assigning to this runner *right now*") without
+//! needing the original dispatch's `run_id` at all — see `reconcile.rs`'s
+//! module doc comment for the fuller writeup of this decision and the
+//! alternative considered.
 
 use lsbx_kernel::error::LsbxError;
 use octocrab::models::InstallationRepositories;
@@ -88,6 +134,32 @@ impl GitHubClient {
         Self {
             backing: Backing::GhCli(GhCliFallback),
         }
+    }
+
+    /// Test-only: builds an installation-token-backed client with a plain
+    /// token string, pointed at a custom base URI instead of real
+    /// `api.github.com`.
+    ///
+    /// Mirrors `GitHubAppAuth::new_with_base_uri` (`auth.rs`) exactly — same
+    /// `#[cfg(feature = "test-util")]` gate (a bare `#[cfg(test)]` item is
+    /// invisible to this crate's `tests/*.rs` integration tests, which
+    /// compile as a separate crate), same rationale: this unit's
+    /// `test_divergence_nonfatal.rs` needs `GitHubClient::job_for_runner` to
+    /// hit a `wiremock` mock server, not real GitHub, and
+    /// `GitHubClient::from_app_auth` has no seam for that on its own (its
+    /// `installation_token_client` helper never threads a base-uri override
+    /// through). Takes a plain `token: String` rather than a
+    /// `GitHubAppAuth` — the divergence test only needs an authenticated
+    /// `octocrab` client pointed at the mock, not a real JWT exchange, so
+    /// skipping straight to the installation-token step avoids a second,
+    /// unrelated mock endpoint the test would otherwise need to stand up
+    /// just to reach this one.
+    #[cfg(feature = "test-util")]
+    pub fn from_installation_token_with_base_uri(token: String, base_uri: &str) -> Result<Self, LsbxError> {
+        let client = installation_token_client_with_base_uri(token, Some(base_uri))?;
+        Ok(Self {
+            backing: Backing::Installation(client),
+        })
     }
 
     /// Lists every repository the installation can access, as full
@@ -144,6 +216,37 @@ impl GitHubClient {
             Backing::GhCli(fallback) => run_jobs_via_gh_cli(fallback, repo, run_id).await,
         }
     }
+
+    /// Unit 18 addition — see this module's doc comment ("Unit 18 addition")
+    /// for the full design rationale.
+    ///
+    /// Scans `repo`'s currently queued and in-progress workflow runs' jobs
+    /// (the same two-status, two-step `workflow_runs`-then-`run_jobs`
+    /// traversal `poll::queued_jobs` already performs against its own
+    /// private `RUN_STATUSES` — duplicated here as
+    /// [`DIVERGENCE_SCAN_STATUSES`] rather than imported, since Unit 17's
+    /// `poll::RUN_STATUSES` is a private `const` and widening its visibility
+    /// for a same-crate-but-different-unit caller is outside this unit's
+    /// boundary of "does not touch Unit 17's files") for the first job whose
+    /// [`JobSummary::runner_name`] equals `runner_name`, and returns that
+    /// job's `id`. Returns `Ok(None)` if no matching job is found in either
+    /// status — this is not itself an error: a runner between "registered"
+    /// and "GitHub has attached it to a job's `runner_name` field" is a
+    /// real, transient, non-error state.
+    pub async fn job_for_runner(&self, repo: &str, runner_name: &str) -> Result<Option<u64>, LsbxError> {
+        for status in DIVERGENCE_SCAN_STATUSES {
+            let runs = self.workflow_runs(repo, status).await?;
+            for run in runs {
+                let jobs = self.run_jobs(repo, run.id).await?;
+                for job in jobs {
+                    if job.runner_name.as_deref() == Some(runner_name) {
+                        return Ok(Some(job.id));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Minimal, permissively-parsed shape of one entry in a
@@ -170,6 +273,13 @@ pub struct JobSummary {
     pub labels: Vec<String>,
     #[serde(default)]
     pub created_at: Option<String>,
+    /// Added by Unit 18 — see this module's doc comment ("Unit 18 addition")
+    /// for the field-name verification against GitHub's real REST schema and
+    /// why it is `#[serde(default)] Option<String>` like the other optional
+    /// fields on this struct. `null`/absent until GitHub has actually
+    /// assigned a runner to this job.
+    #[serde(default)]
+    pub runner_name: Option<String>,
 }
 
 /// Builds the single `Octocrab` client construction path for a real
@@ -177,13 +287,38 @@ pub struct JobSummary {
 /// constructs this builder (rather than repeating the same
 /// `Octocrab::builder()...build()` block at each call site).
 fn installation_token_client(token: String) -> Result<Octocrab, LsbxError> {
-    Octocrab::builder()
-        .personal_token(token)
+    installation_token_client_with_base_uri(token, None)
+}
+
+/// Unit 18 addition: same construction path as
+/// [`installation_token_client`], with an optional base-URI override for
+/// this crate's own tests — see
+/// [`GitHubClient::from_installation_token_with_base_uri`]'s doc comment for
+/// why this seam exists, and `auth.rs`'s `build_app_client` for the
+/// identical pattern already established there.
+fn installation_token_client_with_base_uri(
+    token: String,
+    base_uri_override: Option<&str>,
+) -> Result<Octocrab, LsbxError> {
+    let mut builder = Octocrab::builder().personal_token(token);
+
+    if let Some(base_uri) = base_uri_override {
+        builder = builder
+            .base_uri(base_uri)
+            .map_err(|e| LsbxError::AuthFailed(format!("invalid test base_uri: {e}")))?;
+    }
+
+    builder
         .build()
         .map_err(|e| LsbxError::AuthFailed(format!("failed to build installation-token client: {e}")))
 }
 
 const PER_PAGE: u8 = 100;
+
+/// Duplicated from `poll::RUN_STATUSES` — see
+/// [`GitHubClient::job_for_runner`]'s doc comment for why this is a
+/// same-crate duplicate rather than a shared import.
+const DIVERGENCE_SCAN_STATUSES: [&str; 2] = ["queued", "in_progress"];
 
 async fn installation_repositories_via_octocrab(client: &Octocrab) -> Result<Vec<String>, LsbxError> {
     let mut full_names = Vec::new();
