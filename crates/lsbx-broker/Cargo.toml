@@ -1,0 +1,76 @@
+[package]
+name = "lsbx-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel.workspace = true
+lsbx-store.workspace = true
+lsbx-ops.workspace = true
+# `reconcile.rs`'s `Reconciler::dispatch` constructs a real
+# `lsbx_lifecycle::create::CreateRequest` to pass into `LsbxOps::create` —
+# `lsbx-ops` re-exports the type through its own `create` signature but does
+# not re-export the crate path itself, so this crate needs its own direct
+# dependency edge to name `lsbx_lifecycle::create::CreateRequest` at all.
+lsbx-lifecycle.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+octocrab.workspace = true
+jsonwebtoken.workspace = true
+chrono.workspace = true
+http.workspace = true
+# Unit 18: `job_record.rs`'s `LifecycleMarkers` regexes. Already declared in
+# the root workspace `Cargo.toml` (`regex = "1.11"`) — added as a direct
+# dependency of this crate here for the first time, not a new workspace
+# addition.
+regex.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tracing-subscriber.workspace = true
+wiremock.workspace = true
+# Unit 18's own tests build a real `LsbxOps` end to end (against
+# `DemoBackend`, no libvirt headers or real infrastructure needed — the same
+# choice `lsbx-ops`'s own dev-dependencies already make for the identical
+# reason) to exercise `Reconciler::dispatch`/`tail_and_update` against
+# something that actually implements the `Backend` trait, matching this
+# unit's own boundary ("calls `LsbxOps::create`/`exec`, exactly like the CLI
+# or HTTP door would" — never a hand-rolled fake standing in for the whole
+# façade). (`lsbx-lifecycle` itself is already a normal [dependencies] entry
+# above, since `src/reconcile.rs` — not just `tests/` — needs it.)
+lsbx-golden.workspace = true
+lsbx-backend-demo.workspace = true
+tempfile.workspace = true
+# `tests/test_dispatch_and_tail.rs` and `tests/test_restart_recovery.rs`
+# each implement `Backend` on a small local log-injecting decorator —
+# `async-trait` is already available inside `src/` (transitively, via
+# other crates), but a `tests/*.rs` integration test compiles as its own
+# separate crate and needs its own direct dependency edge to name the
+# `#[async_trait::async_trait]` macro at all.
+async-trait.workspace = true
+# `FakeClock` is gated behind `#[cfg(any(test, feature = "testing"))]` in
+# lsbx-kernel — invisible to this crate's own `tests/*.rs` integration tests
+# unless this dev-dependency edge also turns the feature on (same reason
+# `lsbx-ops`'s and `lsbx-lifecycle`'s own Cargo.tomls do this).
+lsbx-kernel = { workspace = true, features = ["testing"] }
+
+[features]
+# Exposes `GitHubAppAuth::new_with_base_uri`, so this crate's own tests (under
+# `tests/`, a separate compilation unit that only sees public API — bare
+# `#[cfg(test)]` is invisible there) can point the underlying `octocrab`
+# client at a `wiremock` mock server instead of real `api.github.com`.
+# Mirrors `lsbx-kernel`'s own `testing` feature, same rationale. Enabled by
+# default since nothing outside this crate's own test suite depends on it
+# today (units 17/18 build *on* this crate rather than depending on this
+# feature); if a downstream consumer ever needs prod builds to exclude it,
+# switch to `default-features = false` there.
+default = ["test-util"]
+test-util = []
+
+[lints]
+workspace = true
