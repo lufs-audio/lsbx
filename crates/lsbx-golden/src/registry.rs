@@ -200,6 +200,16 @@ impl ImageRegistry {
     pub fn find_golden(&self, key: &str) -> Option<&GoldenConfig> {
         self.goldens.iter().find(|g| g.key == key)
     }
+
+    /// Resolves a profile name to the golden key it maps to. Returns `None`
+    /// if the profile doesn't exist or is an ISO-type profile (no golden
+    /// mapping).
+    pub fn resolve_profile_golden_key(&self, profile: &str) -> Option<&str> {
+        match self.profiles.get(profile)? {
+            ProfileConfig::Golden { golden } => Some(golden.as_str()),
+            ProfileConfig::Iso { .. } => None,
+        }
+    }
 }
 
 // This module is #[cfg(test)]-gated: every fn in it is a #[test], so a

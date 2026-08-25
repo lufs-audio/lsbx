@@ -91,7 +91,7 @@ impl Backend for LogInjectingBackend {
         self.inner.create_from_golden(req).await
     }
 
-    async fn run(&self, vm_tag: &str, command: &[String], timeout: Duration) -> Result<CommandOutput, LsbxError> {
+    async fn run(&self, vm_tag: &str, command: &[String], timeout: Duration, identity_file: Option<&std::path::Path>) -> Result<CommandOutput, LsbxError> {
         if command == ["cat".to_string(), RUNNER_LOG_PATH.to_string()] {
             #[allow(clippy::unwrap_used)]
             let content = self.log_content.lock().unwrap().clone();
@@ -101,15 +101,15 @@ impl Backend for LogInjectingBackend {
                 stderr: vec![],
             });
         }
-        self.inner.run(vm_tag, command, timeout).await
+        self.inner.run(vm_tag, command, timeout, identity_file).await
     }
 
-    async fn put_file(&self, vm_tag: &str, source: &std::path::Path, destination: &str) -> Result<(), LsbxError> {
-        self.inner.put_file(vm_tag, source, destination).await
+    async fn put_file(&self, vm_tag: &str, source: &std::path::Path, destination: &str, identity_file: Option<&std::path::Path>) -> Result<(), LsbxError> {
+        self.inner.put_file(vm_tag, source, destination, identity_file).await
     }
 
-    async fn get_file(&self, vm_tag: &str, source: &str, destination: &std::path::Path) -> Result<(), LsbxError> {
-        self.inner.get_file(vm_tag, source, destination).await
+    async fn get_file(&self, vm_tag: &str, source: &str, destination: &std::path::Path, identity_file: Option<&std::path::Path>) -> Result<(), LsbxError> {
+        self.inner.get_file(vm_tag, source, destination, identity_file).await
     }
 
     async fn destroy(&self, vm_tag: &str) -> Result<(), LsbxError> {

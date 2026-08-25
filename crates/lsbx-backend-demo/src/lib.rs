@@ -110,7 +110,7 @@ impl Backend for DemoBackend {
         })
     }
 
-    async fn run(&self, vm_tag: &str, _command: &[String], timeout: Duration) -> Result<CommandOutput, LsbxError> {
+    async fn run(&self, vm_tag: &str, _command: &[String], timeout: Duration, _identity_file: Option<&std::path::Path>) -> Result<CommandOutput, LsbxError> {
         if self.fault == FaultMode::Unavailable {
             return Err(LsbxError::BackendUnavailable(
                 "DemoBackend is configured to be unavailable".to_string(),
@@ -137,7 +137,7 @@ impl Backend for DemoBackend {
         })
     }
 
-    async fn put_file(&self, vm_tag: &str, _source: &std::path::Path, _destination: &str) -> Result<(), LsbxError> {
+    async fn put_file(&self, vm_tag: &str, _source: &std::path::Path, _destination: &str, _identity_file: Option<&std::path::Path>) -> Result<(), LsbxError> {
         let exists = {
             let map = self.internal.lock().map_err(lock_poisoned_error)?;
             map.contains_key(vm_tag)
@@ -148,7 +148,7 @@ impl Backend for DemoBackend {
         Ok(())
     }
 
-    async fn get_file(&self, vm_tag: &str, _source: &str, _destination: &std::path::Path) -> Result<(), LsbxError> {
+    async fn get_file(&self, vm_tag: &str, _source: &str, _destination: &std::path::Path, _identity_file: Option<&std::path::Path>) -> Result<(), LsbxError> {
         let exists = {
             let map = self.internal.lock().map_err(lock_poisoned_error)?;
             map.contains_key(vm_tag)

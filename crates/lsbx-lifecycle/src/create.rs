@@ -87,7 +87,7 @@ async fn healthchecks_pass(
     per_call_timeout: Duration,
 ) -> bool {
     for command in healthchecks {
-        match backend.run(vm_tag, command, per_call_timeout).await {
+        match backend.run(vm_tag, command, per_call_timeout, None).await {
             Ok(output) if output.exit_code == 0 => continue,
             _ => return false,
         }

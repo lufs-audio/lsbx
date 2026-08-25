@@ -731,6 +731,7 @@ async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) 
             token,
             reap_ttl,
             daemon,
+            insecure,
         }) => {
             dispatch_serve(
                 args,
@@ -741,6 +742,7 @@ async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) 
                 token.clone(),
                 reap_ttl.as_deref(),
                 *daemon,
+                *insecure,
             )
             .await
         }
@@ -1130,6 +1132,7 @@ async fn dispatch_serve(
     token: Option<String>,
     reap_ttl: Option<&str>,
     daemon: bool,
+    insecure: bool,
 ) -> Result<i32, LsbxError> {
     let host_str = host.unwrap_or("127.0.0.1");
     let host_ip: std::net::IpAddr = host_str.parse().map_err(|e| {
@@ -1144,7 +1147,7 @@ async fn dispatch_serve(
     let gateway_config = || lsbx_gateway::GatewayConfig {
         token: token.clone(),
         allow_local_files: false,
-        insecure: false,
+        insecure,
         rate_limit: lsbx_gateway::RateLimitConfig::default(),
     };
 

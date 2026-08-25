@@ -276,19 +276,72 @@ impl LsbxOps {
         })
     }
 
+    /// Loads the sandbox record for `id` and returns its `key_path` if
+    /// present — the per-sandbox ephemeral Ed25519 private key that the
+    /// libvirt backend needs for SSH into the guest. Returns `None` if the
+    /// record has no `key_path` (the backend falls back to its placeholder).
+    fn resolve_identity_file(&self, id: &str) -> Option<std::path::PathBuf> {
+        self.sandbox_store
+            .load(id)
+            .ok()
+            .and_then(|r| r.key_path.map(std::path::PathBuf::from))
+    }
+
     // ---- lsbx-lifecycle delegation: create / destroy / renew / reap ----
 
-    /// Delegates to `lsbx_lifecycle::create::create`. See the module-level
-    /// delegation map.
+    /// Delegates to `lsbx_lifecycle::create::create`. Resolves the profile
+    /// name to its actual golden key via the in-process `ImageRegistry`
+    /// before calling the lifecycle, so `golden_key_for_profile` receives
+    /// the real golden key (e.g. `"agent-base"`) not the profile name
+    /// (e.g. `"default"`).
     pub async fn create(
         &self,
         req: lsbx_lifecycle::create::CreateRequest<'_>,
     ) -> Result<PublicSandbox, LsbxError> {
+        let golden_key = {
+            let registry = self.registry.read().await;
+            registry
+                .resolve_profile_golden_key(req.profile)
+                .map(str::to_string)
+                .unwrap_or_else(|| req.profile.to_string())
+        };
+
+        let mut resolved = lsbx_lifecycle::create::CreateRequest {
+            profile: &golden_key,
+            name: req.name,
+            task_id: req.task_id,
+            lease: req.lease,
+            ready_timeout: req.ready_timeout,
+            verify: req.verify,
+            healthchecks: req.healthchecks.clone(),
+        };
+
+        // Also resolve healthchecks from the golden config if none were
+        // explicitly provided — the registry has declared healthchecks per
+        // golden that should be used by default.
+        if resolved.healthchecks.is_empty() {
+            let healthchecks = {
+                let registry = self.registry.read().await;
+                registry
+                    .find_golden(&golden_key)
+                    .map(|g| {
+                        g.healthcheck
+                            .iter()
+                            .map(|cmd| {
+                                vec!["sh".to_string(), "-c".to_string(), cmd.clone()]
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            resolved.healthchecks = healthchecks;
+        }
+
         lsbx_lifecycle::create::create(
             self.backend.as_ref(),
             &self.sandbox_store,
             self.clock.as_ref(),
-            req,
+            resolved,
         )
         .await
     }
@@ -370,19 +423,22 @@ impl LsbxOps {
         timeout: Duration,
     ) -> Result<lsbx_kernel::backend::CommandOutput, LsbxError> {
         let vm_tag = self.resolve_vm_tag(id)?;
-        self.backend.run(&vm_tag, command, timeout).await
+        let key_path = self.resolve_identity_file(id);
+        self.backend.run(&vm_tag, command, timeout, key_path.as_deref()).await
     }
 
     /// Resolves `id` to a `vm_tag`, then delegates to `Backend::put_file`.
     pub async fn put(&self, id: &str, source: &Path, destination: &str) -> Result<(), LsbxError> {
         let vm_tag = self.resolve_vm_tag(id)?;
-        self.backend.put_file(&vm_tag, source, destination).await
+        let key_path = self.resolve_identity_file(id);
+        self.backend.put_file(&vm_tag, source, destination, key_path.as_deref()).await
     }
 
     /// Resolves `id` to a `vm_tag`, then delegates to `Backend::get_file`.
     pub async fn get(&self, id: &str, source: &str, destination: &Path) -> Result<(), LsbxError> {
         let vm_tag = self.resolve_vm_tag(id)?;
-        self.backend.get_file(&vm_tag, source, destination).await
+        let key_path = self.resolve_identity_file(id);
+        self.backend.get_file(&vm_tag, source, destination, key_path.as_deref()).await
     }
 
     // ---- Status: implemented directly, live-probing the backend ----

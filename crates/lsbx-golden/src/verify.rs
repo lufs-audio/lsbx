@@ -106,6 +106,7 @@ pub async fn golden_verify(
                 &vm_tag,
                 &["sh".to_string(), "-c".to_string(), command.clone()],
                 HEALTHCHECK_TIMEOUT,
+                None,
             )
             .await
         {

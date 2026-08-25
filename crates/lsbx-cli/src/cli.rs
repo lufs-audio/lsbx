@@ -120,6 +120,8 @@ pub enum Command {
         reap_ttl: Option<String>,
         #[arg(long)]
         daemon: bool,
+        #[arg(long)]
+        insecure: bool,
     },
     Bootstrap {
         #[arg(long)]

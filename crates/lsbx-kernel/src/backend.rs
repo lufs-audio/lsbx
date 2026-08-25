@@ -31,9 +31,9 @@ pub struct CreateFromGoldenRequest<'a> {
 pub trait Backend: Send + Sync {
     fn capabilities(&self) -> BackendCapabilities;
     async fn create_from_golden(&self, req: CreateFromGoldenRequest<'_>) -> Result<CreatedVm, crate::error::LsbxError>;
-    async fn run(&self, vm_tag: &str, command: &[String], timeout: std::time::Duration) -> Result<CommandOutput, crate::error::LsbxError>;
-    async fn put_file(&self, vm_tag: &str, source: &std::path::Path, destination: &str) -> Result<(), crate::error::LsbxError>;
-    async fn get_file(&self, vm_tag: &str, source: &str, destination: &std::path::Path) -> Result<(), crate::error::LsbxError>;
+    async fn run(&self, vm_tag: &str, command: &[String], timeout: std::time::Duration, identity_file: Option<&std::path::Path>) -> Result<CommandOutput, crate::error::LsbxError>;
+    async fn put_file(&self, vm_tag: &str, source: &std::path::Path, destination: &str, identity_file: Option<&std::path::Path>) -> Result<(), crate::error::LsbxError>;
+    async fn get_file(&self, vm_tag: &str, source: &str, destination: &std::path::Path, identity_file: Option<&std::path::Path>) -> Result<(), crate::error::LsbxError>;
     async fn destroy(&self, vm_tag: &str) -> Result<(), crate::error::LsbxError>;
     async fn list_vms(&self) -> Result<Vec<String>, crate::error::LsbxError>;
     async fn rename_vm(&self, old_tag: &str, new_tag: &str) -> Result<(), crate::error::LsbxError>;

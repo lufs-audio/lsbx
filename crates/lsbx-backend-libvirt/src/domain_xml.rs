@@ -20,8 +20,16 @@ pub fn parse_memory_to_kib(memory: &str) -> Result<u64, LsbxError> {
     }
 
     let (digits, multiplier_kib): (&str, u64) =
-        if let Some(stripped) = trimmed.strip_suffix(['G', 'g']) {
+        if let Some(stripped) = trimmed.strip_suffix("GiB").or_else(|| trimmed.strip_suffix("gib")) {
             (stripped, 1024 * 1024)
+        } else if let Some(stripped) = trimmed.strip_suffix("GB").or_else(|| trimmed.strip_suffix("gb")) {
+            (stripped, 1024 * 1024)
+        } else if let Some(stripped) = trimmed.strip_suffix(['G', 'g']) {
+            (stripped, 1024 * 1024)
+        } else if let Some(stripped) = trimmed.strip_suffix("MiB").or_else(|| trimmed.strip_suffix("mib")) {
+            (stripped, 1024)
+        } else if let Some(stripped) = trimmed.strip_suffix("MB").or_else(|| trimmed.strip_suffix("mb")) {
+            (stripped, 1024)
         } else if let Some(stripped) = trimmed.strip_suffix(['M', 'm']) {
             (stripped, 1024)
         } else if let Some(stripped) = trimmed.strip_suffix(['K', 'k']) {
@@ -60,39 +68,42 @@ pub struct DomainXmlParams<'a> {
     pub cpu: u32,
     pub memory: &'a str,
     pub disk_path: &'a std::path::Path,
+    /// Optional cloud-init seed ISO path. When `Some`, an IDE cdrom device
+    /// is added to the domain XML so the guest can read cloud-init
+    /// `user-data`/`meta-data` at boot (SSH key injection, hostname, etc.).
+    pub seed_iso: Option<&'a std::path::Path>,
 }
 
-/// Renders a minimal but complete KVM/QEMU domain XML: a qcow2 disk backed
-/// by the resolved path, virtio net/disk for reasonable default
-/// performance, and a Cirrus/VNC-free console setup (console access is
-/// this backend's `capabilities().console` claim, exercised through
-/// libvirt's own serial/graphics device model — the *choice* of graphics
-/// device is intentionally minimal here since Unit 14 (`lsbx-stream`) owns
-/// the noVNC/WebSocket proxy layer on top of whatever libvirt exposes, not
-/// this unit).
+/// Renders a KVM/QEMU domain XML matching the Python reference
+/// implementation (`lufs_sandbox/backends/libvirt.py:_domain_xml`):
 ///
-/// ### Pubkey injection — documented gap, not silently dropped
-/// `req.pubkey` is **not yet injected into the guest** by this function.
-/// Doing that properly needs one of: (a) cloud-init (a `NoCloud`
-/// ISO/`<metadata>` seed disk with a `user-data` that appends the pubkey
-/// to `authorized_keys`), or (b) the golden image already having a
-/// provisioning-time mechanism that reads a fixed location (a virtio-9p
-/// mount, a `qemu-guest-agent` file-write call) for the key. Both are real
-/// engineering, not a one-line omission, and building either fully is
-/// judged out of scope for this unit — full cloud-init/guest-agent
-/// integration is exactly the kind of "how does key material actually get
-/// into a booted guest" question Unit 08 (which owns what a golden's build
-/// process produces) and/or a dedicated follow-up unit should settle, not
-/// something this backend should invent unilaterally. The pubkey is
-/// threaded through as a domain XML `<metadata>` comment (inert to
-/// libvirt/QEMU, but keeps the value visible on the domain for a human or
-/// a later automated step to act on) so it is not silently discarded
-/// end-to-end, and this gap is called out explicitly in the PR description.
+/// - qcow2 disk (virtio)
+/// - optional cloud-init seed ISO (IDE cdrom) for SSH key injection
+/// - virtio NIC on the `default` libvirt network
+/// - serial/pty + console/pty (matching Python's `-serial mon:stdio`)
+/// - QEMU guest agent channel (`org.qemu.guest_agent.0`) — required for
+///   `virsh domifaddr --source agent` IP resolution
+/// - VNC graphics (autoport) for noVNC/WebSocket proxy access
 pub fn render_domain_xml(params: &DomainXmlParams<'_>, pubkey: &str) -> Result<String, LsbxError> {
     let memory_kib = parse_memory_to_kib(params.memory)?;
     let name = xml_escape(params.name);
     let disk_path = xml_escape(&params.disk_path.to_string_lossy());
     let pubkey_escaped = xml_escape(pubkey);
+
+    // Cloud-init seed ISO cdrom device (IDE bus, matching Python)
+    let seed_disk = match params.seed_iso {
+        Some(path) => {
+            let seed_path = xml_escape(&path.to_string_lossy());
+            format!(
+                r#"    <disk type='file' device='cdrom'>
+      <source file='{seed_path}'/>
+      <target dev='hda' bus='ide'/>
+      <readonly/>
+    </disk>"#
+            )
+        }
+        None => String::new(),
+    };
 
     Ok(format!(
         r#"<domain type='kvm'>
@@ -101,7 +112,7 @@ pub fn render_domain_xml(params: &DomainXmlParams<'_>, pubkey: &str) -> Result<S
   <currentMemory unit='KiB'>{memory_kib}</currentMemory>
   <vcpu placement='static'>{cpu}</vcpu>
   <os>
-    <type arch='x86_64' machine='q35'>hvm</type>
+    <type arch='x86_64' machine='pc'>hvm</type>
     <boot dev='hd'/>
   </os>
   <features>
@@ -109,26 +120,26 @@ pub fn render_domain_xml(params: &DomainXmlParams<'_>, pubkey: &str) -> Result<S
     <apic/>
   </features>
   <cpu mode='host-passthrough'/>
-  <!-- Guest SSH pubkey injection is a documented gap for this unit — see
-       domain_xml::render_domain_xml's doc comment. Recorded here so the
-       value is visible on the domain rather than silently dropped
-       end-to-end; this metadata node has no effect on QEMU/libvirt. -->
   <metadata>
     <lsbx:pubkey xmlns:lsbx="https://lufs.org/lsbx/domain-metadata">{pubkey_escaped}</lsbx:pubkey>
   </metadata>
   <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
     <disk type='file' device='disk'>
       <driver name='qemu' type='qcow2'/>
       <source file='{disk_path}'/>
       <target dev='vda' bus='virtio'/>
     </disk>
-    <interface type='network'>
+{seed_disk}    <interface type='network'>
       <source network='default'/>
       <model type='virtio'/>
     </interface>
-    <console type='pty'>
-      <target type='serial' port='0'/>
-    </console>
+    <serial type='pty'/>
+    <console type='pty'/>
+    <channel type='unix'>
+      <source mode='bind'/>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
     <graphics type='vnc' port='-1' autoport='yes'/>
   </devices>
 </domain>"#,
@@ -137,6 +148,7 @@ pub fn render_domain_xml(params: &DomainXmlParams<'_>, pubkey: &str) -> Result<S
         cpu = params.cpu,
         pubkey_escaped = pubkey_escaped,
         disk_path = disk_path,
+        seed_disk = seed_disk,
     ))
 }
 
@@ -151,8 +163,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_gb_suffix() {
+        assert_eq!(parse_memory_to_kib("4GB").unwrap(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_gib_suffix() {
+        assert_eq!(parse_memory_to_kib("2GiB").unwrap(), 2 * 1024 * 1024);
+    }
+
+    #[test]
     fn parses_megabyte_suffix() {
         assert_eq!(parse_memory_to_kib("512M").unwrap(), 512 * 1024);
+    }
+
+    #[test]
+    fn parses_mb_suffix() {
+        assert_eq!(parse_memory_to_kib("512MB").unwrap(), 512 * 1024);
+    }
+
+    #[test]
+    fn parses_mib_suffix() {
+        assert_eq!(parse_memory_to_kib("512MiB").unwrap(), 512 * 1024);
     }
 
     #[test]
@@ -182,12 +214,17 @@ mod tests {
             cpu: 4,
             memory: "1G",
             disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-test-vm.qcow2"),
+            seed_iso: None,
         };
         let xml = render_domain_xml(&params, "ssh-ed25519 AAAA... lsbx:test").unwrap();
         assert!(xml.contains("<name>lsbx-test-vm</name>"));
         assert!(xml.contains("vcpu placement='static'>4<"));
         assert!(xml.contains("/var/lib/lsbx/vms/lsbx-test-vm.qcow2"));
         assert!(xml.contains("1048576")); // 1G in KiB
+        assert!(xml.contains("org.qemu.guest_agent.0"));
+        assert!(xml.contains("<serial type='pty'/>"));
+        assert!(xml.contains("<console type='pty'/>"));
+        assert!(!xml.contains("<target dev='hda'")); // no cdrom when no seed
     }
 
     #[test]
@@ -197,11 +234,27 @@ mod tests {
             cpu: 1,
             memory: "512M",
             disk_path: std::path::Path::new("/tmp/x.qcow2"),
+            seed_iso: None,
         };
         let xml = render_domain_xml(&params, "ssh-ed25519 AAAA\"quote lsbx:test").unwrap();
         assert!(!xml.contains("<name>lsbx-<injected></name>"));
         assert!(xml.contains("&lt;injected&gt;"));
         assert!(xml.contains("&quot;quote"));
+    }
+
+    #[test]
+    fn domain_xml_includes_seed_iso_cdrom_when_provided() {
+        let params = DomainXmlParams {
+            name: "lsbx-test-vm",
+            cpu: 2,
+            memory: "1G",
+            disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-test-vm.qcow2"),
+            seed_iso: Some(std::path::Path::new("/var/lib/lsbx/vms/lsbx-test-vm-cidata.iso")),
+        };
+        let xml = render_domain_xml(&params, "ssh-ed25519 AAAA... test").unwrap();
+        assert!(xml.contains("<target dev='hda' bus='ide'/>"));
+        assert!(xml.contains("/var/lib/lsbx/vms/lsbx-test-vm-cidata.iso"));
+        assert!(xml.contains("device='cdrom'"));
     }
 
     #[test]
@@ -211,6 +264,7 @@ mod tests {
             cpu: 1,
             memory: "not-a-number",
             disk_path: std::path::Path::new("/tmp/x.qcow2"),
+            seed_iso: None,
         };
         assert!(render_domain_xml(&params, "irrelevant").is_err());
     }

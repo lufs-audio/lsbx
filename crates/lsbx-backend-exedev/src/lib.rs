@@ -303,6 +303,7 @@ impl Backend for ExedevBackend {
         vm_tag: &str,
         command: &[String],
         timeout: Duration,
+        _identity_file: Option<&std::path::Path>,
     ) -> Result<CommandOutput, LsbxError> {
         let cmd = command.join(" ");
         let host = format!("{}.exe.xyz", vm_tag);
@@ -334,6 +335,7 @@ impl Backend for ExedevBackend {
         _vm_tag: &str,
         _source: &std::path::Path,
         _destination: &str,
+        _identity_file: Option<&std::path::Path>,
     ) -> Result<(), LsbxError> {
         Err(LsbxError::BackendUnavailable(
             "exedev backend does not yet implement file transfer (SFTP over the SSH path is the intended \
@@ -347,6 +349,7 @@ impl Backend for ExedevBackend {
         _vm_tag: &str,
         _source: &str,
         _destination: &std::path::Path,
+        _identity_file: Option<&std::path::Path>,
     ) -> Result<(), LsbxError> {
         Err(LsbxError::BackendUnavailable(
             "exedev backend does not yet implement file transfer (SFTP over the SSH path is the intended \

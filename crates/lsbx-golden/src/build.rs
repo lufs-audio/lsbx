@@ -278,7 +278,7 @@ async fn run_build_steps(
 ) -> Result<String, LsbxError> {
     // Step 2: copy the provisioning script onto the build VM.
     backend
-        .put_file(vm_tag, script, REMOTE_SCRIPT_PATH)
+        .put_file(vm_tag, script, REMOTE_SCRIPT_PATH, None)
         .await?;
 
     // Step 3: actually execute it on the guest. `run`'s `Ok` only means the
@@ -290,6 +290,7 @@ async fn run_build_steps(
             vm_tag,
             &["sh".to_string(), REMOTE_SCRIPT_PATH.to_string()],
             BUILD_SCRIPT_TIMEOUT,
+            None,
         )
         .await?;
 
