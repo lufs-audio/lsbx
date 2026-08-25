@@ -1,0 +1,39 @@
+[package]
+name = "lsbx-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+octocrab.workspace = true
+jsonwebtoken.workspace = true
+chrono.workspace = true
+http.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tracing-subscriber.workspace = true
+wiremock.workspace = true
+
+[features]
+# Exposes `GitHubAppAuth::new_with_base_uri`, so this crate's own tests (under
+# `tests/`, a separate compilation unit that only sees public API — bare
+# `#[cfg(test)]` is invisible there) can point the underlying `octocrab`
+# client at a `wiremock` mock server instead of real `api.github.com`.
+# Mirrors `lsbx-kernel`'s own `testing` feature, same rationale. Enabled by
+# default since nothing outside this crate's own test suite depends on it
+# today (units 17/18 build *on* this crate rather than depending on this
+# feature); if a downstream consumer ever needs prod builds to exclude it,
+# switch to `default-features = false` there.
+default = ["test-util"]
+test-util = []
+
+[lints]
+workspace = true

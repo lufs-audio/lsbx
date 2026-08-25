@@ -11,6 +11,7 @@ members = [
     "crates/lsbx-lifecycle",
     "crates/lsbx-ops",
     "crates/lsbx-mcp",
+    "crates/lsbx-broker",
 ]
 resolver = "2"
 
@@ -34,6 +35,7 @@ lsbx-golden = { path = "crates/lsbx-golden" }
 lsbx-lifecycle = { path = "crates/lsbx-lifecycle" }
 lsbx-ops = { path = "crates/lsbx-ops" }
 lsbx-mcp = { path = "crates/lsbx-mcp" }
+lsbx-broker = { path = "crates/lsbx-broker" }
 
 # Async & Runtime
 tokio = { version = "1.43", features = ["full"] }
@@ -60,6 +62,11 @@ crossterm = "0.28"
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = "0.26"
 octocrab = "0.43"
+# Direct dependency (transitively pulled in via octocrab already, at a
+# compatible version) added by Unit 16 (lsbx-broker) so `error_map.rs` can
+# name `http::StatusCode` directly when mapping octocrab errors onto
+# LsbxError, without octocrab re-exporting the `http` crate itself.
+http = "1"
 
 # Cryptography & Security
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
@@ -72,6 +79,9 @@ fs4 = { version = "0.12", features = ["tokio"] }
 tempfile = "3.17"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1.11"
+
+# Test-only HTTP mocking (Unit 16's test_token_caching.rs / test_no_secret_leakage.rs)
+wiremock = "0.6"
 
 # MCP server SDK (Unit 15)
 rmcp = { version = "3", features = ["server", "transport-io", "macros", "schemars"] }
