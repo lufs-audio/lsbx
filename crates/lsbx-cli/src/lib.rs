@@ -59,18 +59,67 @@
 //! ## Bare invocation / TUI handoff
 //! A bare `lsbx` invocation (no subcommand) is supposed to delegate to
 //! `lsbx-tui`'s dashboard when stdout is a TTY (Unit 12, built in parallel
-//! with this one). `lsbx-tui` is not on `main` yet at the time this crate
-//! was written — this crate does not add a dependency on an unmerged
-//! crate, so the bare-invocation path below calls `status` directly and
-//! renders it through the same one formatting path every other subcommand
-//! uses, regardless of TTY-ness, with a `// TODO` marking exactly where the
-//! real handoff belongs once Unit 12 lands.
+//! with this one). `lsbx-tui` is not wired in as a dependency of this
+//! crate — this crate does not add a dependency on a door outside this
+//! pass's scope, so the bare-invocation path below calls `status` directly
+//! and renders it through the same one formatting path every other
+//! subcommand uses, regardless of TTY-ness, with a `// TODO` marking
+//! exactly where the real handoff belongs once that wiring is taken up.
+//!
+//! ## Gap 1/3 (final integration wiring pass): `Serve`, `Bootstrap`, `Mcp`,
+//! `CiBroker` are now real, not `ContractViolated` stubs
+//!
+//! As merged, `dispatch`'s `Serve`/`Bootstrap`/`Mcp` arms were honest
+//! `ContractViolated` stubs naming the crate that didn't exist yet at the
+//! time this unit was built (`lsbx-gateway`/`lsbx-bootstrap`/`lsbx-mcp`, all
+//! unmerged Layer 6/8 crates as of PR #17). All three crates are now
+//! merged, and this pass wires each stub to its real implementation. A
+//! fourth subcommand, `CiBroker`, did not exist at all — the systemd unit
+//! files `lsbx-bootstrap::systemd::generate_broker_units` generates
+//! reference `lsbx ci-broker run --backend=<...>` as their `ExecStart`, a
+//! subcommand this pass adds for the first time (see `cli.rs`'s
+//! `CiBrokerCommand` and `dispatch_ci_broker` below).
+//!
+//! - **`Bootstrap`** calls the real `lsbx_bootstrap::systemd::bootstrap`
+//!   with a real `BootstrapConfig` built from the parsed flags, and renders
+//!   the resulting `BootstrapReport` through this crate's one formatting
+//!   path via a new `BootstrapReportDto`/`Formattable` impl (see below) —
+//!   `BootstrapReport` itself derives no `Serialize`/`Formattable`,
+//!   matching this crate's existing convention of a small local DTO for
+//!   every non-`Serialize` `LsbxOps`/sibling-crate response type it
+//!   touches (`StatusReportDto`, `ReapReportDto`, etc., already below).
+//! - **`Mcp`** builds the exact same `LsbxOps` this crate's own
+//!   `build_deps()` already builds for every other subcommand (no separate
+//!   construction path), wraps it in the `Arc` `lsbx_mcp::run_stdio_server`
+//!   requires, and calls it — blocking on stdio for the rest of the
+//!   process's life, which is correct MCP server behavior (the CLI itself
+//!   becomes the MCP server process once this subcommand runs).
+//! - **`Serve`** builds `lsbx_gateway::GatewayDeps { ops, state_dir }` from
+//!   the same `LsbxOps`/`state_dir` `build_deps()` already resolved, and
+//!   implements the documented design: a single merged gateway+stream
+//!   listener by default (`stream_port` unset or equal to `port`), or two
+//!   independent listeners (gateway-only on `port`, stream-only on
+//!   `stream_port`) when `stream_port` is explicitly set to a different
+//!   value. Either way, a background reap loop runs alongside serving. See
+//!   `dispatch_serve`'s own doc comment for the full design writeup,
+//!   including the `--daemon` semantics (deliberately NOT real Unix
+//!   double-fork daemonization).
+//! - **`CiBroker { action: CiBrokerCommand::Run { backend, queue_label } }`**
+//!   builds a real `LsbxOps`/`CiJobStore`/`GitHubClient` the same way
+//!   `build_deps()` already does for every other command, resolves GitHub
+//!   App credentials from the `LSBX_GITHUB_APP_*` environment variables
+//!   this pass documents in root `AGENTS.md` (falling back to
+//!   `GitHubClient::from_gh_cli_fallback()` when they aren't set, exactly
+//!   as `lsbx-broker` itself already supports), and calls the real
+//!   `lsbx_broker::reconcile::run_broker(..., iterations: None)` — runs
+//!   forever, exactly like the systemd units this closes the loop for
+//!   expect. See `dispatch_ci_broker`'s own doc comment.
 
 pub mod cli;
 pub mod format;
 
 use clap::Parser as _;
-use cli::{BackendChoice, Cli, Command, GoldenCommand};
+use cli::{BackendChoice, CiBrokerCommand, Cli, Command, GoldenCommand};
 use format::Formattable;
 use lsbx_backend_demo::DemoBackend;
 use lsbx_backend_exedev::{ExedevAuth, ExedevBackend};
@@ -109,7 +158,7 @@ pub async fn run() -> i32 {
 pub async fn run_with_args(args: Cli) -> i32 {
     let as_json = args.json;
 
-    let deps = match build_deps(&args).await {
+    let deps = match build_deps(&args, None).await {
         Ok(deps) => deps,
         Err(e) => {
             println!("{}", format::render_error(&e, as_json));
@@ -117,9 +166,10 @@ pub async fn run_with_args(args: Cli) -> i32 {
         }
     };
 
+    let state_dir = deps.state_dir.clone();
     let ops = deps.into_ops();
 
-    match dispatch(&ops, &args, as_json).await {
+    match dispatch(&ops, state_dir, &args, as_json).await {
         Ok(code) => code,
         Err(e) => {
             println!("{}", format::render_error(&e, as_json));
@@ -334,7 +384,14 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
-/// Everything `LsbxOps::new` needs, resolved from parsed args.
+/// Everything `LsbxOps::new` needs, resolved from parsed args, plus the
+/// resolved `state_dir` itself — carried alongside for the `serve`/
+/// `ci-broker run` subcommands (Gap 1/3), which each need a second,
+/// independent `SandboxStore`/`CiJobStore` pointed at the same directory
+/// `LsbxOps`'s own store was built from (`lsbx-gateway`'s `GatewayDeps` and
+/// `lsbx-broker`'s `run_broker` both need direct `CiJobStore`/`SandboxStore`
+/// access that `LsbxOps` itself does not expose — see those crates' own
+/// module doc comments for why).
 struct OpsDeps {
     backend: Box<dyn Backend>,
     backend_name: String,
@@ -342,6 +399,7 @@ struct OpsDeps {
     ci_job_store: CiJobStore,
     registry: ImageRegistry,
     clock: Box<dyn Clock>,
+    state_dir: PathBuf,
 }
 
 impl OpsDeps {
@@ -363,7 +421,18 @@ impl OpsDeps {
 /// method" only works once a real `LsbxOps` exists to call it on, and this
 /// is where that instance is actually assembled — the exact gap neither
 /// prior Jules candidate closed.
-async fn build_deps(args: &Cli) -> Result<OpsDeps, LsbxError> {
+///
+/// `backend_override`, when `Some`, takes precedence over `args.backend` —
+/// added by Gap 3's `ci-broker run` subcommand, whose own `--backend` flag
+/// is scoped to `CiBrokerCommand::Run` (not the top-level `Cli::backend`
+/// global flag every other subcommand reads), so `dispatch_ci_broker` calls
+/// this function with `Some(backend)` from its own parsed flag rather than
+/// needing `Cli`/`Command` to derive `Clone` just to reconstruct a
+/// synthetic top-level `Cli` value (neither type derives it, and adding it
+/// solely for this one internal call site would be a needless surface
+/// change to `cli.rs`, whose own module doc comment reserves it for
+/// argument-parsing definitions only).
+async fn build_deps(args: &Cli, backend_override: Option<BackendChoice>) -> Result<OpsDeps, LsbxError> {
     let state_dir = resolve_state_dir(args.state_dir.as_deref());
     let images_path = resolve_images_path(args.images.as_deref(), &state_dir);
 
@@ -375,7 +444,7 @@ async fn build_deps(args: &Cli) -> Result<OpsDeps, LsbxError> {
     // seam to land in rather than this crate silently ignoring the flag.
     let _config_path = args.config.clone();
 
-    let backend_choice = args.backend.clone().unwrap_or(BackendChoice::Demo);
+    let backend_choice = backend_override.or_else(|| args.backend.clone()).unwrap_or(BackendChoice::Demo);
     let built = build_backend(&backend_choice, &state_dir).await?;
 
     let sandbox_store = SandboxStore::new(state_dir.clone());
@@ -405,6 +474,7 @@ async fn build_deps(args: &Cli) -> Result<OpsDeps, LsbxError> {
         ci_job_store,
         registry,
         clock: Box::new(SystemClock),
+        state_dir,
     })
 }
 
@@ -470,14 +540,22 @@ fn generate_pubkey_for(label: &str) -> Result<(String, lsbx_keys::keygen::Epheme
 /// process exit code (`0` on success, or `error.exit_code()` when a
 /// non-fatal-to-dispatch subcommand still reports failure, e.g. `down`
 /// against a nonexistent id).
-async fn dispatch(ops: &LsbxOps, args: &Cli, as_json: bool) -> Result<i32, LsbxError> {
+///
+/// `state_dir` is threaded through alongside `ops`/`args` (Gap 1/3): the
+/// `Serve`/`CiBroker` arms each need a second, independent
+/// `SandboxStore`/`CiJobStore` pointed at the same directory `ops`'s own
+/// stores were built from, which `LsbxOps` itself has no accessor for (its
+/// `sandbox_store`/`ci_job_store` fields are private by design — see
+/// `lsbx-ops`'s own module doc comment).
+async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) -> Result<i32, LsbxError> {
     match &args.command {
         None => {
-            // TODO: hand off to lsbx-tui once merged (Unit 12's dashboard,
-            // bare `lsbx` when stdout is a TTY — SPEC.md §4.8, this unit's
-            // own Boundaries). lsbx-tui is not on `main` yet at the time
-            // this crate was written, so this deliberately does not add a
-            // dependency on an unmerged crate; falling back to `status`
+            // TODO: hand off to lsbx-tui once wired as a dependency of this
+            // crate (Unit 12's dashboard, bare `lsbx` when stdout is a TTY
+            // — SPEC.md §4.8, this unit's own Boundaries). This
+            // deliberately does not add a dependency on `lsbx-tui` as part
+            // of this integration-wiring pass (out of scope for the four
+            // gaps this pass closes); falling back to `status`
             // unconditionally (not just when stdout is not a TTY) keeps
             // this crate's dependency graph honest about what it actually
             // ships today.
@@ -646,31 +724,33 @@ async fn dispatch(ops: &LsbxOps, args: &Cli, as_json: bool) -> Result<i32, LsbxE
             println!("{}", format::render(&ReapReportDto::from(report), as_json));
             Ok(0)
         }
-        Some(Command::Serve { .. }) => {
-            // Boundaries: this unit does not implement serve's HTTP server
-            // (Unit 13) — only constructs and hands off. Unit 13's crate
-            // (`lsbx-gateway`) is not a dependency of this crate for the
-            // same reason `lsbx-tui` isn't (avoid a hard dependency on an
-            // unmerged crate); this subcommand is accepted for
-            // interface-contract parity and reports the real gap rather
-            // than pretending to have started a server.
-            Err(LsbxError::ContractViolated(
-                "serve is not implemented in this unit — Unit 13 (lsbx-gateway) owns the \
-                 HTTP server; this subcommand exists on the CLI surface for parity but has \
-                 nothing to construct and hand off to until that crate is merged"
-                    .to_string(),
-            ))
+        Some(Command::Serve {
+            host,
+            port,
+            stream_port,
+            token,
+            reap_ttl,
+            daemon,
+        }) => {
+            dispatch_serve(
+                args,
+                state_dir,
+                host.as_deref(),
+                *port,
+                *stream_port,
+                token.clone(),
+                reap_ttl.as_deref(),
+                *daemon,
+            )
+            .await
         }
-        Some(Command::Bootstrap { .. }) => {
-            // Same boundary as `serve`, for Unit 19 (`lsbx-bootstrap`).
-            Err(LsbxError::ContractViolated(
-                "bootstrap is not implemented in this unit — Unit 19 (lsbx-bootstrap) owns \
-                 host verification and golden flattening; this subcommand exists on the CLI \
-                 surface for parity but has nothing to construct and hand off to until that \
-                 crate is merged"
-                    .to_string(),
-            ))
-        }
+        Some(Command::Bootstrap {
+            target,
+            no_services,
+            no_verify,
+            force,
+            dry_run,
+        }) => dispatch_bootstrap(target.clone(), *no_services, *no_verify, *force, *dry_run, as_json).await,
         Some(Command::Golden { action }) => dispatch_golden(ops, action, as_json).await,
         Some(Command::Config { show, init, set, path, force }) => {
             dispatch_config(ops, *show, *init, set.as_deref(), *path, *force, as_json).await
@@ -685,16 +765,8 @@ async fn dispatch(ops: &LsbxOps, args: &Cli, as_json: bool) -> Result<i32, LsbxE
                 Err(e) => Err(e),
             }
         }
-        Some(Command::Mcp) => {
-            // Boundaries: this unit does not implement mcp's MCP server
-            // (Unit 15) — same shape of gap as `serve`/`bootstrap` above.
-            Err(LsbxError::ContractViolated(
-                "mcp is not implemented in this unit — Unit 15 (lsbx-mcp) owns the stdio MCP \
-                 server; this subcommand exists on the CLI surface for parity but has nothing \
-                 to construct and hand off to until that crate is merged"
-                    .to_string(),
-            ))
-        }
+        Some(Command::Mcp) => dispatch_mcp(args).await,
+        Some(Command::CiBroker { action }) => dispatch_ci_broker(args, action).await,
     }
 }
 
@@ -806,8 +878,8 @@ async fn dispatch_golden(
                 // "replace" (there's nothing to remove first); any other
                 // failure from the delete attempt should not block the
                 // subsequent register, since `replace` promises "make sure
-                // this exists afterward, whatever was there before" rather
-                // than "the delete step itself must succeed."
+                // this exists afterward, whatever was there before"
+                // rather than "the delete step itself must succeed."
                 let _ = ops.golden_delete(name, false).await;
             }
 
@@ -881,6 +953,494 @@ async fn dispatch_config(
     Ok(0)
 }
 
+// ---------------------------------------------------------------------
+// dispatch_bootstrap — Gap 3: wires `lsbx bootstrap` to the real
+// `lsbx_bootstrap::systemd::bootstrap`.
+// ---------------------------------------------------------------------
+
+/// `lsbx bootstrap [--target --no-services --no-verify --force --dry-run]`
+/// -> `lsbx_bootstrap::systemd::bootstrap(BootstrapConfig { .. })`.
+///
+/// Field names/types confirmed by direct re-read of
+/// `crates/lsbx-bootstrap/src/systemd.rs`'s real `BootstrapConfig` (`target:
+/// Option<String>, install_services: bool, verify: bool, force: bool,
+/// dry_run: bool`) immediately before writing this function — `--no-services`/
+/// `--no-verify` are the CLI's own negated-flag spelling of
+/// `install_services`/`verify`, so the two booleans below are inverted from
+/// the CLI flag names, matching `BootstrapConfig`'s own field semantics
+/// exactly (`install_services: !no_services`, `verify: !no_verify`).
+///
+/// This function has no `LsbxOps`/backend dependency at all — bootstrap is
+/// entirely host-verification and systemd-unit-file work
+/// (`lsbx-bootstrap`'s own Boundaries: "does not implement
+/// `create_from_golden` or any domain VM lifecycle"), so it does not take
+/// `ops` as a parameter the way every other dispatch function here does.
+async fn dispatch_bootstrap(
+    target: Option<String>,
+    no_services: bool,
+    no_verify: bool,
+    force: bool,
+    dry_run: bool,
+    as_json: bool,
+) -> Result<i32, LsbxError> {
+    let config = lsbx_bootstrap::systemd::BootstrapConfig {
+        target,
+        install_services: !no_services,
+        verify: !no_verify,
+        force,
+        dry_run,
+    };
+
+    let report = lsbx_bootstrap::systemd::bootstrap(config).await?;
+    println!("{}", format::render(&BootstrapReportDto::from(report), as_json));
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------
+// dispatch_mcp — Gap 3: wires `lsbx mcp` to the real
+// `lsbx_mcp::run_stdio_server`.
+// ---------------------------------------------------------------------
+
+/// `lsbx mcp` -> `lsbx_mcp::run_stdio_server(Arc<LsbxOps>)`.
+///
+/// `run_stdio_server`'s real signature (confirmed by direct re-read of
+/// `crates/lsbx-mcp/src/lib.rs`) takes `ops: std::sync::Arc<lsbx_ops::LsbxOps>`
+/// and blocks until the MCP client disconnects — this is correct MCP
+/// server behavior, not a hang: once this subcommand runs, the CLI process
+/// *becomes* the MCP server for the rest of its life, taking over stdio.
+///
+/// The real `dispatch`/`run` signatures here build one `ops: LsbxOps` (an
+/// owned value, not `Arc`-wrapped) in `run_with_args` and pass a borrowed
+/// `&LsbxOps` into `dispatch`, matching every other subcommand's own needs
+/// — none of them need to own or share it. `run_stdio_server` needs an
+/// owned `Arc`, which a bare `&LsbxOps` cannot produce without either
+/// changing every other dispatch function's signature (unnecessary churn
+/// for one subcommand) or constructing a *fresh* `LsbxOps` from the same
+/// parsed args. Since `mcp` is a terminal subcommand (nothing else in this
+/// process runs after or alongside it — it blocks on stdio until exit),
+/// this function re-resolves a fresh `OpsDeps`/`LsbxOps` from `args` (the
+/// same `Cli` value `run_with_args` already parsed once — passed through
+/// here rather than re-parsed from `std::env::args_os()`, which would
+/// silently diverge from whatever `Cli` value a caller of `run_with_args`
+/// actually supplied, e.g. this crate's own unit tests), wraps *that*
+/// instance in the `Arc` `run_stdio_server` requires, and hands it off.
+/// This means `mcp` builds its backend/store/registry twice (once in
+/// `run_with_args`'s initial `build_deps()` call, whose resulting
+/// `ops: &LsbxOps` `dispatch` receives but cannot reuse across an
+/// ownership boundary, and once more here) — a real, small inefficiency,
+/// documented here rather than hidden, and harmless in practice since both
+/// constructions are cheap (`SandboxStore`/`CiJobStore`/`ImageRegistry` are
+/// plain, synchronous, non-pooled handles, and
+/// `DemoBackend`/`LibvirtBackend`/`ExedevBackend` construction does no
+/// expensive work up front beyond what `build_backend` already does for
+/// the first call).
+async fn dispatch_mcp(args: &Cli) -> Result<i32, LsbxError> {
+    let deps = build_deps(args, None).await?;
+    let mcp_ops = std::sync::Arc::new(deps.into_ops());
+
+    lsbx_mcp::run_stdio_server(mcp_ops).await?;
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------
+// dispatch_serve — Gap 1/3: wires `lsbx serve` to the real
+// `lsbx_gateway`/`lsbx_stream`, with a background reap loop.
+// ---------------------------------------------------------------------
+
+/// Default port `lsbx serve` binds when `--port` is not given. Chosen to
+/// match the existing gateway's own documented default
+/// (SPEC.md §4.8's Door 2 preserves "the exact existing route table" —
+/// the existing Python gateway's own default port).
+const DEFAULT_SERVE_PORT: u16 = 8080;
+
+/// Floor for the background reap-loop interval — see [`reap_loop_interval`]
+/// for the full design rationale.
+const MIN_REAP_LOOP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default reap TTL when `--reap-ttl` is not given, matching the same
+/// zero-TTL-means-"sweep iff expired" default every other TTL-accepting
+/// subcommand (`reap --ttl`) already uses in this crate.
+const DEFAULT_SERVE_REAP_TTL: Duration = Duration::ZERO;
+
+/// `lsbx serve [--host --port --stream-port --token --reap-ttl --daemon]`.
+///
+/// ## Design (already decided; this function implements it)
+///
+/// **Single vs. dual listener.** When `stream_port` is unset, or set to the
+/// same value as `port`, this runs ONE bound server on `port` serving the
+/// gateway's own merged router — per Gap 1 (`lsbx-gateway`'s
+/// `GatewayDeps::build_router`), that router already includes
+/// `lsbx-stream`'s mounted `/stream/*`, `/console`, `/consoles/*` routes
+/// alongside the gateway's own REST routes, so "the merged router" and
+/// "gateway + stream together" are the same thing at this point in the
+/// integration. This is the default, simplest mode — most deployments have
+/// no reason to split gateway and stream traffic onto separate ports.
+///
+/// When `stream_port` is explicitly set to a *different* value than `port`,
+/// this runs TWO independent bound servers concurrently, via `tokio::join!`:
+/// one gateway-*only* listener on `port` (the plain `routes::build_router`
+/// router, deliberately bypassing the Gap 1 merge — this is the one place
+/// in this codebase that constructs the gateway's route table without also
+/// mounting `lsbx-stream`, precisely because the caller asked for the two
+/// to be reachable on separate ports), and one stream-*only* listener on
+/// `stream_port` (`lsbx_stream::router` constructed directly, with its own
+/// second `Arc<SandboxStore>` — the same one `GatewayDeps` would have built
+/// internally, just constructed here instead since this path never calls
+/// `GatewayDeps::build_router` at all).
+///
+/// **Background reap loop.** Either way, this also spawns a background
+/// task that calls `LsbxOps::reap(reap_ttl, dry_run: false)` on an
+/// interval, logging the result via `tracing` and never letting a reap
+/// error crash the serve loop (a failed reap pass is logged and retried
+/// next interval, not propagated up to tear down the whole `serve`
+/// invocation — a transient backend hiccup during a reap sweep must not
+/// take down request-serving). The interval is `reap_ttl / 4`, floored at
+/// `MIN_REAP_LOOP_INTERVAL` (30s) — see [`reap_loop_interval`]'s own doc
+/// comment for why this specific formula was chosen; it is a judgment
+/// call, documented here and at the call site, not a value derived from
+/// any acceptance criterion this task names literally.
+///
+/// **`--daemon` semantics — a deliberate deviation from what the flag name
+/// might suggest.** This does **not** implement real Unix double-fork
+/// daemonization. Forking a multi-threaded Tokio process is unsafe (only
+/// async-signal-safe syscalls may run between `fork()` and `exec()`/`exit()`
+/// in the child, and a Tokio runtime's worker threads, timers, and I/O
+/// driver are not in any way fork-safe once the runtime has started) and is
+/// not how this system is meant to be deployed — systemd already supervises
+/// the two broker services per Unit 19/AGENTS.md's "Broker operations"
+/// section (`lsbx-ci-broker`, `lsbx-ci-broker-exe`), and the same
+/// operational pattern applies here: a real deployment runs `lsbx serve`
+/// under its own systemd unit (or `nohup`, or an equivalent process
+/// supervisor), which already provides real backgrounding, restart-on-
+/// failure, and log capture — all the things a real daemonization
+/// implementation would otherwise need to reinvent. Concretely, `--daemon`
+/// here means: suppress the human-readable startup banner this function
+/// would otherwise print to stdout (so a systemd unit's captured stdout
+/// stays clean of a banner meant for an interactive terminal), and nothing
+/// else. Real backgrounding remains the operator's/systemd's job. This is
+/// documented here, in the PR description, and is a deliberate deviation
+/// from what the flag name might otherwise suggest.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_serve(
+    args: &Cli,
+    state_dir: PathBuf,
+    host: Option<&str>,
+    port: Option<u16>,
+    stream_port: Option<u16>,
+    token: Option<String>,
+    reap_ttl: Option<&str>,
+    daemon: bool,
+) -> Result<i32, LsbxError> {
+    let host_str = host.unwrap_or("127.0.0.1");
+    let host_ip: std::net::IpAddr = host_str.parse().map_err(|e| {
+        LsbxError::Usage(format!("invalid --host value '{host_str}': {e}"))
+    })?;
+    let gateway_port = port.unwrap_or(DEFAULT_SERVE_PORT);
+    let reap_ttl_duration = match reap_ttl {
+        Some(s) => parse_duration(s)?,
+        None => DEFAULT_SERVE_REAP_TTL,
+    };
+
+    let gateway_config = || lsbx_gateway::GatewayConfig {
+        token: token.clone(),
+        allow_local_files: false,
+        insecure: false,
+        rate_limit: lsbx_gateway::RateLimitConfig::default(),
+    };
+
+    // Re-resolve a second, independent `LsbxOps` for the same reason
+    // `dispatch_mcp` does (see that function's own doc comment): `serve`
+    // needs an owned value to move into the background reap task and,
+    // in the dual-listener branch, into a second concurrently-running
+    // server — a bare `&LsbxOps` borrow cannot outlive this function's own
+    // stack frame across `tokio::spawn`/`tokio::join!`. `GatewayDeps`
+    // itself takes ownership of an `Arc<LsbxOps>`, so the *serving* side
+    // needs an `Arc` either way; re-resolving from `args` (the same `Cli`
+    // value `run_with_args` already parsed, threaded through rather than
+    // re-parsed from `std::env::args_os()` — see `dispatch_mcp`'s own doc
+    // comment for why) keeps every other subcommand's signature exactly as
+    // simple as it already is, rather than requiring `run_with_args`'s
+    // original `ops` binding to already be an `Arc` just for this one
+    // subcommand's sake.
+    let serve_deps = build_deps(args, None).await?;
+    let serve_state_dir = state_dir.clone();
+    let reap_ops = std::sync::Arc::new(serve_deps.into_ops());
+
+    if !daemon {
+        println!("lsbx serve: starting on {host_str}:{gateway_port}");
+    }
+
+    // Background reap loop, spawned once regardless of single- vs.
+    // dual-listener mode — see this function's own doc comment for the
+    // interval formula and the "never let a reap error crash serving"
+    // guarantee.
+    let reap_loop_ops = std::sync::Arc::clone(&reap_ops);
+    let reap_interval = reap_loop_interval(reap_ttl_duration);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(reap_interval);
+        loop {
+            ticker.tick().await;
+            match reap_loop_ops.reap(reap_ttl_duration, false).await {
+                Ok(report) => {
+                    tracing::info!(
+                        destroyed = ?report.destroyed,
+                        keys_reconciled = report.keys_reconciled,
+                        "lsbx serve: background reap pass completed"
+                    );
+                }
+                Err(e) => {
+                    // Never let a reap error crash the serve loop — log
+                    // and retry on the next interval tick.
+                    tracing::warn!(error = %e, "lsbx serve: background reap pass failed; will retry next interval");
+                }
+            }
+        }
+    });
+
+    let dual_listener = matches!(stream_port, Some(sp) if sp != gateway_port);
+
+    if !dual_listener {
+        // Single merged listener: the gateway's own router already
+        // includes lsbx-stream's mounted routes (Gap 1).
+        let deps = lsbx_gateway::GatewayDeps {
+            ops: reap_ops,
+            state_dir: serve_state_dir,
+        };
+        let addr = std::net::SocketAddr::new(host_ip, gateway_port);
+        let bound = lsbx_gateway::run_server(deps, gateway_config(), addr).await?;
+        if !daemon {
+            println!(
+                "lsbx serve: listening on {} (gateway + stream, merged)",
+                bound.local_addr
+            );
+        }
+        bound
+            .serve()
+            .await
+            .map_err(|e| LsbxError::ContractViolated(format!("gateway server error: {e}")))?;
+        Ok(0)
+    } else {
+        // Dual listener: gateway-only on `port`, stream-only on
+        // `stream_port` — two independent bound servers run concurrently.
+        #[allow(clippy::unwrap_used)] // `dual_listener` above already proved `stream_port` is `Some`.
+        let stream_port_value = stream_port.unwrap();
+
+        let gateway_router = lsbx_gateway::build_router(std::sync::Arc::clone(&reap_ops), gateway_config());
+        let gateway_addr = std::net::SocketAddr::new(host_ip, gateway_port);
+        let gateway_listener = tokio::net::TcpListener::bind(gateway_addr).await.map_err(|e| {
+            LsbxError::ContractViolated(format!("failed to bind gateway listener on {gateway_addr}: {e}"))
+        })?;
+
+        let stream_store = std::sync::Arc::new(lsbx_store::sandbox_store::SandboxStore::new(state_dir.clone()));
+        let stream_router = lsbx_stream::router(lsbx_stream::StreamState {
+            ops: reap_ops,
+            store: stream_store,
+        });
+        let stream_addr = std::net::SocketAddr::new(host_ip, stream_port_value);
+        let stream_listener = tokio::net::TcpListener::bind(stream_addr).await.map_err(|e| {
+            LsbxError::ContractViolated(format!("failed to bind stream listener on {stream_addr}: {e}"))
+        })?;
+
+        if !daemon {
+            println!("lsbx serve: listening on {gateway_addr} (gateway) and {stream_addr} (stream)");
+        }
+
+        let gateway_serve = axum::serve(
+            gateway_listener,
+            gateway_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        );
+        let stream_serve = axum::serve(
+            stream_listener,
+            stream_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        );
+
+        let (gateway_result, stream_result) = tokio::join!(gateway_serve, stream_serve);
+        gateway_result
+            .map_err(|e| LsbxError::ContractViolated(format!("gateway server error: {e}")))?;
+        stream_result
+            .map_err(|e| LsbxError::ContractViolated(format!("stream server error: {e}")))?;
+        Ok(0)
+    }
+}
+
+/// The background reap loop's interval: `reap_ttl / 4`, floored at
+/// [`MIN_REAP_LOOP_INTERVAL`] (30s).
+///
+/// This is a judgment call — no acceptance criterion this task names
+/// specifies an exact formula, only "every some sensible interval (say,
+/// `reap_ttl / 4`, floored at a reasonable minimum like 30s — use your
+/// judgment, document it)." `reap_ttl / 4` means a lease is swept, on
+/// average, within a quarter of its own grace window after becoming
+/// eligible — frequent enough that `reap`'s own TTL configuration remains
+/// meaningful (a TTL of 10 minutes but a reap loop that only runs once an
+/// hour would make the TTL setting nearly decorative), without polling so
+/// aggressively that a `reap_ttl` of 0 (the default — "sweep iff expired")
+/// would imply an interval of 0 and busy-loop the reap task. The 30-second
+/// floor exists precisely for that zero/near-zero-TTL case: a `reap_ttl` of
+/// 0 or a few seconds still gets a real, bounded reap cadence (30s) rather
+/// than an unboundedly tight loop hammering the backend's `list_vms()`/
+/// `destroy()` calls.
+fn reap_loop_interval(reap_ttl: Duration) -> Duration {
+    let quarter = Duration::from_secs_f64(reap_ttl.as_secs_f64() / 4.0);
+    quarter.max(MIN_REAP_LOOP_INTERVAL)
+}
+
+// ---------------------------------------------------------------------
+// dispatch_ci_broker — Gap 3: the new `lsbx ci-broker run` subcommand,
+// wiring `lsbx-broker`'s real `run_broker` to a real GitHub client built
+// from the LSBX_GITHUB_APP_* environment variables (documented in root
+// AGENTS.md) or the gh CLI fallback.
+// ---------------------------------------------------------------------
+
+/// `LSBX_QUEUE_LABEL` is already documented in root `AGENTS.md` (used by
+/// `lsbx_broker::poll::PollConfig::from_queue_label_and_env`, which this
+/// function's own `PollConfig` construction below also reads through
+/// indirectly via `--queue-label`/this env var). The four
+/// `LSBX_GITHUB_APP_*` variables below are new, added by this pass,
+/// following the same `LSBX_*` naming convention — see root `AGENTS.md`'s
+/// new "CI broker environment variables" section for the authoritative
+/// documentation this doc comment summarizes.
+const QUEUE_LABEL_ENV: &str = "LSBX_QUEUE_LABEL";
+const GITHUB_APP_ID_ENV: &str = "LSBX_GITHUB_APP_ID";
+const GITHUB_APP_PRIVATE_KEY_PATH_ENV: &str = "LSBX_GITHUB_APP_PRIVATE_KEY_PATH";
+const GITHUB_APP_INSTALLATION_ID_ENV: &str = "LSBX_GITHUB_APP_INSTALLATION_ID";
+const GITHUB_APP_OWNER_ENV: &str = "LSBX_GITHUB_APP_OWNER";
+
+/// Default lease every CI-dispatched sandbox gets, when no more specific
+/// configuration exists for it. `lsbx-broker`'s own `Reconciler::dispatch`
+/// takes a `lease: Duration` parameter with no built-in default (the
+/// interface contract leaves lease policy to the caller) — one hour is a
+/// reasonable default bound for a CI job's own runner VM lifetime, matching
+/// the same 1-hour default `lsbx up`'s own `DEFAULT_LEASE` already uses
+/// elsewhere in this file for the identical "no explicit lease given"
+/// case.
+const DEFAULT_CI_BROKER_LEASE: Duration = Duration::from_secs(3600);
+
+/// `lsbx ci-broker run --backend=<libvirt|exedev|demo|auto> [--queue-label]`.
+///
+/// Builds a real `LsbxOps`/`CiJobStore`/`GitHubClient` the same way
+/// `build_deps()` already does for every other command (reusing that exact
+/// function, not a parallel construction path), then calls the real
+/// `lsbx_broker::reconcile::run_broker(&job_store, &ops, &github,
+/// BrokerConfig { poll, lease }, iterations: None)` — runs forever, per
+/// `run_broker`'s own documented `iterations: Option<u32>` contract
+/// (`None` means "run until the process is killed," matching how systemd
+/// supervises `lsbx-ci-broker`/`lsbx-ci-broker-exe` per AGENTS.md's
+/// "Broker operations" section).
+///
+/// ## GitHub App credential resolution (new: `LSBX_GITHUB_APP_*`)
+///
+/// When both `LSBX_GITHUB_APP_ID` and `LSBX_GITHUB_APP_PRIVATE_KEY_PATH`
+/// are set, this builds a real `lsbx_broker::auth::GitHubAppConfig` (`app_id`
+/// parsed from the former, `private_key_pem` read from the file named by
+/// the latter, `installation_id` parsed from `LSBX_GITHUB_APP_INSTALLATION_ID`
+/// when present or left `None` for `GitHubAppAuth` to discover on first use
+/// — its own real, already-implemented behavior, confirmed against
+/// `crates/lsbx-broker/src/auth.rs`), and calls
+/// `GitHubClient::from_app_auth(&auth, owner)`, where `owner` comes from
+/// the also-new `LSBX_GITHUB_APP_OWNER` (required whenever the App-credential
+/// path is used at all, since `from_app_auth`'s real signature needs an
+/// `owner: &str` to scope the installation-token exchange to).
+///
+/// When either `LSBX_GITHUB_APP_ID` or `LSBX_GITHUB_APP_PRIVATE_KEY_PATH`
+/// is unset, this falls back to `GitHubClient::from_gh_cli_fallback()` —
+/// exactly the same fallback `lsbx-broker` itself already documents and
+/// implements for local dev/testing without full GitHub App credentials
+/// (confirmed against `crates/lsbx-broker/src/github_client.rs`'s real,
+/// already-merged `from_gh_cli_fallback` constructor — this function does
+/// not invent a new fallback mechanism, it invokes the existing one).
+async fn dispatch_ci_broker(args: &Cli, action: &CiBrokerCommand) -> Result<i32, LsbxError> {
+    match action {
+        CiBrokerCommand::Run { backend, queue_label } => {
+            // Reuse build_deps()'s exact construction path for
+            // backend/store/registry, the same way dispatch_mcp/dispatch_serve
+            // do — see those functions' own doc comments for the general
+            // pattern. `ci-broker run`'s own `--backend` flag (scoped to
+            // `CiBrokerCommand::Run`, distinct from the top-level `Cli`'s
+            // global `--backend`) is passed as `build_deps`'s
+            // `backend_override` parameter, taking precedence over
+            // whatever `args.backend` happens to hold (which is `None`
+            // for this subcommand in practice, since a caller invoking
+            // `lsbx ci-broker run --backend=X` has no reason to also pass
+            // the top-level `--backend` flag — but the override parameter
+            // makes the precedence explicit either way, rather than
+            // requiring `Cli`/`Command` to derive `Clone` just to
+            // reconstruct a synthetic top-level `Cli` value the way an
+            // earlier draft of this function did).
+            let deps = build_deps(args, Some(backend.clone())).await?;
+            let state_dir = deps.state_dir.clone();
+            let job_store = CiJobStore::new(state_dir);
+            let ops = deps.into_ops();
+
+            let queue_label_value = queue_label
+                .clone()
+                .or_else(|| std::env::var(QUEUE_LABEL_ENV).ok())
+                .unwrap_or_else(|| lsbx_broker::poll::FALLBACK_QUEUE_LABEL.to_string());
+            let poll_config = lsbx_broker::poll::PollConfig::from_queue_label_and_env(&queue_label_value);
+
+            let github = build_github_client().await?;
+
+            let broker_config = lsbx_broker::reconcile::BrokerConfig {
+                poll: poll_config,
+                lease: DEFAULT_CI_BROKER_LEASE,
+            };
+
+            lsbx_broker::reconcile::run_broker(&job_store, &ops, &github, broker_config, None).await?;
+            Ok(0)
+        }
+    }
+}
+
+/// Resolves a real `lsbx_broker::github_client::GitHubClient`: the GitHub
+/// App credential path when `LSBX_GITHUB_APP_ID`/`LSBX_GITHUB_APP_PRIVATE_KEY_PATH`
+/// are both set, falling back to `GitHubClient::from_gh_cli_fallback()`
+/// otherwise. See [`dispatch_ci_broker`]'s own doc comment for the full
+/// design writeup.
+async fn build_github_client() -> Result<lsbx_broker::github_client::GitHubClient, LsbxError> {
+    let app_id = std::env::var(GITHUB_APP_ID_ENV).ok();
+    let private_key_path = std::env::var(GITHUB_APP_PRIVATE_KEY_PATH_ENV).ok();
+
+    match (app_id, private_key_path) {
+        (Some(app_id_str), Some(key_path)) => {
+            let app_id: u64 = app_id_str.parse().map_err(|_| {
+                LsbxError::Usage(format!(
+                    "{GITHUB_APP_ID_ENV} value '{app_id_str}' is not a valid u64"
+                ))
+            })?;
+            let private_key_pem = std::fs::read_to_string(&key_path).map_err(|e| {
+                LsbxError::BackendUnavailable(format!(
+                    "failed to read {GITHUB_APP_PRIVATE_KEY_PATH_ENV} file '{key_path}': {e}"
+                ))
+            })?;
+            let installation_id = std::env::var(GITHUB_APP_INSTALLATION_ID_ENV)
+                .ok()
+                .map(|s| {
+                    s.parse::<u64>().map_err(|_| {
+                        LsbxError::Usage(format!(
+                            "{GITHUB_APP_INSTALLATION_ID_ENV} value '{s}' is not a valid u64"
+                        ))
+                    })
+                })
+                .transpose()?;
+            let owner = std::env::var(GITHUB_APP_OWNER_ENV).map_err(|_| {
+                LsbxError::Usage(format!(
+                    "{GITHUB_APP_OWNER_ENV} is required when {GITHUB_APP_ID_ENV} and \
+                     {GITHUB_APP_PRIVATE_KEY_PATH_ENV} are set (the installation-token \
+                     exchange is scoped per-owner)"
+                ))
+            })?;
+
+            let auth = lsbx_broker::auth::GitHubAppAuth::new(lsbx_broker::auth::GitHubAppConfig {
+                app_id,
+                private_key_pem,
+                installation_id,
+            })?;
+            lsbx_broker::github_client::GitHubClient::from_app_auth(&auth, &owner).await
+        }
+        _ => Ok(lsbx_broker::github_client::GitHubClient::from_gh_cli_fallback()),
+    }
+}
+
 fn parse_flavor(input: &str) -> Result<GoldenFlavor, LsbxError> {
     match input.to_lowercase().as_str() {
         "desktop" => Ok(GoldenFlavor::Desktop),
@@ -921,11 +1481,11 @@ fn is_expired_public(sandbox: &PublicSandbox, now: std::time::SystemTime) -> boo
 //
 // Every real LsbxOps response type this crate touches is routed through
 // `format::render`/`format::render_result`. Types that are not themselves
-// `Serialize` (StatusReport, ReapReport, HealthcheckResult, CommandOutput —
-// none of the real `lsbx-ops`/`lsbx-lifecycle`/`lsbx-golden` types derive
-// it) are translated into a small local DTO defined here that does, rather
-// than this crate reaching into those crates to add a derive they didn't
-// ask for.
+// `Serialize` (StatusReport, ReapReport, HealthcheckResult, CommandOutput,
+// BootstrapReport — none of the real `lsbx-ops`/`lsbx-lifecycle`/
+// `lsbx-golden`/`lsbx-bootstrap` types derive it) are translated into a
+// small local DTO defined here that does, rather than this crate reaching
+// into those crates to add a derive they didn't ask for.
 // ---------------------------------------------------------------------
 
 impl Formattable for PublicSandbox {
@@ -1056,6 +1616,47 @@ impl Formattable for ReapReportDto {
             ("would_destroy", self.would_destroy.join(", ")),
             ("keys_reconciled", self.keys_reconciled.to_string()),
         ])
+    }
+}
+
+/// DTO for `lsbx_bootstrap::systemd::BootstrapReport` (Gap 3) — that type
+/// derives no `Serialize`, matching every other non-`Serialize`
+/// sibling-crate response type this crate already wraps in a local DTO
+/// above.
+#[derive(Serialize)]
+struct BootstrapReportDto {
+    actions_taken: Vec<String>,
+    actions_would_take: Vec<String>,
+}
+
+impl From<lsbx_bootstrap::systemd::BootstrapReport> for BootstrapReportDto {
+    fn from(r: lsbx_bootstrap::systemd::BootstrapReport) -> Self {
+        Self {
+            actions_taken: r.actions_taken,
+            actions_would_take: r.actions_would_take,
+        }
+    }
+}
+
+impl Formattable for BootstrapReportDto {
+    fn to_human_table(&self) -> String {
+        let mut lines = Vec::new();
+        if !self.actions_taken.is_empty() {
+            lines.push("actions taken:".to_string());
+            for action in &self.actions_taken {
+                lines.push(format!("  - {action}"));
+            }
+        }
+        if !self.actions_would_take.is_empty() {
+            lines.push("actions that would be taken (--dry-run):".to_string());
+            for action in &self.actions_would_take {
+                lines.push(format!("  - {action}"));
+            }
+        }
+        if lines.is_empty() {
+            lines.push("(no actions)".to_string());
+        }
+        lines.join("\n")
     }
 }
 

@@ -70,6 +70,7 @@ fn top_level_help_lists_every_subcommand() {
         &[
             "up", "down", "list", "exec", "put", "get", "renew", "console", "info", "status",
             "profiles", "images", "reap", "serve", "bootstrap", "golden", "config", "logs", "mcp",
+            "ci-broker",
         ],
         "top-level --help subcommand list",
     );
@@ -215,4 +216,12 @@ fn version_flag_prints_a_version() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.to_lowercase().contains("lsbx"));
+}
+
+/// Gap 3 (final integration wiring pass): `ci-broker run` is a new real
+/// subcommand — its own help text must list the flags this pass added.
+#[test]
+fn ci_broker_run_help_lists_its_flags() {
+    let help = run_help(&["ci-broker", "run"]);
+    assert_contains_all(&help, &["--backend", "--queue-label"], "`lsbx ci-broker run --help`");
 }

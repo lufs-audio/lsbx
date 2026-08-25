@@ -25,6 +25,22 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+# Gap 3 (final integration wiring): wires `bootstrap`, `mcp`, `serve`, and
+# the new `ci-broker run` subcommands to their real crates — see lib.rs's
+# module doc comment for the full design.
+lsbx-bootstrap = { workspace = true }
+lsbx-mcp = { workspace = true }
+lsbx-gateway = { workspace = true }
+lsbx-stream = { workspace = true }
+lsbx-broker = { workspace = true }
+tracing = { workspace = true }
+# `dispatch_serve`'s dual-listener branch (Gap 1/3) constructs two
+# `axum::serve(...)` futures directly (bypassing `lsbx-gateway`'s own
+# `run_server`, which only supports the single-merged-listener case) — this
+# crate therefore needs a direct `axum` dependency edge to name
+# `axum::serve`/`axum::Router::into_make_service_with_connect_info` itself,
+# not just transitively through `lsbx-gateway`/`lsbx-stream`.
+axum = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

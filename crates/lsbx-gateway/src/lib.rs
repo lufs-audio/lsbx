@@ -20,21 +20,64 @@
 //! that the whole unit.
 //!
 //! `run_server` returns the bound `axum::serve` future rather than
-//! `.await`-ing it internally, so a caller (the eventual `lsbx serve` CLI
-//! subcommand, or this crate's own tests) decides whether/how long to run
-//! it — blocking a test's whole async runtime inside a library function
-//! with no cancellation handle would make "does the fail-closed check
-//! actually prevent a bind" and "does a passing check actually produce a
-//! live listener" impossible to test independently within a bounded test
-//! timeout. The unit contract does not specify a concrete return type for
-//! `run_server`, and the safer, more composable choice — given every other
-//! unit in this system's own stated preference for typed, awaitable
-//! results over ambient blocking (SPEC.md §1's "ran vs. proven" framing
-//! applies here too: a function that blocks forever internally can't ever
-//! report whether serving actually failed) — is to hand back something
-//! awaitable rather than block the caller's `main` directly. This is
-//! called out explicitly here (and in this crate's own PR description) as
-//! the judgment call it is, not a silent deviation.
+//! `.await`-ing it internally, so a caller (the `lsbx serve` CLI
+//! subcommand — see Gap 1/Gap 3 note below — or this crate's own tests)
+//! decides whether/how long to run it — blocking a test's whole async
+//! runtime inside a library function with no cancellation handle would make
+//! "does the fail-closed check actually prevent a bind" and "does a passing
+//! check actually produce a live listener" impossible to test independently
+//! within a bounded test timeout. The unit contract does not specify a
+//! concrete return type for `run_server`, and the safer, more composable
+//! choice — given every other unit in this system's own stated preference
+//! for typed, awaitable results over ambient blocking (SPEC.md §1's "ran
+//! vs. proven" framing applies here too: a function that blocks forever
+//! internally can't ever report whether serving actually failed) — is to
+//! hand back something awaitable rather than block the caller's `main`
+//! directly. This is called out explicitly here (and in this crate's own
+//! PR description) as the judgment call it is, not a silent deviation.
+//!
+//! ## Gap 1 (final integration wiring pass): mounting `lsbx-stream`'s router
+//!
+//! As merged, this crate's `build_router` produced a REST-only `Router`
+//! with no `/stream/*`, `/console`, or `/consoles/*` routes — those live in
+//! `lsbx-stream` (Unit 14), which was built and merged as an independent
+//! sub-router with no caller wiring it in yet (confirmed by direct re-read
+//! of `crates/lsbx-stream/src/lib.rs`'s own module doc comment at the time
+//! of this pass: "Unit 13 has not yet landed on `main` — see this crate's
+//! PR description for what that means for verifying that composition point
+//! today"). [`GatewayDeps::build_router`] below closes that gap: it
+//! constructs `lsbx_stream::StreamState { ops, store }` — a *second*,
+//! independent `Arc<lsbx_store::sandbox_store::SandboxStore>` pointed at
+//! the same `state_dir` the caller's own `LsbxOps` was built from, per
+//! `lsbx-stream`'s own documented design (`SandboxStore` has no `Clone` —
+//! confirmed against `crates/lsbx-store/src/sandbox_store.rs`, which
+//! derives no `Clone` at all — so two owners of the same on-disk state each
+//! get their own plain, cheap, synchronous-`fs`-backed instance rather than
+//! sharing one object; this is the exact same pattern
+//! `lsbx-ops`'s own `tests/test_all_operations.rs` uses for its reap test,
+//! and the exact same pattern `lsbx-stream`'s own module doc comment
+//! documents as intentional) — builds `lsbx_stream::router(stream_state)`,
+//! and `.merge()`s it with this crate's own REST router, so a single bound
+//! gateway server (one `TcpListener`, one `axum::serve` call) serves both
+//! route families together.
+//!
+//! `routes::build_router` (this crate's own standalone, full REST router)
+//! is left unchanged for callers that want this crate's REST surface in
+//! isolation (its own test suite, or a caller with no `lsbx-stream`
+//! mounted). The merge in [`GatewayDeps::build_router`] instead calls
+//! `routes::build_router_for_merge`, a merge-specific variant — see that
+//! function's own doc comment for why: this crate (Unit 13) and
+//! `lsbx-stream` (Unit 14) were each built independently and both
+//! registered their own, differently-shaped `GET /console` and
+//! `GET /consoles/{id}` handlers, which panics axum's router builder with
+//! an "Overlapping method route" error if both are merged verbatim (a
+//! real conflict this pass's own smoke test caught, not a hypothetical
+//! one). `build_router_for_merge` omits this crate's own colliding
+//! `/console`/`/consoles/{id}` registrations so `lsbx-stream`'s versions —
+//! the ones this pass's own task description names explicitly as part of
+//! the merged surface — are what the merged router actually serves for
+//! those two paths; every other route this crate owns (including the
+//! non-colliding `GET /consoles` list endpoint) is unaffected.
 
 pub mod auth;
 pub mod ratelimit;
@@ -46,7 +89,55 @@ pub use routes::{build_router, GatewayConfig};
 use lsbx_kernel::error::LsbxError;
 use lsbx_ops::LsbxOps;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Everything needed to build the *merged* router (this crate's own REST
+/// routes plus `lsbx-stream`'s mounted sub-router) — the Gap 1 composition
+/// root.
+///
+/// `state_dir` is the same directory the caller already built its
+/// `Arc<LsbxOps>` from (via a `SandboxStore` internal to that `LsbxOps`,
+/// which this crate has no accessor for — `LsbxOps`'s `sandbox_store`
+/// field is private by design, confirmed against
+/// `crates/lsbx-ops/src/lib.rs`). This struct exists specifically so a
+/// caller (the CLI's `serve` subcommand, or this crate's own tests) can
+/// hand both the already-built `LsbxOps` and the raw `state_dir` needed to
+/// construct `lsbx-stream`'s own independent `SandboxStore`, without this
+/// crate needing to reach into `LsbxOps`'s private internals (which it
+/// cannot) or `lsbx-ops` needing to grow a new accessor for a door-level
+/// composition concern that isn't `lsbx-ops`'s job either.
+pub struct GatewayDeps {
+    pub ops: Arc<LsbxOps>,
+    pub state_dir: PathBuf,
+}
+
+impl GatewayDeps {
+    /// Builds the merged router: this crate's own REST routes
+    /// (`routes::build_router`) merged with `lsbx-stream`'s mounted
+    /// sub-router (`/stream/*`, `/console`, `/consoles/*`) — see this
+    /// module's "Gap 1" doc comment for the full design rationale.
+    ///
+    /// Constructs a second, independent `lsbx_store::sandbox_store::SandboxStore`
+    /// pointed at the same `state_dir` `self.ops` was itself built from —
+    /// this is the one new piece of state this function adds beyond what
+    /// `routes::build_router` already needed, and it exists solely to
+    /// satisfy `lsbx-stream`'s own documented `StreamState` shape.
+    pub fn build_router(self, config: GatewayConfig) -> axum::Router {
+        let rest_router = routes::build_router_for_merge(Arc::clone(&self.ops), config);
+
+        let stream_store = Arc::new(lsbx_store::sandbox_store::SandboxStore::new(
+            self.state_dir.clone(),
+        ));
+        let stream_state = lsbx_stream::StreamState {
+            ops: self.ops,
+            store: stream_store,
+        };
+        let stream_router = lsbx_stream::router(stream_state);
+
+        rest_router.merge(stream_router)
+    }
+}
 
 /// The result of [`run_server`]'s fail-closed bind check, and (on success)
 /// the live server future ready to be awaited.
@@ -79,7 +170,10 @@ impl BoundServer {
 
 /// Checks the fail-closed bind precondition (this unit's acceptance
 /// criteria) and, if it passes, actually binds `addr` and constructs the
-/// live server. Returns `Err(LsbxError::AuthFailed)` when a non-loopback
+/// live server — now serving the merged router (this crate's own REST
+/// routes plus `lsbx-stream`'s mounted sub-router; see this module's "Gap
+/// 1" doc comment) rather than the REST-only router `build_router` alone
+/// would produce. Returns `Err(LsbxError::AuthFailed)` when a non-loopback
 /// bind is attempted without both a configured token and `insecure: true`
 /// — `AuthFailed` (exit code 7 per SPEC.md §6) is the correct mapping
 /// since this is exactly "a gateway bearer-auth rejection" at the
@@ -92,13 +186,13 @@ impl BoundServer {
 /// call itself failed, which is a different claim than "this bind was
 /// never authorized to happen."
 pub async fn run_server(
-    ops: Arc<LsbxOps>,
+    deps: GatewayDeps,
     config: GatewayConfig,
     addr: SocketAddr,
 ) -> Result<BoundServer, LsbxError> {
     enforce_fail_closed_bind(&config, addr.ip())?;
 
-    let router = routes::build_router(ops, config);
+    let router = deps.build_router(config);
 
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         LsbxError::ContractViolated(format!("failed to bind gateway listener on {addr}: {e}"))
@@ -201,5 +295,65 @@ mod tests {
     fn non_loopback_with_both_token_and_insecure_is_allowed() {
         let cfg = config(Some("secret"), true);
         assert!(enforce_fail_closed_bind(&cfg, "0.0.0.0".parse().unwrap()).is_ok());
+    }
+
+    /// Gap 1 smoke test: builds the merged router via `GatewayDeps::build_router`
+    /// against a real `DemoBackend`-backed `LsbxOps`, and confirms — through
+    /// one HTTP request per route family, both served through the SAME
+    /// `Router` value — that both this crate's own REST routes and
+    /// `lsbx-stream`'s mounted routes are actually reachable together. Per
+    /// the task's own instructions this is a smoke test, not a rebuild of
+    /// `lsbx-stream`'s own test suite (which already covers that crate's
+    /// routes in depth, in its own crate).
+    #[tokio::test]
+    async fn merged_router_serves_both_gateway_and_stream_routes() {
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sandbox_store = lsbx_store::sandbox_store::SandboxStore::new(dir.path().to_path_buf());
+        let ci_job_store = lsbx_store::ci_job_store::CiJobStore::new(dir.path().to_path_buf());
+        let registry = lsbx_golden::registry::ImageRegistry {
+            images: vec![],
+            goldens: vec![],
+            profiles: std::collections::HashMap::new(),
+        };
+        let backend = lsbx_backend_demo::DemoBackend::new();
+        let clock = Box::new(lsbx_kernel::clock::SystemClock);
+        let ops = Arc::new(LsbxOps::new(
+            Box::new(backend),
+            "demo".to_string(),
+            sandbox_store,
+            ci_job_store,
+            registry,
+            clock,
+        ));
+
+        let deps = GatewayDeps {
+            ops,
+            state_dir: dir.path().to_path_buf(),
+        };
+        let gw_config = config(Some("test-token"), false);
+        let router = deps.build_router(gw_config);
+
+        // One gateway route (an authenticated REST route from routes.rs):
+        // /health with the configured bearer token must succeed.
+        let health_req = axum::http::Request::builder()
+            .uri("/health")
+            .header("Authorization", "Bearer test-token")
+            .body(axum::body::Body::empty())
+            .expect("build health request");
+        let health_response = router.clone().oneshot(health_req).await.expect("oneshot health");
+        assert_eq!(health_response.status(), axum::http::StatusCode::OK);
+
+        // One stream-crate route (the unauthenticated /console page from
+        // lsbx-stream, mounted via this merge): must be served by the SAME
+        // router value, proving the merge actually happened rather than
+        // two separately-bound servers.
+        let console_req = axum::http::Request::builder()
+            .uri("/console?target=sbx-does-not-matter")
+            .body(axum::body::Body::empty())
+            .expect("build console request");
+        let console_response = router.oneshot(console_req).await.expect("oneshot console");
+        assert_eq!(console_response.status(), axum::http::StatusCode::OK);
     }
 }
