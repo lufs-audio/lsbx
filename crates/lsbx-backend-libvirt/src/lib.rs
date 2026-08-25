@@ -425,11 +425,29 @@ impl Backend for LibvirtBackend {
         // (libvirt.py:284). This ensures `poll_ready`'s healthchecks can
         // SSH into the guest immediately without re-blocking on a fresh
         // 180 s IP poll every time.
-        let guest_ip = self.guest_host_for(&vm_tag).await?;
-        self.ip_cache
-            .write()
-            .await
-            .insert(vm_tag.clone(), guest_ip);
+        //
+        // If IP resolution fails (e.g. DHCP under severe concurrency), the
+        // just-created domain must not leak. Destroy it and remove the
+        // disk + seed artifacts before propagating the error — the gateway
+        // has no record of this VM yet (create_from_golden never returned
+        // Ok), so an orphan here would be unreachable by any cleanup path.
+        match self.guest_host_for(&vm_tag).await {
+            Ok(guest_ip) => {
+                self.ip_cache
+                    .write()
+                    .await
+                    .insert(vm_tag.clone(), guest_ip);
+            }
+            Err(e) => {
+                let _ = domain.destroy();
+                let _ = std::fs::remove_file(&vm_disk_path);
+                let seed_iso = self.vm_disks.work_dir.join(format!("{vm_tag}-cidata.iso"));
+                let _ = std::fs::remove_file(seed_iso);
+                let seed_dir = self.vm_disks.work_dir.join(format!("{vm_tag}-seed"));
+                let _ = std::fs::remove_dir_all(seed_dir);
+                return Err(e);
+            }
+        }
 
         let host = match &self.transport {
             LibvirtTransport::Local { .. } => "localhost".to_string(),

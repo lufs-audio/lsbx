@@ -378,24 +378,29 @@ Measured on Carnyx (Tue Aug 25 2026), each metric 5 runs (median) or 100 sequent
 | Metric | Old (Python) | New (Rust) | Speedup |
 |---|---|---|---|
 | Binary startup time (`--help`) | 47 ms | 8 ms | **5.9×** |
-| Sandbox create latency (no wait) | 9,425 ms | 249 ms | **37.9×** |
-| Sandbox create latency (full, with readiness) | 12,637 ms | 11,009 ms ¹ | **1.1×** |
+| Sandbox create latency (no wait) | 9,400 ms | 9,400 ms | **1.0×** ¹ |
+| Sandbox create latency (full, with readiness) | 12,637 ms | 11,009 ms ² | **1.1×** |
 | Exec round-trip (`echo hi`) | 208 ms | 61 ms | **3.4×** |
 | `list` latency (2 live sandboxes) | 48 ms | 16 ms | **3.0×** |
 | Gateway `/health` median (100 req) | 0.2 ms | 0.1 ms | **2.0×** |
-| Gateway `/health` p99 (100 req) | 0.4 ms | 3.4 ms | 0.1× ² |
+| Gateway `/health` p99 (100 req) | 0.4 ms | 3.4 ms | 0.1× ³ |
 | Idle memory (gateway + stream-proxy) | 33,348 kB | 30,248 kB | **1.1×** |
 | Idle CPU (5 s sample) | 0.00% | 0.00% | — |
+| Concurrent create, 10 in-flight (no-wait) | 1/10 ok, 3×429, 5×timeout | 1/10 ok, 9×503 ⁴ | — |
 | Sandbox destroy latency | 292 ms | 230 ms | **1.3×** |
 
-¹ The original pass recorded a 120,254 ms readiness timeout on the Rust full-create path; that exposed four readiness-polling bugs (username default, IP resolution timing, healthcheck identity key, and SSH argv quoting — see §15.2), all fixed on `benchmark/carnyx-migration`. The rerun above completes in 11,009 ms — marginally *faster* than Python's 12,637 ms. The no-wait create numbers (249 ms vs 9,425 ms) isolate the pure VM-creation cost and remain the more meaningful comparison for raw backend latency.
+¹ The earlier "37.9×" claim (9,425→249 ms) was measured against a build *before* guest-IP resolution moved inside `create_from_golden`; that 249 ms path now blocks on `_wait_for_ip` like Python's. Re-measured back-to-back single no-wait creates: old 9.4 s, new 9.4 s — true 1:1 parity (both dominated by `qemu-img` clone + cloud-init + IP wait).
 
-² The Rust gateway's higher p99 reflects one-time cold-path costs (first few requests hit lazy init paths); steady-state median is lower. The Python gateway's `ThreadingHTTPServer` has uniform request handling after warm-up.
+² The original pass recorded a 120,254 ms readiness timeout on the Rust full-create path; that exposed four readiness-polling bugs (username default, IP resolution timing, healthcheck identity key, and SSH argv quoting — see §15.2), all fixed on `benchmark/carnyx-migration`. The rerun completes in 11,009 ms — marginally *faster* than Python's 12,637 ms.
+
+³ The Rust gateway's higher p99 reflects one-time cold-path costs (first requests hit lazy-init paths); steady-state median is lower. The Python gateway's `ThreadingHTTPServer` has uniform request handling after warm-up.
+
+⁴ Both providers serialize VM creation on libvirt/kernel resources; neither sustains 10 concurrent no-wait creates. Old auto-throttles with HTTP 429 on quota; new returns 503 when the backend can't keep up. The concurrent run also exposed — and this pass subsequently fixed — a Rust leak: a failed create (503) after domain creation left the VM running with no store record (unreachable by cleanup). After the fix the 9 failed 503 creates rolled back cleanly with zero orphaned VMs (verified via `virsh list`). This is now also covered by §15.2's rollback item.
 
 ### 9.3 Directional conclusions (evidence-based)
 
 - **CLI cold-start**: The Rust binary's 8 ms `--help` (vs Python's 47 ms) is directly attributable to zero interpreter startup cost — the measured 5.9× gap matches the expected elimination of the Python venv import chain.
-- **VM creation**: The 37.9× speedup (249 ms vs 9,425 ms) on `--no-wait` create confirms the Rust implementation eliminates the Python `ssh-keygen` subprocess call (Python's `generate_keypair` spawns `ssh-keygen`; Rust uses `ed25519-dalek` in-process). This is the single largest measured improvement.
+- **VM creation**: At parity — 9.4 s for both Python and Rust on no-wait create, dominated by `qemu-img` overlay clone + cloud-init seed + guest-IP wait, which neither implementation can avoid. The Rust `ed25519-dalek` in-process keygen (vs Python's `ssh-keygen` subprocess) saves only the ~10 ms keypair mint, immaterial next to the seconds-long VM boot.
 - **SSH exec**: The 3.4× speedup (61 ms vs 208 ms) on exec rounds reflects both lower CLI overhead and the Rust `ssh` subprocess invocation having no Python interpreter tax per call.
 - **Gateway health**: Both sub-millisecond; the 2× median gap is within noise for such short requests. The Rust p99 outlier is cold-path and will disappear under sustained load.
 - **Memory**: The Rust merged gateway+stream service (30 MB RSS) is lighter than the Python pair (33 MB combined), consistent with eliminating one Python interpreter process.
@@ -549,12 +554,13 @@ The original benchmark pass recorded a 120 s readiness timeout on Rust full-crea
 2. **Readiness healthchecks never used the generated key**: `lsbx-lifecycle::create` generated an ephemeral keypair but `poll_ready`/`healthchecks_pass` called `Backend::run` with `identity_file=None`, so the backend fell back to a nonexistent placeholder (`~/.ssh/lsbx_guest_key`) and every SSH auth failed. Wired `keypair.private_key_path` through `poll_ready` → `healthchecks_pass`.
 3. **Recycled DHCP IP tripped host-key verification**: libvirt's DHCP pool reuses IPs across sandbox lifetimes, so a fresh VM reusing an old VM's IP failed `StrictHostKeyChecking=accept-new` ("host key changed"). Python pairs `accept-new` with `-o UserKnownHostsFile=/dev/null` (`libvirt.py:440`); added the same to `base_ssh_args`.
 4. **SSH argv collapsed**: healthchecks are `["sh", "-c", "git --version"]`; Rust spread them across separate `ssh` argv, which OpenSSH space-joins and the guest re-parses as `sh -c git --version` → `git` ran bare → usage/exit 1. Added `shell_quote`/`shell_quote_join` to `guest_ssh.rs` so the argv is reconstructed into a single faithfully-quoted remote command line — matching Python's single-string `command` argument to `ssh` (`libvirt.py:348`).
+5. **Failed create leaked an orphaned VM** (found during the concurrent-create benchmark): when `create_from_golden` failed *after* `Domain::create_xml` (e.g. IP-resolution timeout under concurrency), the just-created domain was never destroyed, and since `create_from_golden` never returned `Ok`, no store record existed — the VM was unreachable by `destroy`. Nine such orphans appeared during the 10-concurrent run. `create_from_golden` now rolls back on IP-resolution failure (destroy domain + remove disk/seed), verified to leave zero orphans on the re-run.
 
-Additionally, `create_from_golden` now resolves the guest IP before returning (matching Python's `_wait_for_ip()` call at `libvirt.py:284`) and caches it in an in-memory `ip_cache`, so subsequent `run`/`put_file`/`get_file` calls reuse the IP instead of re-polling `domifaddr` for up to 180 s each — the timeout whose combination with the other three bugs produced the original 120 s failure.
+Additionally, `create_from_golden` now resolves the guest IP before returning (matching Python's `_wait_for_ip()` call at `libvirt.py:284`) and caches it in an in-memory `ip_cache`, so subsequent `run`/`put_file`/`get_file` calls reuse the IP instead of re-polling `domifaddr` for up to 180 s each — the timeout whose combination with the other bugs produced the original 120 s failure.
 
-After these fixes the full-create benchmark completes in **11.0 s** (vs Python's 12.6 s).
+After these fixes the full-create benchmark completes in **11.0 s** (vs Python's 12.6 s), and the no-wait create is at parity (9.4 s both).
 
-- **Concurrent create-sandbox throughput**: Still not benchmarked — it requires `hey` (or `ab`/`wrk`, or a hand-rolled concurrent loop), which is not installed on Carnyx. The gateway `/health` benchmark confirmed both are sub-millisecond; concurrent *create* throughput should be tested under real load. (`hey` is a Go HTTP load tool — `go install github.com/rakyll/hey@latest`, or use `ab`/`wrk`, or a short `xargs -P` concurrent `curl` loop against `/sandboxes`.)
+- **Concurrent create-sandbox throughput**: measured this pass with a 10-in-flight no-wait `POST /sandboxes` loop (`hey` has no published binaries and Carnyx lacks `go`; `ab`/`wrk` also absent, so a `curl` fan-out was used per §9.1's allowance). Result: **neither provider sustains 10 concurrent creates** — old 1/10 ok (3×429 quota + 5×timeout ≈300 s), new 1/10 ok (9×503). Both are serialized on libvirt/kernel resources (single libvirt connection, `qemu-img` clone, DHCP/agent IP wait). The old throttles via HTTP 429 with a slot reservation; the new surfaces 503 when the backend refuses. This is inherent to the shared hypervisor, not a Rust regression — the new gateway did not adopt the old's quota-throttle, which is a config difference, not a correctness regression. Concurrent *health* (the `/health` row) is sub-millisecond on both.
 
 ### 15.3 Verification
 
