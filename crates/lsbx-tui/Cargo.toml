@@ -1,0 +1,50 @@
+[package]
+name = "lsbx-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel = { workspace = true }
+lsbx-ops = { workspace = true }
+lsbx-golden = { workspace = true }
+# `wizard.rs`'s `answers_to_create_request` returns
+# `lsbx_lifecycle::create::CreateRequest<'_>` directly (the real,
+# merged request type `LsbxOps::create` takes) — this crate reaches
+# through `lsbx-ops` at the *call* site (`ops.create(req)`), but naming
+# the request type itself in a public function signature needs a direct
+# dependency edge; Rust does not let a crate name a transitive
+# dependency's types without one, even though `lsbx-ops` already
+# re-exposes the same type through its own `create` method signature.
+lsbx-lifecycle = { workspace = true }
+tokio = { workspace = true }
+ratatui = { workspace = true }
+# `event-stream` feature gives us `crossterm::event::EventStream`, an
+# `impl futures::Stream<Item = io::Result<Event>>` — the async, non-blocking
+# event source `run_dashboard`'s `tokio::select!` loop is built on, so the
+# dashboard never busy-polls or blocks the executor waiting on a keypress.
+crossterm = { workspace = true, features = ["event-stream"] }
+futures = { workspace = true }
+
+[dev-dependencies]
+# `test_wizard_calls_same_ops` builds a real, DemoBackend-backed `LsbxOps`
+# to compare the wizard's `CreateRequest` against what a real
+# `LsbxOps::create` call would actually construct — not a hand-rolled
+# double. This mirrors the exact same dev-dependency pattern `lsbx-ops`'s
+# own Cargo.toml already uses for its own tests (see that crate's own PR
+# description for why `lsbx-backend-libvirt` is deliberately never pulled
+# into a dev-dependency graph like this one: no libvirt headers needed to
+# exercise a DemoBackend-backed façade). This is not a dependency on
+# `lsbx-cli` — that crate does not exist yet and pulling it in here would
+# be a real circular-dependency risk (lsbx-cli depends on lsbx-tui, not the
+# reverse); `lsbx-backend-demo`/`lsbx-store`/`lsbx-kernel` (testing feature)
+# are the actual, non-circular path to a real `LsbxOps` instance.
+lsbx-backend-demo = { workspace = true }
+lsbx-store = { workspace = true }
+lsbx-kernel = { workspace = true, features = ["testing"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
