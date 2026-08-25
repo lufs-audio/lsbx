@@ -11,6 +11,7 @@ members = [
     "crates/lsbx-lifecycle",
     "crates/lsbx-ops",
     "crates/lsbx-mcp",
+    "crates/lsbx-bootstrap",
 ]
 resolver = "2"
 
@@ -34,6 +35,7 @@ lsbx-golden = { path = "crates/lsbx-golden" }
 lsbx-lifecycle = { path = "crates/lsbx-lifecycle" }
 lsbx-ops = { path = "crates/lsbx-ops" }
 lsbx-mcp = { path = "crates/lsbx-mcp" }
+lsbx-bootstrap = { path = "crates/lsbx-bootstrap" }
 
 # Async & Runtime
 tokio = { version = "1.43", features = ["full"] }
