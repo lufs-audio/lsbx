@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "kind": "sandbox",
+  "sandbox": {
+    "id": "lsbx-a1b2c3d4e5",
+    "name": "lsbx-a1b2c3d4e5",
+    "host": "192.0.2.42",
+    "profile": "ci",
+    "flavor": "ci-runner",
+    "streaming": "none",
+    "username": "exedev",
+    "key_name": "exedev",
+    "key_path": "/tmp/lsbx-key-x7q9z2/id_ed25519",
+    "key_dir": "/tmp/lsbx-key-x7q9z2",
+    "pubkey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKz0S8m2h6oW1t9m3vQ4Vd8bYQwFtq6EJx2LhPz1r5Ku lsbx:lsbx-a1b2c3d4e5",
+    "task_id": "run-9f8e7d6c5b4a",
+    "created_at": "2026-08-24T18:32:07.512348+00:00",
+    "lease_expires_at": "2026-08-24T19:32:07.512348+00:00",
+    "vm_tag": "lsbx-a1b2c3d4e5",
+    "https_url": "https://192.0.2.42",
+    "cleanup_failed": false,
+    "repository_key": "ci-runner",
+    "repository": "ci-runner",
+    "extra": {
+      "console_url": null,
+      "transport": "ssh"
+    }
+  }
+}

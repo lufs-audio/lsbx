@@ -1,0 +1,71 @@
+# Agent and contributor guidance
+
+## Scope
+
+This repository is the ground-up Rust rewrite of the `lsbx` disposable-VM
+service and its zero-idle CI broker, replacing the Python implementation in
+`lufs-audio/lufs-sandbox-server` (which remains a read-only reference for
+existing on-disk schemas and behavior — see `SPEC.md`). The workspace is a
+17-crate Cargo workspace under `crates/`; keep current usage guidance in
+`README.md`. Files under dated `docs/specs/` directories (the unit contracts)
+are the authoritative interface for each unit of work and are historical
+evidence once merged, not living documentation to edit casually.
+
+## Verification
+
+Before committing code or workflow changes, run the standard three-tier gate
+for whichever crate(s) you touched, and for the workspace as a whole before
+opening a PR:
+
+```bash
+cargo check --workspace --message-format=json
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+```
+
+Ignored, infrastructure-requiring tests (real libvirt/KVM, real exe.dev
+SSH/HTTPS access, etc.) are excluded from the default `cargo test` run and
+must be run manually, on a host where that infrastructure is actually
+present:
+
+```bash
+cargo test --workspace -- --ignored
+```
+
+Use `cargo test --workspace -- --list` (or `-p <crate>`) as the source of
+truth for what a given crate actually covers; do not hand-maintain a test
+count against an old baseline.
+
+## CI authoring
+
+GitHub Actions runner labels are conjunctive. Broker-managed jobs must carry
+`self-hosted` plus exactly one placement label:
+
+- `lsbx-molimo` — exe.dev / Molimo, runner group `exe`
+- `lsbx-carnyx` — local libvirt / Carnyx, runner group `continuo`
+
+Never add both placement labels to one `runs-on` list to express "either,"
+and do not route zero-idle broker jobs through the legacy `lufs` label (that
+label is reserved for `lsbx`'s own workspace CI — see `.github/workflows/ci.yml`
+and SPEC.md Deviation 15 — pinned there deliberately until this repo's own
+broker is verified live). Use a matrix only when intentionally running a job
+once per host; otherwise select one placement through the repository CI
+variable or workflow input.
+
+## Broker operations
+
+- Molimo service: `lsbx-ci-broker-exe`
+- Carnyx service: `lsbx-ci-broker`
+- Keep `LSBX_QUEUE_LABEL`, `RUNNER_LABELS`, and `LUFSS_VM_PREFIX` host-specific.
+- Verify clean idle state with the host's `lsbx` list and the corresponding
+  GitHub runner-group inventory.
+- Pull and restart only the intended branch. Preserve unrelated untracked
+  operator evidence; do not reset or delete it.
+
+## Safety and changes
+
+Do not commit credentials, private keys, tokens, or generated state (`/target`,
+`Cargo.lock` — see `.gitignore`). Operate only on store-tracked sandboxes and
+use bounded leases. Make focused commits with descriptive messages, run the
+verification gates, push the requested branch, and report any host action
+blocked by unavailable privileges rather than bypassing access controls.

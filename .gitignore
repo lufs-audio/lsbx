@@ -1,0 +1,9 @@
+/target
+Cargo.lock
+
+# Editor/OS cruft
+.DS_Store
+*.swp
+
+# Local environment overrides (never commit secrets)
+.env

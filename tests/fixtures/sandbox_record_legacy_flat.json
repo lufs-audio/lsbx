@@ -1,0 +1,22 @@
+{
+  "id": "lsbx-f00dcafe01",
+  "name": "lsbx-f00dcafe01",
+  "host": "192.0.2.17",
+  "profile": "default",
+  "flavor": "agent",
+  "streaming": "none",
+  "username": "exedev",
+  "key_name": "exedev",
+  "key_path": "/tmp/lsbx-key-m3k8p1/id_ed25519",
+  "key_dir": "/tmp/lsbx-key-m3k8p1",
+  "pubkey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG3vT1kZs8dQfR6yXwJn4hC9pLb2oE0uV7aM5tRk8qWx lsbx:lsbx-f00dcafe01",
+  "task_id": null,
+  "created_at": "2026-07-02T09:14:55.203110",
+  "lease_expires_at": "2026-07-02T10:14:55.203110",
+  "vm_tag": "lsbx-f00dcafe01",
+  "https_url": "https://192.0.2.17",
+  "cleanup_failed": false,
+  "repository_key": null,
+  "repository": null,
+  "extra": {}
+}
