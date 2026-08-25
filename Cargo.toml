@@ -10,6 +10,7 @@ members = [
     "crates/lsbx-golden",
     "crates/lsbx-lifecycle",
     "crates/lsbx-ops",
+    "crates/lsbx-mcp",
     "crates/lsbx-cli",
 ]
 resolver = "2"
@@ -33,6 +34,7 @@ lsbx-backend-libvirt = { path = "crates/lsbx-backend-libvirt" }
 lsbx-golden = { path = "crates/lsbx-golden" }
 lsbx-lifecycle = { path = "crates/lsbx-lifecycle" }
 lsbx-ops = { path = "crates/lsbx-ops" }
+lsbx-mcp = { path = "crates/lsbx-mcp" }
 lsbx-cli = { path = "crates/lsbx-cli" }
 
 # Async & Runtime
@@ -72,6 +74,10 @@ fs4 = { version = "0.12", features = ["tokio"] }
 tempfile = "3.17"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1.11"
+
+# MCP server SDK (Unit 15)
+rmcp = { version = "3", features = ["server", "transport-io", "macros", "schemars"] }
+schemars = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
