@@ -1,0 +1,33 @@
+[package]
+name = "lsbx-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel = { workspace = true }
+lsbx-store = { workspace = true }
+lsbx-ops = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+# This crate's own destination-resolution logic only ever touches
+# SandboxStore directly (never LsbxOps/Backend — see src/proxy.rs's module
+# doc comment for why), so its tests construct a real SandboxStore seeded
+# with a real SandboxRecord directly, rather than standing up a full
+# LsbxOps+DemoBackend VM-lifecycle stack just to get one record into the
+# store. Real construction throughout (tempfile::tempdir() +
+# SandboxStore::new(), matching lsbx-ops's own
+# tests/test_all_operations.rs::build_ops pattern) — no ad-hoc test-spy
+# fields/methods on any production type.
+tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

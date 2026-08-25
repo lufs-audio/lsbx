@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<!--
+  PLACEHOLDER — this is NOT a vendored copy of the real noVNC JS client.
+
+  This page is a deliberately minimal, explicitly labeled stand-in for
+  Unit 14's noVNC console. Fetching and vendoring the actual upstream
+  noVNC client (its RFB-over-WebSocket protocol implementation, UI chrome,
+  and asset bundle) was judged out of scope for this unit's remaining
+  effort, and an AI-approximated "noVNC-shaped" client that doesn't
+  correctly speak RFB would fail in a way that's *harder* to diagnose than
+  this honest placeholder. See crates/lsbx-stream/src/console.rs's module
+  doc comment and this unit's PR description for the fuller rationale.
+
+  This is a flagged, explicit gap for whoever picks up real console UI
+  work next — not a silent stub pretending to be finished.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>lsbx console (placeholder)</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #1b1e24;
+        color: #e6e6e6;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+        margin: 0;
+      }
+      .card {
+        max-width: 32rem;
+        padding: 2rem 2.5rem;
+        border-radius: 0.75rem;
+        background: #262a33;
+        box-shadow: 0 0 0 1px #3a3f4b;
+      }
+      h1 {
+        font-size: 1.25rem;
+        margin: 0 0 0.75rem;
+      }
+      p {
+        line-height: 1.5;
+        color: #b7bcc6;
+      }
+      code {
+        background: #1b1e24;
+        padding: 0.1rem 0.35rem;
+        border-radius: 0.25rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>noVNC console — placeholder</h1>
+      <p>
+        This is a bundled placeholder page, not the real noVNC client. The
+        WebSocket stream proxy this page would attach to lives at
+        <code>/stream/&lt;sandbox-id&gt;/vnc</code> and is fully implemented
+        (destination resolution, bidirectional relay, close propagation).
+        Wiring up the real noVNC RFB client is a separate, explicitly
+        flagged follow-up.
+      </p>
+    </div>
+  </body>
+</html>
