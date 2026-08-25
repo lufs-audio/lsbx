@@ -11,6 +11,7 @@ use lsbx_kernel::clock::Clock;
 use lsbx_kernel::error::LsbxError;
 use lsbx_kernel::types::{GoldenKey, PublicSandbox, SandboxRecord};
 use lsbx_store::sandbox_store::SandboxStore;
+use std::path::Path;
 use std::time::Duration;
 
 /// Request to provision a new sandbox.
@@ -85,9 +86,13 @@ async fn healthchecks_pass(
     vm_tag: &str,
     healthchecks: &[Vec<String>],
     per_call_timeout: Duration,
+    identity_file: Option<&Path>,
 ) -> bool {
     for command in healthchecks {
-        match backend.run(vm_tag, command, per_call_timeout, None).await {
+        match backend
+            .run(vm_tag, command, per_call_timeout, identity_file)
+            .await
+        {
             Ok(output) if output.exit_code == 0 => continue,
             _ => return false,
         }
@@ -124,6 +129,7 @@ async fn poll_ready(
     vm_tag: &str,
     healthchecks: &[Vec<String>],
     ready_timeout: Duration,
+    identity_file: Option<&Path>,
 ) -> Result<(), LsbxError> {
     let deadline = std::time::Instant::now() + ready_timeout;
     let probe: Vec<Vec<String>> = if healthchecks.is_empty() {
@@ -142,7 +148,7 @@ async fn poll_ready(
 
         let attempt = tokio::time::timeout(
             remaining,
-            healthchecks_pass(backend, vm_tag, &probe, remaining),
+            healthchecks_pass(backend, vm_tag, &probe, remaining, identity_file),
         )
         .await;
 
@@ -270,6 +276,7 @@ pub async fn create(
             &created_vm.vm_tag,
             &req.healthchecks,
             req.ready_timeout,
+            Some(&keypair.private_key_path),
         )
         .await?;
     }

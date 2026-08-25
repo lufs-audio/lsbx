@@ -21,6 +21,7 @@ use lsbx_kernel::backend::{
     Backend, BackendCapabilities, CommandOutput, CreateFromGoldenRequest, CreatedVm,
 };
 use lsbx_kernel::error::LsbxError;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use transport::LibvirtTransport;
 use virt::connect::Connect;
@@ -95,6 +96,11 @@ pub struct LibvirtBackend {
     vm_disks: VmDiskConfig,
     disk_mode: DiskMode,
     guest_username: String,
+    /// In-memory cache of vm_tag → guest IP, populated by
+    /// `create_from_golden` (which calls `_wait_for_ip` matching the Python
+    /// pattern) and reused by `run` so healthchecks don't block on a fresh
+    /// 180 s IP poll every time.
+    ip_cache: tokio::sync::RwLock<HashMap<String, String>>,
 }
 
 /// A libvirt `ErrorNumber` that means "the domain you asked about does not
@@ -145,7 +151,8 @@ impl LibvirtBackend {
                 work_dir: std::path::PathBuf::from("/var/lib/lsbx/vms"),
             },
             disk_mode: DiskMode::default(),
-            guest_username: "lsbx".to_string(),
+            guest_username: "exedev".to_string(),
+            ip_cache: tokio::sync::RwLock::new(HashMap::new()),
         })
     }
 
@@ -180,7 +187,7 @@ impl LibvirtBackend {
     }
 
     /// Sets the guest OS username used for `run`/`put_file`/`get_file`
-    /// (default `"lsbx"`, matching the existing system's convention).
+    /// (default `"exedev"`, matching the Python reference's convention).
     #[must_use]
     pub fn with_guest_username(mut self, username: impl Into<String>) -> Self {
         self.guest_username = username.into();
@@ -413,6 +420,17 @@ impl Backend for LibvirtBackend {
         let domain = Domain::create_xml(conn, &xml, 0).map_err(map_virt_err)?;
         let vm_tag = domain.get_name().map_err(map_virt_err)?;
 
+        // Resolve the guest IP *before* returning, matching the Python
+        // reference's `_wait_for_ip()` call inside `create_from_golden`
+        // (libvirt.py:284). This ensures `poll_ready`'s healthchecks can
+        // SSH into the guest immediately without re-blocking on a fresh
+        // 180 s IP poll every time.
+        let guest_ip = self.guest_host_for(&vm_tag).await?;
+        self.ip_cache
+            .write()
+            .await
+            .insert(vm_tag.clone(), guest_ip);
+
         let host = match &self.transport {
             LibvirtTransport::Local { .. } => "localhost".to_string(),
             LibvirtTransport::RemoteSsh { host, .. } => host.clone(),
@@ -451,7 +469,17 @@ impl Backend for LibvirtBackend {
         let resolved_identity = identity_file
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.identity_file_placeholder());
-        let host = self.guest_host_for(vm_tag).await?;
+        // Check the in-memory cache first (populated by
+        // `create_from_golden`) to avoid blocking on a fresh 180 s IP
+        // poll during `poll_ready` healthchecks.
+        let cached_ip = {
+            let cache = self.ip_cache.read().await;
+            cache.get(vm_tag).cloned()
+        };
+        let host = match cached_ip {
+            Some(ip) => ip,
+            None => self.guest_host_for(vm_tag).await?,
+        };
         let target = guest_ssh::GuestSshTarget {
             host: &host,
             username: &self.guest_username,
@@ -471,7 +499,14 @@ impl Backend for LibvirtBackend {
         let resolved_identity = identity_file
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.identity_file_placeholder());
-        let host = self.guest_host_for(vm_tag).await?;
+        let cached_ip = {
+            let cache = self.ip_cache.read().await;
+            cache.get(vm_tag).cloned()
+        };
+        let host = match cached_ip {
+            Some(ip) => ip,
+            None => self.guest_host_for(vm_tag).await?,
+        };
         let target = guest_ssh::GuestSshTarget {
             host: &host,
             username: &self.guest_username,
@@ -491,7 +526,14 @@ impl Backend for LibvirtBackend {
         let resolved_identity = identity_file
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.identity_file_placeholder());
-        let host = self.guest_host_for(vm_tag).await?;
+        let cached_ip = {
+            let cache = self.ip_cache.read().await;
+            cache.get(vm_tag).cloned()
+        };
+        let host = match cached_ip {
+            Some(ip) => ip,
+            None => self.guest_host_for(vm_tag).await?,
+        };
         let target = guest_ssh::GuestSshTarget {
             host: &host,
             username: &self.guest_username,
@@ -503,6 +545,9 @@ impl Backend for LibvirtBackend {
     async fn destroy(&self, vm_tag: &str) -> Result<(), LsbxError> {
         let domain = self.lookup_domain(vm_tag)?;
         domain.destroy().map_err(map_virt_err)?;
+
+        // Evict the cached IP for this VM — the entry is now stale.
+        self.ip_cache.write().await.remove(vm_tag);
 
         // Best-effort cleanup of the per-VM working disk and cloud-init
         // seed artifacts this backend created in `create_from_golden`.
