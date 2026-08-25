@@ -5,6 +5,8 @@ members = [
     "crates/lsbx-keys",
     "crates/lsbx-backend-testkit",
     "crates/lsbx-backend-demo",
+    "crates/lsbx-backend-exedev",
+    "crates/lsbx-backend-libvirt",
     "crates/lsbx-golden",
     "crates/lsbx-lifecycle",
     "crates/lsbx-ops",
@@ -26,6 +28,8 @@ lsbx-store = { path = "crates/lsbx-store" }
 lsbx-keys = { path = "crates/lsbx-keys" }
 lsbx-backend-testkit = { path = "crates/lsbx-backend-testkit" }
 lsbx-backend-demo = { path = "crates/lsbx-backend-demo" }
+lsbx-backend-exedev = { path = "crates/lsbx-backend-exedev" }
+lsbx-backend-libvirt = { path = "crates/lsbx-backend-libvirt" }
 lsbx-golden = { path = "crates/lsbx-golden" }
 lsbx-lifecycle = { path = "crates/lsbx-lifecycle" }
 lsbx-ops = { path = "crates/lsbx-ops" }
