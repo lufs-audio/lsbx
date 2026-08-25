@@ -1,0 +1,38 @@
+[package]
+name = "lsbx-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lsbx-kernel = { workspace = true }
+lsbx-golden = { workspace = true }
+lsbx-lifecycle = { workspace = true }
+lsbx-ops = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = "0.4"
+tracing = { workspace = true }
+async-trait = { workspace = true }
+# Used by two handlers (upload/artifacts) to bridge an HTTP body to the
+# real LsbxOps::put/get's filesystem-`&Path` signatures — production code,
+# not test-only, hence a normal dependency rather than a dev-dependency.
+tempfile = { workspace = true }
+
+[dev-dependencies]
+# Every test in this crate constructs a real LsbxOps against a real
+# DemoBackend + tempfile-backed SandboxStore/CiJobStore, matching Unit 10's
+# own tests/test_all_operations.rs construction pattern — never a bare
+# Arc::new(LsbxOps) unit value.
+lsbx-backend-demo = { workspace = true }
+lsbx-store = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[lints]
+workspace = true
