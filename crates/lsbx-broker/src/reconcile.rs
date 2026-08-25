@@ -141,8 +141,16 @@ pub struct Reconciler<'a> {
 }
 
 impl<'a> Reconciler<'a> {
-    pub fn new(ops: &'a lsbx_ops::LsbxOps, job_store: &'a CiJobStore, github: &'a GitHubClient) -> Self {
-        Self { ops, job_store, github }
+    pub fn new(
+        ops: &'a lsbx_ops::LsbxOps,
+        job_store: &'a CiJobStore,
+        github: &'a GitHubClient,
+    ) -> Self {
+        Self {
+            ops,
+            job_store,
+            github,
+        }
     }
 
     /// Calls `LsbxOps::create` with `profile: "ci"`, `task_id: job.job_id`,
@@ -162,12 +170,21 @@ impl<'a> Reconciler<'a> {
     /// at a conservative bound rather than threaded through the interface
     /// contract's `dispatch(job, lease)` signature, which has no readiness-
     /// timeout parameter to accept one.
-    pub async fn dispatch(&self, job: &QueuedJob, lease: Duration) -> Result<CiJobRecord, LsbxError> {
+    pub async fn dispatch(
+        &self,
+        job: &QueuedJob,
+        lease: Duration,
+    ) -> Result<CiJobRecord, LsbxError> {
         let job_id_str = job.job_id.to_string();
         let sandbox = self
             .ops
             .create(lsbx_lifecycle::create::CreateRequest {
                 profile: CI_PROFILE,
+                golden: None,
+                cpu: None,
+                memory: None,
+                flavor: None,
+                streaming: None,
                 name: None,
                 task_id: Some(job_id_str.as_str()),
                 lease,
@@ -253,7 +270,10 @@ impl<'a> Reconciler<'a> {
                     record.runner_name = Some(runner_name);
                     changed = true;
                 }
-                if record.phase != "running" && record.phase != PHASE_COMPLETED && record.phase != PHASE_FAILED {
+                if record.phase != "running"
+                    && record.phase != PHASE_COMPLETED
+                    && record.phase != PHASE_FAILED
+                {
                     record.phase = "registered".to_string();
                     changed = true;
                 }
@@ -292,7 +312,8 @@ impl<'a> Reconciler<'a> {
                     changed = true;
                 }
                 if record.last_error.is_none() && terminal_phase == PHASE_FAILED {
-                    record.last_error = Some(format!("job {job_name} completed with result: {result}"));
+                    record.last_error =
+                        Some(format!("job {job_name} completed with result: {result}"));
                     changed = true;
                 }
             }
@@ -327,7 +348,10 @@ impl<'a> Reconciler<'a> {
             return Ok(());
         };
 
-        let actual_job_id = self.github.job_for_runner(&record.repository, &runner_name).await?;
+        let actual_job_id = self
+            .github
+            .job_for_runner(&record.repository, &runner_name)
+            .await?;
 
         let dispatched_job_id: Option<u64> = record.job_id.parse().ok();
 
@@ -398,7 +422,8 @@ impl<'a> Reconciler<'a> {
                     "failed to resume tailing for in-flight CI job during startup recovery; \
                      continuing with the remaining in-flight jobs"
                 );
-                record.last_error = Some(format!("resume-tail failed during startup recovery: {e}"));
+                record.last_error =
+                    Some(format!("resume-tail failed during startup recovery: {e}"));
                 record.updated_at = now_rfc3339();
                 // Best-effort persistence of the failure note; if even this
                 // save fails, the in-memory record returned to the caller

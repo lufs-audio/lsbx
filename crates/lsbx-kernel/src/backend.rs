@@ -30,11 +30,50 @@ pub struct CreateFromGoldenRequest<'a> {
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync {
     fn capabilities(&self) -> BackendCapabilities;
-    async fn create_from_golden(&self, req: CreateFromGoldenRequest<'_>) -> Result<CreatedVm, crate::error::LsbxError>;
-    async fn run(&self, vm_tag: &str, command: &[String], timeout: std::time::Duration) -> Result<CommandOutput, crate::error::LsbxError>;
-    async fn put_file(&self, vm_tag: &str, source: &std::path::Path, destination: &str) -> Result<(), crate::error::LsbxError>;
-    async fn get_file(&self, vm_tag: &str, source: &str, destination: &std::path::Path) -> Result<(), crate::error::LsbxError>;
+    async fn create_from_golden(
+        &self,
+        req: CreateFromGoldenRequest<'_>,
+    ) -> Result<CreatedVm, crate::error::LsbxError>;
+    async fn run(
+        &self,
+        vm_tag: &str,
+        command: &[String],
+        timeout: std::time::Duration,
+    ) -> Result<CommandOutput, crate::error::LsbxError>;
+    async fn put_file(
+        &self,
+        vm_tag: &str,
+        source: &std::path::Path,
+        destination: &str,
+    ) -> Result<(), crate::error::LsbxError>;
+    async fn get_file(
+        &self,
+        vm_tag: &str,
+        source: &str,
+        destination: &std::path::Path,
+    ) -> Result<(), crate::error::LsbxError>;
     async fn destroy(&self, vm_tag: &str) -> Result<(), crate::error::LsbxError>;
+    /// Associate the ephemeral private key with a VM for subsequent guest
+    /// run/file-transfer operations. Backends that do not need local key
+    /// material inherit a no-op.
+    async fn register_vm_key(
+        &self,
+        _vm_tag: &str,
+        _key_path: &std::path::Path,
+    ) -> Result<(), crate::error::LsbxError> {
+        Ok(())
+    }
+
     async fn list_vms(&self) -> Result<Vec<String>, crate::error::LsbxError>;
+
+    /// Remove a VM and, when supplied, revoke its per-sandbox public key.
+    /// inherit the plain destroy behavior.
+    async fn destroy_with_key(
+        &self,
+        vm_tag: &str,
+        _pubkey: &str,
+    ) -> Result<(), crate::error::LsbxError> {
+        self.destroy(vm_tag).await
+    }
     async fn rename_vm(&self, old_tag: &str, new_tag: &str) -> Result<(), crate::error::LsbxError>;
 }

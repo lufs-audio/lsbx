@@ -72,7 +72,7 @@ Same guidance as the Carnyx document: decide and document whether to wait for na
 ### 3.3 Baseline verification-suite health check
 
 ```bash
-TOKEN=$(grep -oP '(?<=GATEWAY_TOKEN=).*' /home/exedev/repos/lufs-sandbox-server/.env 2>/dev/null || echo "")
+TOKEN=$(grep -oP '(?<=LUFSS_GATEWAY_TOKEN=).*' /home/exedev/repos/lufs-sandbox-server/.env 2>/dev/null || echo "")
 curl -sf -H "Authorization: Bearer $TOKEN" http://100.122.170.73:8244/health
 curl -sf https://molimo.exe.xyz:8243/health   # the public Caddy-proxied path — separate from the Carnyx-proxying ports 8246/8247, this one fronts Molimo's OWN gateway
 ```
@@ -246,7 +246,8 @@ User=exedev
 Group=exedev
 WorkingDirectory=/home/exedev/repos/lsbx
 EnvironmentFile=/home/exedev/lsbx-state/serve.env
-ExecStart=/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 100.122.170.73 --port 8244 --reap-ttl 3600h
+UnsetEnvironment=EXE_TOKEN
+ExecStart=/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 100.122.170.73 --port 8244 --reap-ttl 3600h --insecure
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

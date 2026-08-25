@@ -192,7 +192,11 @@ pub(crate) fn build_router_for_merge(ops: Arc<LsbxOps>, config: GatewayConfig) -
     build_router_inner(ops, config, false)
 }
 
-fn build_router_inner(ops: Arc<LsbxOps>, config: GatewayConfig, include_own_console_routes: bool) -> Router {
+fn build_router_inner(
+    ops: Arc<LsbxOps>,
+    config: GatewayConfig,
+    include_own_console_routes: bool,
+) -> Router {
     let rate_limiter = Arc::new(TokenBucket::new(config.rate_limit));
     let state = GatewayState {
         ops,
@@ -207,10 +211,7 @@ fn build_router_inner(ops: Arc<LsbxOps>, config: GatewayConfig, include_own_cons
         .route("/capabilities", get(capabilities))
         .route("/consoles", get(consoles))
         .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
-        .route(
-            "/sandboxes/{id}",
-            get(get_sandbox).delete(delete_sandbox),
-        )
+        .route("/sandboxes/{id}", get(get_sandbox).delete(delete_sandbox))
         .route("/sandboxes/{id}/upload", post(upload_to_sandbox))
         .route("/sandboxes/{id}/artifacts", get(download_artifact))
         .route("/sandboxes/{id}/exec", post(exec_in_sandbox))
@@ -238,7 +239,10 @@ fn build_router_inner(ops: Arc<LsbxOps>, config: GatewayConfig, include_own_cons
         // this sub-router with the read-only one, so a route defined on
         // this sub-router keeps the audit layer while routes on the
         // outer router (added after this call) do not.
-        .layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit_log_middleware,
+        ));
 
     let mut unauthenticated_routes = Router::new();
     if include_own_console_routes {
@@ -260,7 +264,10 @@ fn build_router_inner(ops: Arc<LsbxOps>, config: GatewayConfig, include_own_cons
         // extractor — a request that's rate-limited never gets far enough
         // to have its credentials checked, matching "throttle before you
         // even look at who's asking".
-        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
         .with_state(state)
 }
 
@@ -319,7 +326,8 @@ async fn rate_limit_middleware(
                 .into_response();
             response.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
-                #[allow(clippy::unwrap_used)] // A Duration's whole-second count formatted as ASCII digits is always a valid header value.
+                #[allow(clippy::unwrap_used)]
+                // A Duration's whole-second count formatted as ASCII digits is always a valid header value.
                 axum::http::HeaderValue::from_str(&retry_after.as_secs().to_string()).unwrap(),
             );
             response
@@ -472,14 +480,24 @@ async fn health(State(state): State<GatewayState>, _auth: AuthedRequest) -> Resp
 
 async fn images(State(state): State<GatewayState>, _auth: AuthedRequest) -> Response {
     match state.ops.config_show().await {
-        Ok(config) => success_response(config.get("images").cloned().unwrap_or(serde_json::json!({}))),
+        Ok(config) => success_response(
+            config
+                .get("images")
+                .cloned()
+                .unwrap_or(serde_json::json!({})),
+        ),
         Err(e) => error_response(e),
     }
 }
 
 async fn profiles(State(state): State<GatewayState>, _auth: AuthedRequest) -> Response {
     match state.ops.config_show().await {
-        Ok(config) => success_response(config.get("profiles").cloned().unwrap_or(serde_json::json!({}))),
+        Ok(config) => success_response(
+            config
+                .get("profiles")
+                .cloned()
+                .unwrap_or(serde_json::json!({})),
+        ),
         Err(e) => error_response(e),
     }
 }
@@ -585,6 +603,11 @@ async fn create_sandbox(
 ) -> Response {
     let req = lsbx_lifecycle::create::CreateRequest {
         profile: &body.profile,
+        golden: None,
+        cpu: None,
+        memory: None,
+        flavor: None,
+        streaming: None,
         name: body.name.as_deref(),
         task_id: body.task_id.as_deref(),
         lease: Duration::from_secs(body.lease_secs),
@@ -669,9 +692,14 @@ async fn upload_to_sandbox(
         }
     };
 
-    let result = state.ops.put(&id, temp_file.path(), &query.destination).await;
+    let result = state
+        .ops
+        .put(&id, temp_file.path(), &query.destination)
+        .await;
     match result {
-        Ok(()) => success_response(serde_json::json!({ "id": id, "destination": query.destination })),
+        Ok(()) => {
+            success_response(serde_json::json!({ "id": id, "destination": query.destination }))
+        }
         Err(e) => error_response(e),
     }
 }
@@ -821,7 +849,9 @@ async fn put_local_file(
 
     let source_path = std::path::PathBuf::from(&body.source);
     match state.ops.put(&id, &source_path, &body.destination).await {
-        Ok(()) => success_response(serde_json::json!({ "id": id, "destination": body.destination })),
+        Ok(()) => {
+            success_response(serde_json::json!({ "id": id, "destination": body.destination }))
+        }
         Err(e) => error_response(e),
     }
 }
@@ -895,7 +925,11 @@ async fn renew_sandbox(
     _auth: AuthedRequest,
     Json(body): Json<RenewBody>,
 ) -> Response {
-    match state.ops.renew(&id, Duration::from_secs(body.duration_secs)).await {
+    match state
+        .ops
+        .renew(&id, Duration::from_secs(body.duration_secs))
+        .await
+    {
         Ok(sandbox) => success_response(sandbox),
         Err(e) => error_response(e),
     }

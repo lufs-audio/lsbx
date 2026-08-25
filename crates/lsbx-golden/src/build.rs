@@ -225,7 +225,7 @@ pub async fn golden_build(
         // into the returned error only when the build itself otherwise
         // succeeded (never overwrite a real build failure with a cleanup
         // failure).
-        let destroy_result = backend.destroy(&vm_tag).await;
+        let destroy_result = backend.destroy_with_key(&vm_tag, req.pubkey).await;
         if let Err(destroy_err) = destroy_result {
             if result.is_ok() {
                 return Err(LsbxError::ContractViolated(format!(
@@ -277,9 +277,7 @@ async fn run_build_steps(
     flattener: Option<&dyn GoldenFlattener>,
 ) -> Result<String, LsbxError> {
     // Step 2: copy the provisioning script onto the build VM.
-    backend
-        .put_file(vm_tag, script, REMOTE_SCRIPT_PATH)
-        .await?;
+    backend.put_file(vm_tag, script, REMOTE_SCRIPT_PATH).await?;
 
     // Step 3: actually execute it on the guest. `run`'s `Ok` only means the
     // command executor was reached and returned an exit code — the exit

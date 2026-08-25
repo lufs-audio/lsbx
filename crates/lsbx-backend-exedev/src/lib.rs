@@ -22,7 +22,10 @@
 use lsbx_kernel::backend::*;
 use lsbx_kernel::error::LsbxError;
 
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub mod http_fallback;
@@ -92,9 +95,13 @@ pub enum ExedevAuth {
         token: String,
         fallback_ssh_key_path: Option<PathBuf>,
     },
-    /// SSH-only: every verb goes over SSH using this key, so there is no
-    /// 422-fallback case to configure — the primary path already is SSH.
+    /// SSH-only with an explicit private key path.
     Ssh { key_path: PathBuf },
+    /// SSH-only through the operator's configured OpenSSH alias. This is
+    /// the compatibility path used by the Python service (`ssh exe.dev ...`)
+    /// when no token is selected; the alias supplies the key and user from
+    /// the host's existing SSH config/agent.
+    SshAlias { alias: String },
 }
 
 impl ExedevAuth {
@@ -118,6 +125,12 @@ impl ExedevAuth {
         Self::AccountToken {
             token: token.into(),
             fallback_ssh_key_path: Some(fallback_ssh_key_path),
+        }
+    }
+
+    pub fn ssh_alias(alias: impl Into<String>) -> Self {
+        Self::SshAlias {
+            alias: alias.into(),
         }
     }
 
@@ -146,7 +159,7 @@ impl ExedevAuth {
             Self::AccountToken { token, .. } | Self::VmScopedToken { token, .. } => {
                 Some(token.as_str())
             }
-            Self::Ssh { .. } => None,
+            Self::Ssh { .. } | Self::SshAlias { .. } => None,
         }
     }
 
@@ -160,7 +173,7 @@ impl ExedevAuth {
                 fallback_ssh_key_path,
                 ..
             } => fallback_ssh_key_path.as_ref(),
-            Self::Ssh { .. } => None,
+            Self::Ssh { .. } | Self::SshAlias { .. } => None,
         }
     }
 
@@ -173,16 +186,144 @@ impl ExedevAuth {
 
 pub struct ExedevBackend {
     auth: ExedevAuth,
+    vm_key_paths: Arc<Mutex<HashMap<String, PathBuf>>>,
+}
+
+fn golden_vm_tag(golden_base: &str, name: &str) -> String {
+    let source = golden_base
+        .rsplit('/')
+        .next()
+        .unwrap_or(golden_base)
+        .trim_end_matches(".qcow2");
+    let stem = match source.rsplit_once("-v") {
+        Some((prefix, version))
+            if !version.is_empty() && version.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            prefix
+        }
+        _ => source,
+    };
+    let stem = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let prefix = if stem.starts_with("lsbx-") {
+        stem
+    } else {
+        format!("lsbx-{stem}")
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{golden_base}:{name}").as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("{}-{}", prefix.trim_matches('-'), &digest[..12])
+}
+
+async fn run_open_ssh(args: Vec<String>, timeout: Duration) -> Result<CommandOutput, LsbxError> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let child = Command::new("ssh")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| LsbxError::BackendUnavailable(format!("failed to start ssh: {e}")))?;
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            LsbxError::ContractViolated(format!("ssh command timed out after {timeout:?}"))
+        })?
+        .map_err(|e| LsbxError::BackendUnavailable(format!("ssh command failed: {e}")))?;
+    Ok(CommandOutput {
+        exit_code: output.status.code().unwrap_or(255),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+async fn run_scp(args: Vec<String>, timeout: Duration) -> Result<(), LsbxError> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let child = Command::new("scp")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| LsbxError::BackendUnavailable(format!("failed to start scp: {e}")))?;
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            LsbxError::ContractViolated(format!("scp command timed out after {timeout:?}"))
+        })?
+        .map_err(|e| LsbxError::BackendUnavailable(format!("scp command failed: {e}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(LsbxError::BackendUnavailable(format!(
+            "scp failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn parse_json_value(bytes: &[u8], operation: &str) -> Result<serde_json::Value, LsbxError> {
+    let text = String::from_utf8_lossy(bytes);
+    let candidates = std::iter::once(text.trim()).chain(text.lines().rev().map(str::trim));
+    for candidate in candidates {
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+            return Ok(value);
+        }
+    }
+    Err(LsbxError::BackendUnavailable(format!(
+        "exe.dev {operation} returned malformed JSON"
+    )))
+}
+
+fn parse_json_object(
+    bytes: &[u8],
+    operation: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, LsbxError> {
+    let value = parse_json_value(bytes, operation)?;
+    value.as_object().cloned().ok_or_else(|| {
+        LsbxError::BackendUnavailable(format!(
+            "exe.dev {operation} returned a non-object JSON payload"
+        ))
+    })
 }
 
 impl ExedevBackend {
     pub fn new(auth: ExedevAuth) -> Self {
-        Self { auth }
+        Self {
+            auth,
+            vm_key_paths: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
-    /// Runs one exe.dev verb via SSH against `host` (a VM's own
-    /// `<vm_tag>.exe.xyz`, or the bare `exe.dev` control host for
-    /// account-level verbs), using `key_path`.
+    fn vm_key_path(&self, vm_tag: &str) -> Option<PathBuf> {
+        self.vm_key_paths
+            .lock()
+            .ok()
+            .and_then(|keys| keys.get(vm_tag).cloned())
+    }
+
     async fn run_ssh(
         &self,
         host: &str,
@@ -190,13 +331,57 @@ impl ExedevBackend {
         timeout: Duration,
         key_path: &std::path::Path,
     ) -> Result<CommandOutput, LsbxError> {
-        let mut session = SshSession::connect(key_path, "root", host, 22).await?;
-        session.exec(cmd, timeout).await
+        if !key_path.is_file() {
+            return Err(LsbxError::BackendUnavailable(format!(
+                "ssh key does not exist: {}",
+                key_path.display()
+            )));
+        }
+        run_open_ssh(
+            vec![
+                "-n".to_string(),
+                "-i".to_string(),
+                key_path.display().to_string(),
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+                "-o".to_string(),
+                "StrictHostKeyChecking=accept-new".to_string(),
+                "-o".to_string(),
+                "ConnectTimeout=30".to_string(),
+                "-o".to_string(),
+                "ClearAllForwardings=yes".to_string(),
+                host.to_string(),
+                cmd.to_string(),
+            ],
+            timeout,
+        )
+        .await
     }
 
-    /// Runs one verb via the account-level HTTPS `/exec` fallback (i.e. not
-    /// scoped to a specific `vm_tag` — used for `new`/`rm <tag>`/`ls`, none
-    /// of which are the documented-422-prone raw-VM-shell case).
+    async fn run_ssh_alias(&self, alias: &str, cmd: &str) -> Result<CommandOutput, LsbxError> {
+        run_open_ssh(
+            vec![
+                "-n".to_string(),
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+                alias.to_string(),
+                cmd.to_string(),
+            ],
+            Duration::from_secs(35),
+        )
+        .await
+    }
+
+    fn guest_key_path(&self, vm_tag: &str) -> Option<PathBuf> {
+        self.vm_key_path(vm_tag).or_else(|| match &self.auth {
+            ExedevAuth::Ssh { key_path } => Some(key_path.clone()),
+            ExedevAuth::AccountToken { .. } | ExedevAuth::VmScopedToken { .. } => {
+                self.auth.fallback_ssh_key_path().cloned()
+            }
+            ExedevAuth::SshAlias { .. } => None,
+        })
+    }
+
     async fn run_http_account_level(&self, cmd: &str) -> Result<CommandOutput, LsbxError> {
         let token = self.auth.http_token().ok_or_else(|| {
             LsbxError::BackendUnavailable("no HTTP token configured for this auth mode".to_string())
@@ -204,13 +389,8 @@ impl ExedevBackend {
         let client = HttpFallbackClient::new(token.to_string(), None);
         match client.exec(cmd).await? {
             HttpExecOutcome::Completed(out) => Ok(out),
-            // Account-level verbs (new/rm/ls) are not the documented
-            // raw-VM-shell 422 case, but exe.dev's API is still free to
-            // return 422 for a malformed request; there is no VM-scoped SSH
-            // target to retry against here, so this surfaces directly.
             HttpExecOutcome::UnprocessableFallbackToSsh => Err(LsbxError::BackendUnavailable(
-                "exe.dev returned 422 for an account-level command; no SSH fallback target for a non-VM-scoped verb"
-                    .to_string(),
+                "exe.dev returned 422 for an account-level command; no SSH fallback target for a non-VM-scoped verb".to_string(),
             )),
         }
     }
@@ -235,22 +415,39 @@ impl Backend for ExedevBackend {
         }
     }
 
+    async fn register_vm_key(
+        &self,
+        vm_tag: &str,
+        key_path: &std::path::Path,
+    ) -> Result<(), LsbxError> {
+        if !key_path.is_file() {
+            return Err(LsbxError::BackendUnavailable(format!(
+                "ephemeral SSH key does not exist: {}",
+                key_path.display()
+            )));
+        }
+        let mut keys = self.vm_key_paths.lock().map_err(|_| {
+            LsbxError::ContractViolated("exedev VM key map was poisoned".to_string())
+        })?;
+        keys.insert(vm_tag.to_string(), key_path.to_path_buf());
+        Ok(())
+    }
+
     async fn create_from_golden(
         &self,
         req: CreateFromGoldenRequest<'_>,
     ) -> Result<CreatedVm, LsbxError> {
         self.require_not_vm_scoped("create a VM")?;
 
-        // `GoldenKey`'s inner field is private by design (Unit 01) — the
-        // only cross-crate read is `as_str()`/`Display`. There is no public
-        // way, and no reason, to reach into `.0` from this crate.
+        // Match the Python provider's real protocol: clone the registered
+        // base with `cp`, then tag the clone and register the ephemeral key.
+        // The lifecycle layer passes the resolved golden base in `req.golden`.
         let cmd = format!(
-            "new {} --name {} --cpu {} --memory {} --pubkey '{}'",
-            req.golden.as_str(),
-            req.name,
+            "cp {} {} --copy-tags=false --cpu={} --memory={} --json",
+            shell_quote(req.golden.as_str()),
+            shell_quote(req.name),
             req.cpu,
-            req.memory,
-            req.pubkey
+            shell_quote(req.memory),
         );
 
         let out = match &self.auth {
@@ -259,35 +456,67 @@ impl Backend for ExedevBackend {
                 unreachable!("require_not_vm_scoped already rejected this")
             }
             ExedevAuth::Ssh { key_path } => {
-                self.run_ssh("exe.dev", &cmd, Duration::from_secs(30), key_path)
+                self.run_ssh("exe.dev", &cmd, Duration::from_secs(35), key_path)
                     .await?
             }
+            ExedevAuth::SshAlias { alias } => self.run_ssh_alias(alias, &cmd).await?,
         };
 
         if out.exit_code != 0 {
             return Err(LsbxError::BackendUnavailable(format!(
-                "failed to create VM: {}",
+                "failed to clone VM from golden '{}': {}",
+                req.golden,
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
 
-        // `CreatedVm` requires all three fields (Unit 01). `host` follows
-        // exe.dev's `<vm_tag>.exe.xyz` convention. `https_url` follows the
-        // documented `https://<host>:8000/vnc.html` noVNC convention
-        // unconditionally at the backend level — this request has no
-        // `streaming` field to gate on (only `SandboxRecord.streaming`,
-        // owned by Unit 09's lifecycle layer, decides whether a caller
-        // actually surfaces this as a console URL; `PublicSandbox::public()`
-        // already only exposes a `console_url` when `streaming == "novnc"`).
-        // Returning it here unconditionally costs nothing when unused and
-        // saves Unit 09 from having to reconstruct the URL convention itself.
-        let vm_tag = req.name.to_string();
-        let host = format!("{}.exe.xyz", vm_tag);
-        let https_url = Some(format!("https://{}:8000/vnc.html", host));
+        let metadata = parse_json_object(&out.stdout, "cp")?;
+        let host = metadata
+            .get("ssh_dest")
+            .or_else(|| metadata.get("host"))
+            .or_else(|| metadata.get("ssh_host"))
+            .or_else(|| metadata.get("ssh"))
+            .or_else(|| metadata.get("dns_name"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                LsbxError::BackendUnavailable(
+                    "exe.dev cp response omitted SSH host metadata".to_string(),
+                )
+            })?;
+        let host = host.split_once('@').map(|(_, value)| value).unwrap_or(host);
 
+        let tag_cmd = format!(
+            "tag {} {} --json",
+            shell_quote(req.name),
+            shell_quote(&golden_vm_tag(req.golden.as_str(), req.name)),
+        );
+        let key_cmd = format!("ssh-key add {} --json", shell_quote(req.pubkey));
+        for follow_up in [tag_cmd, key_cmd] {
+            let result = match &self.auth {
+                ExedevAuth::AccountToken { .. } => self.run_http_account_level(&follow_up).await?,
+                ExedevAuth::VmScopedToken { .. } => {
+                    unreachable!("require_not_vm_scoped already rejected this")
+                }
+                ExedevAuth::Ssh { key_path } => {
+                    self.run_ssh("exe.dev", &follow_up, Duration::from_secs(35), key_path)
+                        .await?
+                }
+                ExedevAuth::SshAlias { alias } => self.run_ssh_alias(alias, &follow_up).await?,
+            };
+            if result.exit_code != 0 {
+                return Err(LsbxError::BackendUnavailable(format!(
+                    "exe.dev command failed after cloning '{}': {}",
+                    req.name,
+                    String::from_utf8_lossy(&result.stderr)
+                )));
+            }
+        }
+
+        let vm_tag = req.name.to_string();
+        let https_url = Some(format!("https://{}", host.trim_end_matches('/')));
         Ok(CreatedVm {
             vm_tag,
-            host,
+            host: host.to_string(),
             https_url,
         })
     }
@@ -304,79 +533,131 @@ impl Backend for ExedevBackend {
         command: &[String],
         timeout: Duration,
     ) -> Result<CommandOutput, LsbxError> {
-        let cmd = command.join(" ");
+        let cmd = command
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
         let host = format!("{}.exe.xyz", vm_tag);
 
-        match &self.auth {
+        let result = match &self.auth {
             ExedevAuth::AccountToken { .. } | ExedevAuth::VmScopedToken { .. } => {
                 let token = self.auth.http_token().ok_or_else(|| {
                     LsbxError::BackendUnavailable("no HTTP token configured".to_string())
                 })?;
                 let client = HttpFallbackClient::new(token.to_string(), Some(vm_tag));
                 match client.exec(&cmd).await? {
-                    HttpExecOutcome::Completed(out) => Ok(out),
-                    HttpExecOutcome::UnprocessableFallbackToSsh => match self.auth.fallback_ssh_key_path() {
-                        Some(key_path) => self.run_ssh(&host, &cmd, timeout, key_path).await,
-                        None => Err(LsbxError::BackendUnavailable(format!(
-                            "exe.dev returned 422 for vm_tag '{vm_tag}' (the documented raw-VM-shell HTTPS \
-                             limitation) and no fallback_ssh_key_path is configured on this backend's \
-                             ExedevAuth to retry over SSH"
-                        ))),
-                    },
+                    HttpExecOutcome::Completed(out) => return Ok(out),
+                    HttpExecOutcome::UnprocessableFallbackToSsh => {}
                 }
+                self.vm_key_path(vm_tag)
+                    .or_else(|| self.auth.fallback_ssh_key_path().cloned())
+                    .ok_or_else(|| {
+                        LsbxError::BackendUnavailable(format!(
+                            "exe.dev returned 422 for vm_tag '{vm_tag}' and no SSH key is available"
+                        ))
+                    })?
             }
-            ExedevAuth::Ssh { key_path } => self.run_ssh(&host, &cmd, timeout, key_path).await,
-        }
+            ExedevAuth::Ssh { key_path } => {
+                self.vm_key_path(vm_tag).unwrap_or_else(|| key_path.clone())
+            }
+            ExedevAuth::SshAlias { .. } => {
+                if let Some(key_path) = self.vm_key_path(vm_tag) {
+                    return self.run_ssh(&host, &cmd, timeout, &key_path).await;
+                }
+                return run_open_ssh(
+                    vec![
+                        "-n".to_string(),
+                        "-o".to_string(),
+                        "BatchMode=yes".to_string(),
+                        "-o".to_string(),
+                        "StrictHostKeyChecking=accept-new".to_string(),
+                        "-o".to_string(),
+                        "ConnectTimeout=30".to_string(),
+                        host,
+                        cmd,
+                    ],
+                    timeout,
+                )
+                .await;
+            }
+        };
+        self.run_ssh(&host, &cmd, timeout, &result).await
     }
 
     async fn put_file(
         &self,
-        _vm_tag: &str,
-        _source: &std::path::Path,
-        _destination: &str,
+        vm_tag: &str,
+        source: &std::path::Path,
+        destination: &str,
     ) -> Result<(), LsbxError> {
-        Err(LsbxError::BackendUnavailable(
-            "exedev backend does not yet implement file transfer (SFTP over the SSH path is the intended \
-             mechanism; not wired up in this unit)"
-                .to_string(),
-        ))
+        if !source.is_file() && !source.is_dir() {
+            return Err(LsbxError::NotFound(format!(
+                "local upload source does not exist: {}",
+                source.display()
+            )));
+        }
+        let host = format!("{}.exe.xyz", vm_tag);
+        let mut args = vec![
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+        ];
+        if source.is_dir() {
+            args.push("-r".to_string());
+        }
+        if let Some(key_path) = self.guest_key_path(vm_tag) {
+            args.extend(["-i".to_string(), key_path.display().to_string()]);
+        }
+        args.push(source.display().to_string());
+        args.push(format!("{}:{}", host, destination));
+        run_scp(args, Duration::from_secs(120)).await
     }
 
     async fn get_file(
         &self,
-        _vm_tag: &str,
-        _source: &str,
-        _destination: &std::path::Path,
+        vm_tag: &str,
+        source: &str,
+        destination: &std::path::Path,
     ) -> Result<(), LsbxError> {
-        Err(LsbxError::BackendUnavailable(
-            "exedev backend does not yet implement file transfer (SFTP over the SSH path is the intended \
-             mechanism; not wired up in this unit)"
-                .to_string(),
-        ))
+        let host = format!("{}.exe.xyz", vm_tag);
+        let mut args = vec![
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+        ];
+        if let Some(key_path) = self.guest_key_path(vm_tag) {
+            args.extend(["-i".to_string(), key_path.display().to_string()]);
+        }
+        args.push(format!("{}:{}", host, source));
+        args.push(destination.display().to_string());
+        run_scp(args, Duration::from_secs(120)).await
     }
 
     async fn destroy(&self, vm_tag: &str) -> Result<(), LsbxError> {
         self.require_not_vm_scoped("delete a VM")?;
-        let cmd = format!("rm {}", vm_tag);
+        let cmd = format!("rm {}", shell_quote(vm_tag));
         let out = match &self.auth {
             ExedevAuth::AccountToken { .. } => self.run_http_account_level(&cmd).await?,
             ExedevAuth::VmScopedToken { .. } => {
                 unreachable!("require_not_vm_scoped already rejected this")
             }
             ExedevAuth::Ssh { key_path } => {
-                self.run_ssh("exe.dev", &cmd, Duration::from_secs(30), key_path)
+                self.run_ssh("exe.dev", &cmd, Duration::from_secs(35), key_path)
                     .await?
             }
+            ExedevAuth::SshAlias { alias } => self.run_ssh_alias(alias, &cmd).await?,
         };
 
         match out.exit_code {
-            0 => Ok(()),
-            // exe.dev's `rm` on an already-gone/never-existed tag is the
-            // conformance suite's expected `NotFound` signal (Unit 04's
-            // `destroy_nonexistent_returns_notfound` / `destroy_idempotent`
-            // checks) — detected via stderr text since this backend has no
-            // structured exit-code-to-meaning mapping from exe.dev itself to
-            // rely on instead.
+            0 => {
+                if let Ok(mut keys) = self.vm_key_paths.lock() {
+                    keys.remove(vm_tag);
+                }
+                Ok(())
+            }
             _ if String::from_utf8_lossy(&out.stderr)
                 .to_lowercase()
                 .contains("not found")
@@ -393,18 +674,49 @@ impl Backend for ExedevBackend {
         }
     }
 
+    /// Destroys a VM and revokes the per-sandbox key when the caller has
+    /// persisted key material. This is the compatibility extension used by
+    /// lifecycle/reaper cleanup; plain `destroy` remains available for
+    /// account-level callers that do not have the public key.
+    async fn destroy_with_key(&self, vm_tag: &str, pubkey: &str) -> Result<(), LsbxError> {
+        self.require_not_vm_scoped("delete a VM")?;
+        let cmd = format!("ssh-key remove {} --json", shell_quote(pubkey));
+        let result = match &self.auth {
+            ExedevAuth::AccountToken { .. } => self.run_http_account_level(&cmd).await?,
+            ExedevAuth::VmScopedToken { .. } => {
+                unreachable!("require_not_vm_scoped already rejected this")
+            }
+            ExedevAuth::Ssh { key_path } => {
+                self.run_ssh("exe.dev", &cmd, Duration::from_secs(35), key_path)
+                    .await?
+            }
+            ExedevAuth::SshAlias { alias } => self.run_ssh_alias(alias, &cmd).await?,
+        };
+        if result.exit_code != 0 {
+            let detail = String::from_utf8_lossy(&result.stderr).to_lowercase();
+            if !detail.contains("not found") && !detail.contains("no such") {
+                return Err(LsbxError::BackendUnavailable(format!(
+                    "failed to revoke ephemeral SSH key: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                )));
+            }
+        }
+        self.destroy(vm_tag).await
+    }
+
     async fn list_vms(&self) -> Result<Vec<String>, LsbxError> {
         self.require_not_vm_scoped("list VMs")?;
-        let cmd = "ls -f json";
+        let cmd = "ls --json";
         let out = match &self.auth {
             ExedevAuth::AccountToken { .. } => self.run_http_account_level(cmd).await?,
             ExedevAuth::VmScopedToken { .. } => {
                 unreachable!("require_not_vm_scoped already rejected this")
             }
             ExedevAuth::Ssh { key_path } => {
-                self.run_ssh("exe.dev", cmd, Duration::from_secs(30), key_path)
+                self.run_ssh("exe.dev", cmd, Duration::from_secs(35), key_path)
                     .await?
             }
+            ExedevAuth::SshAlias { alias } => self.run_ssh_alias(alias, cmd).await?,
         };
         if out.exit_code != 0 {
             return Err(LsbxError::BackendUnavailable(format!(
@@ -412,20 +724,18 @@ impl Backend for ExedevBackend {
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        // Best-effort JSON array of tag strings; falls back to one-tag-per-
-        // line if the `ls -f json` output isn't parseable JSON, so a
-        // real-account format surprise degrades to something still usable
-        // rather than a hard failure on every `list_vms()` call.
-        if let Ok(tags) = serde_json::from_str::<Vec<String>>(&stdout) {
-            Ok(tags)
-        } else {
-            Ok(stdout
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect())
-        }
+        let value = parse_json_value(&out.stdout, "ls")?;
+        let entries = value
+            .get("vms")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                LsbxError::BackendUnavailable("exe.dev ls response had no vms array".to_string())
+            })?;
+        Ok(entries
+            .iter()
+            .filter_map(|entry| entry.get("vm_name").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect())
     }
 
     async fn rename_vm(&self, _old_tag: &str, _new_tag: &str) -> Result<(), LsbxError> {
@@ -473,9 +783,10 @@ async fn list_tagged_keys(
         }
         ExedevAuth::Ssh { key_path } => {
             backend
-                .run_ssh("exe.dev", run_cmd, Duration::from_secs(30), key_path)
+                .run_ssh("exe.dev", run_cmd, Duration::from_secs(35), key_path)
                 .await?
         }
+        ExedevAuth::SshAlias { alias } => backend.run_ssh_alias(alias, run_cmd).await?,
     };
     if out.exit_code != 0 {
         return Err(LsbxError::BackendUnavailable(format!(
@@ -488,6 +799,7 @@ async fn list_tagged_keys(
     let auth_token = backend.auth.http_token().map(str::to_string);
     let ssh_key_path = match &backend.auth {
         ExedevAuth::Ssh { key_path } => Some(key_path.clone()),
+        ExedevAuth::SshAlias { .. } => None,
         _ => backend.auth.fallback_ssh_key_path().cloned(),
     };
 

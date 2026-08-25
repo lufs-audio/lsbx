@@ -200,6 +200,33 @@ impl ImageRegistry {
     pub fn find_golden(&self, key: &str) -> Option<&GoldenConfig> {
         self.goldens.iter().find(|g| g.key == key)
     }
+
+    ///
+    /// Profiles are the public/user-facing names; their `golden` value names
+    /// a registry entry whose `base` is the actual backend clone source.
+    /// Direct golden keys remain accepted for compatibility with existing
+    /// callers and older state/scripts. ISO-backed profiles are visible in
+    /// the registry but cannot be provisioned through the golden lifecycle.
+    pub fn resolve_golden(&self, name: &str) -> Result<&GoldenConfig, LsbxError> {
+        if let Some(profile) = self.profiles.get(name) {
+            return match profile {
+                ProfileConfig::Golden { golden } => self.find_golden(golden).ok_or_else(|| {
+                    LsbxError::ContractViolated(format!(
+                        "profile '{name}' references unknown golden '{golden}'"
+                    ))
+                }),
+                ProfileConfig::Iso { iso, .. } => Err(LsbxError::Usage(format!(
+                    "profile '{name}' installs ISO '{iso}' and is not provisionable from a golden"
+                ))),
+            };
+        }
+
+        self.find_golden(name).ok_or_else(|| {
+            LsbxError::NotFound(format!(
+                "no profile or golden registered under key '{name}'"
+            ))
+        })
+    }
 }
 
 // This module is #[cfg(test)]-gated: every fn in it is a #[test], so a

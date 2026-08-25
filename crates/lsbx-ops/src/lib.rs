@@ -234,7 +234,8 @@ pub struct LsbxOps {
     /// comment for why this cannot be derived from `&dyn Backend` itself.
     backend_name: String,
     sandbox_store: SandboxStore,
-    #[allow(dead_code)] // Held for door crates (Units 16-18's CI broker) that need direct access; unused by this crate's own operations today.
+    #[allow(dead_code)]
+    // Held for door crates (Units 16-18's CI broker) that need direct access; unused by this crate's own operations today.
     ci_job_store: CiJobStore,
     registry: RwLock<ImageRegistry>,
     clock: Box<dyn Clock>,
@@ -272,11 +273,21 @@ impl LsbxOps {
     fn resolve_vm_tag(&self, id: &str) -> Result<String, LsbxError> {
         let record = self.sandbox_store.load(id)?;
         record.vm_tag.ok_or_else(|| {
-            LsbxError::NotFound(format!("sandbox {id} has no vm_tag (never fully provisioned)"))
+            LsbxError::NotFound(format!(
+                "sandbox {id} has no vm_tag (never fully provisioned)"
+            ))
         })
     }
 
-    // ---- lsbx-lifecycle delegation: create / destroy / renew / reap ----
+    async fn prepare_vm_key(&self, id: &str, vm_tag: &str) -> Result<(), LsbxError> {
+        let record = self.sandbox_store.load(id)?;
+        if let Some(key_path) = record.key_path.as_deref() {
+            self.backend
+                .register_vm_key(vm_tag, Path::new(key_path))
+                .await?;
+        }
+        Ok(())
+    }
 
     /// Delegates to `lsbx_lifecycle::create::create`. See the module-level
     /// delegation map.
@@ -284,11 +295,59 @@ impl LsbxOps {
         &self,
         req: lsbx_lifecycle::create::CreateRequest<'_>,
     ) -> Result<PublicSandbox, LsbxError> {
+        // Resolve the user-facing profile at the façade boundary. Lower
+        // lifecycle code receives the actual backend base plus the golden's
+        // resource/readiness metadata, while the persisted record retains the
+        // original profile name for API compatibility.
+        let (golden, cpu, memory, flavor, streaming, registry_healthchecks) = {
+            let registry = self.registry.read().await;
+            if registry.profiles.is_empty() && registry.goldens.is_empty() {
+                (None, None, None, None, None, None)
+            } else {
+                let config = registry.resolve_golden(req.profile)?;
+                (
+                    Some(config.base.clone()),
+                    Some(config.cpu),
+                    Some(config.memory.clone()),
+                    Some(format_golden_flavor(&config.flavor)),
+                    Some(format_streaming_mode(&config.streaming)),
+                    Some(config.healthcheck.clone()),
+                )
+            }
+        };
+
+        let healthchecks = if req.healthchecks.is_empty() {
+            registry_healthchecks
+                .map(|checks| {
+                    checks
+                        .into_iter()
+                        .map(|command| vec!["sh".to_string(), "-c".to_string(), command])
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            req.healthchecks
+        };
+        let resolved = lsbx_lifecycle::create::CreateRequest {
+            profile: req.profile,
+            golden: golden.as_deref(),
+            name: req.name,
+            task_id: req.task_id,
+            lease: req.lease,
+            ready_timeout: req.ready_timeout,
+            verify: req.verify,
+            cpu,
+            memory: memory.as_deref(),
+            flavor: flavor.as_deref(),
+            streaming: streaming.as_deref(),
+            healthchecks,
+        };
+
         lsbx_lifecycle::create::create(
             self.backend.as_ref(),
             &self.sandbox_store,
             self.clock.as_ref(),
-            req,
+            resolved,
         )
         .await
     }
@@ -370,18 +429,21 @@ impl LsbxOps {
         timeout: Duration,
     ) -> Result<lsbx_kernel::backend::CommandOutput, LsbxError> {
         let vm_tag = self.resolve_vm_tag(id)?;
+        self.prepare_vm_key(id, &vm_tag).await?;
         self.backend.run(&vm_tag, command, timeout).await
     }
 
     /// Resolves `id` to a `vm_tag`, then delegates to `Backend::put_file`.
     pub async fn put(&self, id: &str, source: &Path, destination: &str) -> Result<(), LsbxError> {
         let vm_tag = self.resolve_vm_tag(id)?;
+        self.prepare_vm_key(id, &vm_tag).await?;
         self.backend.put_file(&vm_tag, source, destination).await
     }
 
     /// Resolves `id` to a `vm_tag`, then delegates to `Backend::get_file`.
     pub async fn get(&self, id: &str, source: &str, destination: &Path) -> Result<(), LsbxError> {
         let vm_tag = self.resolve_vm_tag(id)?;
+        self.prepare_vm_key(id, &vm_tag).await?;
         self.backend.get_file(&vm_tag, source, destination).await
     }
 
@@ -447,15 +509,25 @@ impl LsbxOps {
         name: &str,
         verify_name: &str,
         pubkey: &str,
+        key_path: Option<&Path>,
     ) -> Result<Vec<lsbx_golden::verify::HealthcheckResult>, LsbxError> {
         let golden = {
             let registry = self.registry.read().await;
             registry
                 .find_golden(name)
                 .map(clone_golden_config)
-                .ok_or_else(|| LsbxError::NotFound(format!("no golden registered under key '{name}'")))?
+                .ok_or_else(|| {
+                    LsbxError::NotFound(format!("no golden registered under key '{name}'"))
+                })?
         };
-        lsbx_golden::verify::golden_verify(self.backend.as_ref(), &golden, verify_name, pubkey).await
+        lsbx_golden::verify::golden_verify(
+            self.backend.as_ref(),
+            &golden,
+            verify_name,
+            pubkey,
+            key_path,
+        )
+        .await
     }
 
     // ---- Implemented directly against the in-process ImageRegistry ----
@@ -537,7 +609,23 @@ impl LsbxOps {
     }
 }
 
-/// `GoldenConfig` has no `Clone` derive (confirmed against Unit 08's real,
+fn format_golden_flavor(flavor: &lsbx_golden::registry::GoldenFlavor) -> String {
+    match flavor {
+        lsbx_golden::registry::GoldenFlavor::Desktop => "desktop",
+        lsbx_golden::registry::GoldenFlavor::Agent => "agent",
+        lsbx_golden::registry::GoldenFlavor::CiRunner => "ci-runner",
+    }
+    .to_string()
+}
+
+fn format_streaming_mode(streaming: &lsbx_golden::registry::StreamingMode) -> String {
+    match streaming {
+        lsbx_golden::registry::StreamingMode::None => "none",
+        lsbx_golden::registry::StreamingMode::Novnc => "novnc",
+    }
+    .to_string()
+}
+
 /// merged `registry.rs`), so a manual field-by-field clone is needed
 /// wherever this façade needs to read a registry entry out from behind the
 /// `RwLock` without holding the lock for the caller's entire subsequent

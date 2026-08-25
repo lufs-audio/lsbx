@@ -85,7 +85,8 @@ fn fixture_path(name: &str) -> PathBuf {
 
 #[test]
 fn images_json_parses_with_full_schema_fidelity() {
-    let registry = ImageRegistry::load(&fixture_path("images.json")).expect("images.json should load");
+    let registry =
+        ImageRegistry::load(&fixture_path("images.json")).expect("images.json should load");
 
     // Real shape: two images, three goldens, five profiles — see this
     // file's module doc comment for why this differs from the old
@@ -108,8 +109,8 @@ fn images_json_parses_with_full_schema_fidelity() {
 
 #[test]
 fn images_carnyx_json_parses_with_full_schema_fidelity() {
-    let registry =
-        ImageRegistry::load(&fixture_path("images.carnyx.json")).expect("images.carnyx.json should load");
+    let registry = ImageRegistry::load(&fixture_path("images.carnyx.json"))
+        .expect("images.carnyx.json should load");
 
     assert_eq!(registry.images.len(), 2);
     let image_keys: Vec<&str> = registry.images.iter().map(|i| i.key.as_str()).collect();
@@ -139,8 +140,10 @@ fn images_carnyx_json_parses_with_full_schema_fidelity() {
 /// one-image/one-golden shape).
 #[test]
 fn test_registry_schema_preserves_mismatch() {
-    let images = ImageRegistry::load(&fixture_path("images.json")).expect("images.json should load");
-    let carnyx = ImageRegistry::load(&fixture_path("images.carnyx.json")).expect("images.carnyx.json should load");
+    let images =
+        ImageRegistry::load(&fixture_path("images.json")).expect("images.json should load");
+    let carnyx = ImageRegistry::load(&fixture_path("images.carnyx.json"))
+        .expect("images.carnyx.json should load");
 
     let images_base = &images
         .find_golden("agent-base")
@@ -163,7 +166,8 @@ fn test_registry_schema_preserves_mismatch() {
 
 #[test]
 fn allowed_goldens_reflects_loaded_manifest() {
-    let registry = ImageRegistry::load(&fixture_path("images.json")).expect("images.json should load");
+    let registry =
+        ImageRegistry::load(&fixture_path("images.json")).expect("images.json should load");
     let allowed = registry.allowed_goldens();
     // Real shape: three distinct base values across the three real goldens
     // (agent-base -> lsbx-default-v1, ci-runner -> lsbx-ci-v1, agent-web ->
@@ -186,7 +190,8 @@ fn allowed_goldens_reflects_loaded_manifest() {
 /// this test, not a silent behavior change.
 #[test]
 fn agent_base_base_field_does_not_resolve_to_an_images_entry() {
-    let registry = ImageRegistry::load(&fixture_path("images.json")).expect("images.json should load");
+    let registry =
+        ImageRegistry::load(&fixture_path("images.json")).expect("images.json should load");
     let golden = registry
         .find_golden("agent-base")
         .expect("images.json must contain an agent-base golden");

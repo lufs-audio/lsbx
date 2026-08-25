@@ -38,7 +38,9 @@ fn up_with_demo_backend_and_json_prints_real_success_envelope() {
     let output = Command::new(env!("CARGO_BIN_EXE_lsbx"))
         .args([
             "--state-dir",
-            state_dir.to_str().expect("state dir path is not valid UTF-8"),
+            state_dir
+                .to_str()
+                .expect("state dir path is not valid UTF-8"),
             "up",
             "default",
             "--backend",
@@ -128,7 +130,9 @@ fn up_with_explicit_demo_backend_reports_demo_in_verbose_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_lsbx"))
         .args([
             "--state-dir",
-            state_dir.to_str().expect("state dir path is not valid UTF-8"),
+            state_dir
+                .to_str()
+                .expect("state dir path is not valid UTF-8"),
             "--verbose",
             "--backend",
             "demo",
@@ -154,7 +158,9 @@ fn status_with_json_reports_real_backend_name_and_sandbox_count() {
     let output = Command::new(env!("CARGO_BIN_EXE_lsbx"))
         .args([
             "--state-dir",
-            state_dir.to_str().expect("state dir path is not valid UTF-8"),
+            state_dir
+                .to_str()
+                .expect("state dir path is not valid UTF-8"),
             "--backend",
             "demo",
             "status",
@@ -168,7 +174,10 @@ fn status_with_json_reports_real_backend_name_and_sandbox_count() {
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("stdout was not valid JSON ({e}): {stdout}"));
 
-    assert_eq!(parsed.get("status").and_then(|v| v.as_str()), Some("success"));
+    assert_eq!(
+        parsed.get("status").and_then(|v| v.as_str()),
+        Some("success")
+    );
     let data = parsed.get("data").expect("data field missing");
     assert_eq!(
         data.get("backend_name").and_then(|v| v.as_str()),
@@ -202,11 +211,13 @@ fn backend_auto_falls_through_to_demo_when_nothing_else_is_available() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_lsbx"))
         .env_remove("EXE_TOKEN")
-        .env_remove("LSBX_EXEDEV_SSH_KEY")
+        .env("LSBX_EXEDEV_SSH_ALIAS", "lsbx-test-no-such-alias")
         .env_remove("LSBX_LIBVIRT_URI")
         .args([
             "--state-dir",
-            state_dir.to_str().expect("state dir path is not valid UTF-8"),
+            state_dir
+                .to_str()
+                .expect("state dir path is not valid UTF-8"),
             "--backend",
             "auto",
             "status",
@@ -248,7 +259,9 @@ fn bare_invocation_falls_back_to_status_summary() {
     let output = Command::new(env!("CARGO_BIN_EXE_lsbx"))
         .args([
             "--state-dir",
-            state_dir.to_str().expect("state dir path is not valid UTF-8"),
+            state_dir
+                .to_str()
+                .expect("state dir path is not valid UTF-8"),
             "--backend",
             "demo",
             "--json",
@@ -260,8 +273,14 @@ fn bare_invocation_falls_back_to_status_summary() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("stdout was not valid JSON ({e}): {stdout}"));
-    assert_eq!(parsed.get("status").and_then(|v| v.as_str()), Some("success"));
-    assert!(parsed.get("data").and_then(|d| d.get("backend_name")).is_some());
+    assert_eq!(
+        parsed.get("status").and_then(|v| v.as_str()),
+        Some("success")
+    );
+    assert!(parsed
+        .get("data")
+        .and_then(|d| d.get("backend_name"))
+        .is_some());
 
     let _ = std::fs::remove_dir_all(&state_dir);
 }

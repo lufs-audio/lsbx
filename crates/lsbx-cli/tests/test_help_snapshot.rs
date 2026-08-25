@@ -55,8 +55,22 @@ fn top_level_help_lists_every_global_flag() {
     assert_contains_all(
         &help,
         &[
-            "--json", "-j", "--verbose", "-v", "--quiet", "-q", "--no-color", "--config", "-c",
-            "--backend", "-b", "--images", "-i", "--state-dir", "-s", "--version",
+            "--json",
+            "-j",
+            "--verbose",
+            "-v",
+            "--quiet",
+            "-q",
+            "--no-color",
+            "--config",
+            "-c",
+            "--backend",
+            "-b",
+            "--images",
+            "-i",
+            "--state-dir",
+            "-s",
+            "--version",
         ],
         "top-level --help",
     );
@@ -68,8 +82,25 @@ fn top_level_help_lists_every_subcommand() {
     assert_contains_all(
         &help,
         &[
-            "up", "down", "list", "exec", "put", "get", "renew", "console", "info", "status",
-            "profiles", "images", "reap", "serve", "bootstrap", "golden", "config", "logs", "mcp",
+            "up",
+            "down",
+            "list",
+            "exec",
+            "put",
+            "get",
+            "renew",
+            "console",
+            "info",
+            "status",
+            "profiles",
+            "images",
+            "reap",
+            "serve",
+            "bootstrap",
+            "golden",
+            "config",
+            "logs",
+            "mcp",
             "ci-broker",
         ],
         "top-level --help subcommand list",
@@ -82,7 +113,14 @@ fn up_help_lists_its_flags() {
     assert_contains_all(
         &help,
         &[
-            "--count", "-n", "--name", "--task-id", "-t", "--lease", "-l", "--no-verify",
+            "--count",
+            "-n",
+            "--name",
+            "--task-id",
+            "-t",
+            "--lease",
+            "-l",
+            "--no-verify",
             "--ready-timeout",
         ],
         "`lsbx up --help`",
@@ -130,7 +168,15 @@ fn serve_help_lists_its_flags() {
     let help = run_help(&["serve"]);
     assert_contains_all(
         &help,
-        &["--host", "--port", "--stream-port", "--token", "--reap-ttl", "--daemon"],
+        &[
+            "--host",
+            "--port",
+            "--stream-port",
+            "--token",
+            "--reap-ttl",
+            "--insecure",
+            "--daemon",
+        ],
         "`lsbx serve --help`",
     );
 }
@@ -140,7 +186,13 @@ fn bootstrap_help_lists_its_flags() {
     let help = run_help(&["bootstrap"]);
     assert_contains_all(
         &help,
-        &["--target", "--no-services", "--no-verify", "--force", "--dry-run"],
+        &[
+            "--target",
+            "--no-services",
+            "--no-verify",
+            "--force",
+            "--dry-run",
+        ],
         "`lsbx bootstrap --help`",
     );
 }
@@ -161,8 +213,17 @@ fn golden_build_help_lists_its_flags() {
     assert_contains_all(
         &help,
         &[
-            "--from", "--script", "--flavor", "--cpu", "--memory", "--streaming", "--register",
-            "--no-cleanup", "--interactive", "--shell", "--dry-run",
+            "--from",
+            "--script",
+            "--flavor",
+            "--cpu",
+            "--memory",
+            "--streaming",
+            "--register",
+            "--no-cleanup",
+            "--interactive",
+            "--shell",
+            "--dry-run",
         ],
         "`lsbx golden build --help`",
     );
@@ -174,8 +235,14 @@ fn golden_register_help_lists_its_flags() {
     assert_contains_all(
         &help,
         &[
-            "--profile", "--base", "--flavor", "--streaming", "--capabilities", "--healthcheck",
-            "--content-hash", "--replace",
+            "--profile",
+            "--base",
+            "--flavor",
+            "--streaming",
+            "--capabilities",
+            "--healthcheck",
+            "--content-hash",
+            "--replace",
         ],
         "`lsbx golden register --help`",
     );
@@ -223,5 +290,9 @@ fn version_flag_prints_a_version() {
 #[test]
 fn ci_broker_run_help_lists_its_flags() {
     let help = run_help(&["ci-broker", "run"]);
-    assert_contains_all(&help, &["--backend", "--queue-label"], "`lsbx ci-broker run --help`");
+    assert_contains_all(
+        &help,
+        &["--backend", "--queue-label"],
+        "`lsbx ci-broker run --help`",
+    );
 }

@@ -17,8 +17,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use lsbx_backend_demo::DemoBackend;
+use lsbx_gateway::{run_server, GatewayConfig, GatewayDeps, RateLimitConfig};
 use lsbx_golden::registry::ImageRegistry;
-use lsbx_gateway::{run_server, GatewayConfig, RateLimitConfig};
 use lsbx_kernel::clock::SystemClock;
 use lsbx_kernel::error::LsbxError;
 use lsbx_ops::LsbxOps;
@@ -65,7 +65,15 @@ async fn refuses_to_bind_non_loopback_with_no_token_and_no_insecure() {
     let (ops, _dir) = build_test_ops();
     let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-    let result = run_server(ops, base_config(), addr).await;
+    let result = run_server(
+        GatewayDeps {
+            ops,
+            state_dir: _dir.path().to_path_buf(),
+        },
+        base_config(),
+        addr,
+    )
+    .await;
     assert!(
         matches!(result, Err(LsbxError::AuthFailed(_))),
         "expected AuthFailed, got {result:?}",
@@ -80,7 +88,15 @@ async fn refuses_to_bind_non_loopback_with_token_but_no_insecure() {
     config.token = Some("a-real-token".to_string());
     let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-    let result = run_server(ops, config, addr).await;
+    let result = run_server(
+        GatewayDeps {
+            ops,
+            state_dir: _dir.path().to_path_buf(),
+        },
+        config,
+        addr,
+    )
+    .await;
     assert!(matches!(result, Err(LsbxError::AuthFailed(_))));
 }
 
@@ -91,7 +107,15 @@ async fn refuses_to_bind_non_loopback_with_insecure_but_no_token() {
     config.insecure = true;
     let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-    let result = run_server(ops, config, addr).await;
+    let result = run_server(
+        GatewayDeps {
+            ops,
+            state_dir: _dir.path().to_path_buf(),
+        },
+        config,
+        addr,
+    )
+    .await;
     assert!(matches!(result, Err(LsbxError::AuthFailed(_))));
 }
 
@@ -108,9 +132,16 @@ async fn actually_binds_a_real_listener_once_the_check_passes() {
     config.insecure = true;
     let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-    let bound = run_server(ops, config, addr)
-        .await
-        .expect("bind should succeed once both token and insecure are set");
+    let bound = run_server(
+        GatewayDeps {
+            ops,
+            state_dir: _dir.path().to_path_buf(),
+        },
+        config,
+        addr,
+    )
+    .await
+    .expect("bind should succeed once both token and insecure are set");
 
     // A real bind produces a real, nonzero ephemeral port — this is only
     // observable if `TcpListener::bind` genuinely ran (a short-circuited
@@ -127,9 +158,16 @@ async fn loopback_bind_succeeds_even_with_no_token_and_no_insecure() {
     let (ops, _dir) = build_test_ops();
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let bound = run_server(ops, base_config(), addr)
-        .await
-        .expect("loopback bind should always be permitted");
+    let bound = run_server(
+        GatewayDeps {
+            ops,
+            state_dir: _dir.path().to_path_buf(),
+        },
+        base_config(),
+        addr,
+    )
+    .await
+    .expect("loopback bind should always be permitted");
     assert_ne!(bound.local_addr.port(), 0);
 }
 
@@ -146,7 +184,16 @@ async fn bound_server_actually_serves_real_http_requests() {
     config.insecure = true;
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let bound = run_server(ops, config, addr).await.expect("bind should succeed");
+    let bound = run_server(
+        GatewayDeps {
+            ops,
+            state_dir: _dir.path().to_path_buf(),
+        },
+        config,
+        addr,
+    )
+    .await
+    .expect("bind should succeed");
     let local_addr = bound.local_addr;
 
     let server_handle = tokio::spawn(async move {

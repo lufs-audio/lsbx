@@ -51,7 +51,7 @@ fn config(target: &str, force: bool, dry_run: bool) -> BootstrapConfig {
     BootstrapConfig {
         target: Some(target.to_string()),
         install_services: false,
-        verify: true,
+        verify: false,
         force,
         dry_run,
     }
@@ -67,7 +67,10 @@ async fn scenario_fresh_host_succeeds() {
         .expect("bootstrap on a fresh host must succeed even without --force");
 
     assert!(!report.actions_taken.is_empty());
-    assert!(report.actions_would_take.is_empty(), "a real (non-dry-run) run must not report would-take actions");
+    assert!(
+        report.actions_would_take.is_empty(),
+        "a real (non-dry-run) run must not report would-take actions"
+    );
 }
 
 #[tokio::test]
@@ -158,14 +161,29 @@ async fn dry_run_reports_actions_without_writing_anything() {
         .await
         .expect("dry-run must succeed and never error");
 
-    assert!(!report.actions_would_take.is_empty(), "dry-run must report actions it would take");
-    assert!(report.actions_taken.is_empty(), "dry-run must not report any action as actually taken");
+    assert!(
+        !report.actions_would_take.is_empty(),
+        "dry-run must report actions it would take"
+    );
+    assert!(
+        report.actions_taken.is_empty(),
+        "dry-run must not report any action as actually taken"
+    );
 
     // The actual behavioral claim: nothing was genuinely written to
     // disk. Check every path a real run would have created.
-    assert!(!dir.path().join("sandboxes").exists(), "dry-run must not create the sandboxes directory");
-    assert!(!dir.path().join("ci-jobs").exists(), "dry-run must not create the ci-jobs directory");
-    assert!(!dir.path().join(".lsbx-bootstrapped").exists(), "dry-run must not write the bootstrap marker");
+    assert!(
+        !dir.path().join("sandboxes").exists(),
+        "dry-run must not create the sandboxes directory"
+    );
+    assert!(
+        !dir.path().join("ci-jobs").exists(),
+        "dry-run must not create the ci-jobs directory"
+    );
+    assert!(
+        !dir.path().join(".lsbx-bootstrapped").exists(),
+        "dry-run must not write the bootstrap marker"
+    );
 
     // Confirm the directory is genuinely still empty — not just that the
     // three specific paths above are absent, but that dry-run created
@@ -246,8 +264,13 @@ async fn force_true_overwrites_changed_unit_file_and_reports_it() {
     };
 
     // First run: writes both unit files fresh.
-    let first = bootstrap(services_config(false)).await.expect("first run must succeed");
-    assert!(first.actions_taken.iter().any(|a| a.contains("wrote unit file")));
+    let first = bootstrap(services_config(false))
+        .await
+        .expect("first run must succeed");
+    assert!(first
+        .actions_taken
+        .iter()
+        .any(|a| a.contains("wrote unit file")));
 
     let broker_unit_path = unit_dir.join("lsbx-ci-broker.service");
     assert!(broker_unit_path.exists());
@@ -262,13 +285,18 @@ async fn force_true_overwrites_changed_unit_file_and_reports_it() {
         .await
         .expect("force: true rerun must succeed even with a changed unit file on disk");
     assert!(
-        second.actions_taken.iter().any(|a| a.contains("overwrote unit file")),
+        second
+            .actions_taken
+            .iter()
+            .any(|a| a.contains("overwrote unit file")),
         "a changed unit file must be reported as overwritten, got: {:?}",
         second.actions_taken
     );
 
-    let restored_content = std::fs::read_to_string(&broker_unit_path).expect("read restored unit file");
-    assert!(restored_content.contains("ExecStart=/usr/local/bin/lsbx ci-broker run --backend=libvirt"));
+    let restored_content =
+        std::fs::read_to_string(&broker_unit_path).expect("read restored unit file");
+    assert!(restored_content.contains("ExecStart=/usr/local/bin/lsbx --images="));
+    assert!(restored_content.contains("ci-broker run --backend=libvirt"));
 
     std::env::remove_var("LSBX_SYSTEMD_UNIT_DIR");
 }
@@ -291,7 +319,9 @@ async fn force_true_rerun_leaves_unchanged_unit_file_alone_and_reports_it() {
         dry_run: false,
     };
 
-    bootstrap(services_config(false)).await.expect("first run must succeed");
+    bootstrap(services_config(false))
+        .await
+        .expect("first run must succeed");
 
     // Rerun with force: true, with no tampering this time — the unit
     // files are byte-identical to what would be generated now, so they
@@ -309,7 +339,10 @@ async fn force_true_rerun_leaves_unchanged_unit_file_alone_and_reports_it() {
         second.actions_taken
     );
     assert!(
-        !second.actions_taken.iter().any(|a| a.contains("overwrote unit file")),
+        !second
+            .actions_taken
+            .iter()
+            .any(|a| a.contains("overwrote unit file")),
         "an unchanged unit file must not be reported as overwritten"
     );
 

@@ -80,8 +80,18 @@ pub async fn golden_verify(
     golden: &GoldenConfig,
     verify_name: &str,
     pubkey: &str,
+    key_path: Option<&std::path::Path>,
 ) -> Result<Vec<HealthcheckResult>, LsbxError> {
-    let golden_key = crate::registry::ImageRegistry::validate_key(&golden.key)?;
+    // Validate the registry key as well as the backend source key. The
+    // logical golden key remains part of the public registry contract even
+    // when exe.dev/libvirt ultimately clones from `base`.
+    let _logical_key = crate::registry::ImageRegistry::validate_key(&golden.key)?;
+    let source_key = if golden.base.is_empty() {
+        golden.key.as_str()
+    } else {
+        golden.base.as_str()
+    };
+    let golden_key = crate::registry::ImageRegistry::validate_key(source_key)?;
 
     // Step 1: provision a fresh instance from the golden under test.
     let created = backend
@@ -94,6 +104,12 @@ pub async fn golden_verify(
         })
         .await?;
     let vm_tag = created.vm_tag;
+    if let Some(key_path) = key_path {
+        if let Err(error) = backend.register_vm_key(&vm_tag, key_path).await {
+            let _ = backend.destroy_with_key(&vm_tag, pubkey).await;
+            return Err(error);
+        }
+    }
 
     // Step 2: run each declared healthcheck, recording pass/fail per
     // command based on its actual exit code.
@@ -142,7 +158,7 @@ pub async fn golden_verify(
     // Step 3: always destroy the verification instance, on both the
     // healthy-completion and infrastructure-failure path, so `golden
     // verify` never leaks a VM.
-    let destroy_result = backend.destroy(&vm_tag).await;
+    let destroy_result = backend.destroy_with_key(&vm_tag, pubkey).await;
 
     if let Some(e) = run_error {
         return Err(e);
@@ -197,9 +213,15 @@ mod tests {
             "systemctl is-active sshd".to_string(),
         ]);
 
-        let results = golden_verify(&backend, &golden, "verify-agent-base", "ssh-ed25519 AAAA fake")
-            .await
-            .expect("verify should succeed");
+        let results = golden_verify(
+            &backend,
+            &golden,
+            "verify-agent-base",
+            "ssh-ed25519 AAAA fake",
+            None,
+        )
+        .await
+        .expect("verify should succeed");
 
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.passed));
@@ -215,9 +237,15 @@ mod tests {
         let backend = DemoBackend::new();
         let golden = sample_golden(vec![]);
 
-        let results = golden_verify(&backend, &golden, "verify-agent-base", "ssh-ed25519 AAAA fake")
-            .await
-            .expect("verify should succeed");
+        let results = golden_verify(
+            &backend,
+            &golden,
+            "verify-agent-base",
+            "ssh-ed25519 AAAA fake",
+            None,
+        )
+        .await
+        .expect("verify should succeed");
 
         assert!(results.is_empty());
         assert!(backend.list_vms().await.expect("list_vms").is_empty());
@@ -228,7 +256,14 @@ mod tests {
         let backend = DemoBackend::with_fault(lsbx_backend_demo::FaultMode::Unavailable);
         let golden = sample_golden(vec!["true".to_string()]);
 
-        let result = golden_verify(&backend, &golden, "verify-agent-base", "ssh-ed25519 AAAA fake").await;
+        let result = golden_verify(
+            &backend,
+            &golden,
+            "verify-agent-base",
+            "ssh-ed25519 AAAA fake",
+            None,
+        )
+        .await;
         assert!(matches!(result, Err(LsbxError::BackendUnavailable(_))));
     }
 
@@ -238,7 +273,14 @@ mod tests {
         let mut golden = sample_golden(vec!["true".to_string()]);
         golden.key = "Not Valid!".to_string();
 
-        let result = golden_verify(&backend, &golden, "verify-agent-base", "ssh-ed25519 AAAA fake").await;
+        let result = golden_verify(
+            &backend,
+            &golden,
+            "verify-agent-base",
+            "ssh-ed25519 AAAA fake",
+            None,
+        )
+        .await;
         assert!(matches!(result, Err(LsbxError::Usage(_))));
         assert!(backend.list_vms().await.expect("list_vms").is_empty());
     }
