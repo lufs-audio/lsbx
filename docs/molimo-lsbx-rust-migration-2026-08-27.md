@@ -85,9 +85,25 @@ plane operations.
 | idle broker memory | 75.6 MiB | 18.9 MiB |
 | direct `ssh exe.dev true` control | 0.87 s | same control |
 
-## Remaining release control
+## Credential provenance
 
-The code and host cutover are clean, but PR #29 still requires a maintainer
-review/approval before merge. The legacy chaos workflow has no `placement`
-input, so its `-f placement=...` form must not be used; future rehearsals need
-a placement-scoped workflow or explicit maintenance approval.
+Molimo's existing `lufs-runner` configuration confirms the intended auth path:
+
+- `/etc/lufs-runner/runner.env`: App `4377007`, org scope, `lufs-audio`, group
+  `exe`, labels `exe,lufs`, two slots.
+- `/etc/lufs-runner/app-private-key.pem`: root-owned, mode `0600`.
+- The PEM is byte-identical to the exedev-owned mode-0600 copy already used by
+  the Rust broker at `/home/exedev/.lufs-sandbox/lufs-audio-ci-app.pem`.
+- Installation ID is unset and auto-discovered.
+- `lufs-runner.sh check` successfully minted a registration token without
+  modifying runner services.
+
+The root-only `/etc` PEM should not be made readable by the Rust service. The
+existing exedev-owned identical copy is the correct least-privilege input.
+
+## Current CI policy note
+
+The `exe` runner group disallows public repositories, while `lufs-audio/lsbx`
+is public. This explains the queued self-hosted CI check despite an online
+`lsbx-molimo` runner; changing that organization policy requires an explicit
+security decision.

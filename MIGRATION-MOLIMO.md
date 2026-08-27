@@ -490,3 +490,28 @@ The current `lufs-sandbox-server` chaos workflow has no `placement` dispatch
 input and schedules both Carnyx and Molimo jobs. Do not use
 `-f placement=lsbx-molimo` with that workflow; use a placement-scoped workflow
 or an explicitly approved maintenance run instead.
+
+The Molimo App credentials are shared with the existing `lufs-runner` fleet,
+but the Rust service does not need `gh` and must not read the root-only PEM
+directly:
+
+- `/etc/lufs-runner/runner.env` is `root:root`, mode `0600`, with App ID
+  `4377007`, organization scope, owner/org `lufs-audio`, runner group `exe`,
+  and two slots.
+- `/etc/lufs-runner/app-private-key.pem` is `root:root`, mode `0600`.
+- The PEM is byte-identical to the existing exedev-readable copy at
+  `/home/exedev/.lufs-sandbox/lufs-audio-ci-app.pem`, which the Rust broker
+  references as `LSBX_GITHUB_APP_PRIVATE_KEY_PATH`.
+- `APP_INSTALLATION_ID` is intentionally blank; both systems discover the
+  installation automatically.
+- `sudo /usr/local/bin/lufs-runner.sh check` confirmed the App can mint a
+  short-lived runner registration token without changing runner services.
+
+Do not change the `/etc/lufs-runner` PEM permissions merely to make it readable
+by the `User=exedev` Rust service; retain the existing exedev-owned copy and
+its 0600 permissions.
+
+The organization `exe` runner group currently disallows public repositories,
+while `lufs-audio/lsbx` is public. Its self-hosted CI check can therefore remain
+queued even when an `lsbx-molimo` runner is online. Do not broaden that group
+policy without an explicit organization-level security decision.
