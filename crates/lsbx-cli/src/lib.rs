@@ -812,6 +812,7 @@ async fn dispatch(
             host,
             port,
             stream_port,
+            max_sandboxes,
             token,
             reap_ttl,
             insecure,
@@ -823,6 +824,7 @@ async fn dispatch(
                 host.as_deref(),
                 *port,
                 *stream_port,
+                *max_sandboxes,
                 token.clone(),
                 reap_ttl.as_deref(),
                 *insecure,
@@ -1244,6 +1246,7 @@ async fn dispatch_serve(
     host: Option<&str>,
     port: Option<u16>,
     stream_port: Option<u16>,
+    max_sandboxes: Option<usize>,
     token: Option<String>,
     reap_ttl: Option<&str>,
     insecure: bool,
@@ -1254,6 +1257,12 @@ async fn dispatch_serve(
         .parse()
         .map_err(|e| LsbxError::Usage(format!("invalid --host value '{host_str}': {e}")))?;
     let gateway_port = port.unwrap_or(DEFAULT_SERVE_PORT);
+    let max_sandboxes = max_sandboxes.unwrap_or(8);
+    if max_sandboxes == 0 {
+        return Err(LsbxError::Usage(
+            "--max-sandboxes must be greater than zero".to_string(),
+        ));
+    }
     let reap_ttl_duration = match reap_ttl {
         Some(s) => parse_duration(s)?,
         None => DEFAULT_SERVE_REAP_TTL,
@@ -1267,6 +1276,7 @@ async fn dispatch_serve(
         token: gateway_token.clone(),
         allow_local_files: false,
         insecure,
+        max_sandboxes,
         rate_limit: lsbx_gateway::RateLimitConfig::default(),
     };
 

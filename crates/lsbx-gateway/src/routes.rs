@@ -91,10 +91,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Gateway-level configuration, per this unit's interface contract.
+#[derive(Debug, Clone)]
 pub struct GatewayConfig {
     pub token: Option<String>,
     pub allow_local_files: bool,
     pub insecure: bool,
+    /// Maximum number of simultaneously persisted sandboxes. This preserves
+    /// the Python gateway's production safety bound.
+    pub max_sandboxes: usize,
     pub rate_limit: crate::ratelimit::RateLimitConfig,
 }
 
@@ -107,6 +111,7 @@ pub struct GatewayState {
     pub ops: Arc<LsbxOps>,
     pub config: Arc<GatewayConfig>,
     pub rate_limiter: Arc<TokenBucket>,
+    pub creation_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Narrow trait `auth.rs`'s `FromRequestParts` impl is generic over, so the
@@ -202,6 +207,7 @@ fn build_router_inner(
         ops,
         config: Arc::new(config),
         rate_limiter,
+        creation_gate: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     let mut authenticated_routes = Router::new()
@@ -601,6 +607,27 @@ async fn create_sandbox(
     _auth: AuthedRequest,
     Json(body): Json<CreateSandboxBody>,
 ) -> Response {
+    if state.config.max_sandboxes == 0 {
+        return error_response(LsbxError::ContractViolated(
+            "gateway max_sandboxes must be greater than zero".to_string(),
+        ));
+    }
+
+    // Serialize the count check with creation so concurrent requests cannot
+    // both observe the same free slot and exceed the configured cap.
+    let _creation_guard = state.creation_gate.lock().await;
+    match state.ops.list().await {
+        Ok(sandboxes) if sandboxes.len() >= state.config.max_sandboxes => {
+            return error_response(LsbxError::ContractViolated(format!(
+                "sandbox limit reached: {} active sandboxes (max {})",
+                sandboxes.len(),
+                state.config.max_sandboxes
+            )));
+        }
+        Ok(_) => {}
+        Err(e) => return error_response(e),
+    }
+
     let req = lsbx_lifecycle::create::CreateRequest {
         profile: &body.profile,
         golden: None,

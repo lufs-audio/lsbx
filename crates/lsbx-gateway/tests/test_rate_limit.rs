@@ -9,9 +9,9 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use lsbx_backend_demo::DemoBackend;
-use lsbx_golden::registry::ImageRegistry;
 use lsbx_gateway::routes::{build_router, GatewayConfig};
 use lsbx_gateway::RateLimitConfig;
+use lsbx_golden::registry::ImageRegistry;
 use lsbx_kernel::clock::SystemClock;
 use lsbx_ops::LsbxOps;
 use lsbx_store::ci_job_store::CiJobStore;
@@ -47,6 +47,7 @@ fn tightly_limited_config() -> GatewayConfig {
         token: Some(TEST_TOKEN.to_string()),
         allow_local_files: false,
         insecure: false,
+        max_sandboxes: 8,
         // A burst of 2 means the 3rd request within the same key in quick
         // succession must be denied — small enough to exhaust
         // deterministically within a single test without any sleeping.
@@ -73,15 +74,27 @@ async fn exhausting_burst_returns_429_with_retry_after_header() {
     // First two requests (burst: 2) must be allowed through to the real
     // handler (200, since the token is valid and /health always succeeds
     // against a healthy DemoBackend).
-    let first = router.clone().oneshot(health_request(TEST_TOKEN)).await.unwrap();
+    let first = router
+        .clone()
+        .oneshot(health_request(TEST_TOKEN))
+        .await
+        .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
 
-    let second = router.clone().oneshot(health_request(TEST_TOKEN)).await.unwrap();
+    let second = router
+        .clone()
+        .oneshot(health_request(TEST_TOKEN))
+        .await
+        .unwrap();
     assert_eq!(second.status(), StatusCode::OK);
 
     // Third request within the same burst window must be denied with 429
     // and a Retry-After header, per this unit's acceptance criteria.
-    let third = router.clone().oneshot(health_request(TEST_TOKEN)).await.unwrap();
+    let third = router
+        .clone()
+        .oneshot(health_request(TEST_TOKEN))
+        .await
+        .unwrap();
     assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
     let retry_after = third
         .headers()
@@ -101,9 +114,21 @@ async fn rate_limit_is_keyed_per_token_not_shared_globally() {
     let router = build_router(ops, tightly_limited_config());
 
     // Exhaust token A's burst of 2.
-    let _ = router.clone().oneshot(health_request(TEST_TOKEN)).await.unwrap();
-    let _ = router.clone().oneshot(health_request(TEST_TOKEN)).await.unwrap();
-    let exhausted = router.clone().oneshot(health_request(TEST_TOKEN)).await.unwrap();
+    let _ = router
+        .clone()
+        .oneshot(health_request(TEST_TOKEN))
+        .await
+        .unwrap();
+    let _ = router
+        .clone()
+        .oneshot(health_request(TEST_TOKEN))
+        .await
+        .unwrap();
+    let exhausted = router
+        .clone()
+        .oneshot(health_request(TEST_TOKEN))
+        .await
+        .unwrap();
     assert_eq!(exhausted.status(), StatusCode::TOO_MANY_REQUESTS);
 
     // A request presenting a *different* token must not be affected by

@@ -15,8 +15,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use lsbx_backend_demo::DemoBackend;
-use lsbx_golden::registry::ImageRegistry;
 use lsbx_gateway::routes::{build_router, GatewayConfig};
+use lsbx_golden::registry::ImageRegistry;
 use lsbx_kernel::clock::SystemClock;
 use lsbx_ops::LsbxOps;
 use lsbx_store::ci_job_store::CiJobStore;
@@ -58,6 +58,7 @@ fn test_config() -> GatewayConfig {
         token: Some(TEST_TOKEN.to_string()),
         allow_local_files: false,
         insecure: false,
+        max_sandboxes: 8,
         rate_limit: lsbx_gateway::RateLimitConfig {
             requests_per_minute: 6000,
             burst: 1000,
@@ -70,7 +71,12 @@ fn auth_header() -> (&'static str, String) {
 }
 
 async fn body_json(response: axum::response::Response) -> serde_json::Value {
-    let bytes = response.into_body().collect().await.expect("collect body").to_bytes();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect body")
+        .to_bytes();
     serde_json::from_slice(&bytes).expect("response body should be valid JSON")
 }
 
@@ -201,7 +207,8 @@ async fn exec_against_live_sandbox_returns_real_command_output_shape() {
     let router = build_router(ops, test_config());
     let (header_name, header_value) = auth_header();
 
-    let create_body = serde_json::json!({ "profile": "lsbx-default-v1", "name": "exec-target", "verify": false });
+    let create_body =
+        serde_json::json!({ "profile": "lsbx-default-v1", "name": "exec-target", "verify": false });
     let create_request = Request::builder()
         .method("POST")
         .uri("/sandboxes")
@@ -341,7 +348,9 @@ async fn upload_stages_http_body_and_calls_real_put() {
 
     let upload_request = Request::builder()
         .method("POST")
-        .uri(format!("/sandboxes/{sandbox_id}/upload?destination=/tmp/via-http-upload.txt"))
+        .uri(format!(
+            "/sandboxes/{sandbox_id}/upload?destination=/tmp/via-http-upload.txt"
+        ))
         .header(header_name, &header_value)
         .body(Body::from("uploaded bytes over http"))
         .unwrap();
@@ -410,6 +419,40 @@ async fn config_backed_routes_return_real_registry_shape() {
             .body(Body::empty())
             .unwrap();
         let response = router.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "route {path} should return 200");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "route {path} should return 200"
+        );
     }
+}
+
+#[tokio::test]
+async fn create_respects_configured_sandbox_limit() {
+    let (ops, _dir) = build_test_ops();
+    let mut config = test_config();
+    config.max_sandboxes = 1;
+    let router = build_router(ops, config);
+    let (header_name, header_value) = auth_header();
+
+    let body = serde_json::json!({ "profile": "lsbx-default-v1", "verify": false });
+    let first = Request::builder()
+        .method("POST")
+        .uri("/sandboxes")
+        .header(header_name, &header_value)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let first_response = router.clone().oneshot(first).await.unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let second = Request::builder()
+        .method("POST")
+        .uri("/sandboxes")
+        .header(header_name, &header_value)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let second_response = router.oneshot(second).await.unwrap();
+    assert_eq!(second_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

@@ -90,9 +90,9 @@ Same guidance as the Carnyx document: decide and document whether to wait for na
 ### 3.3 Baseline verification-suite health check
 
 ```bash
-TOKEN=$(grep -oP '(?<=GATEWAY_TOKEN=).*' /home/exedev/repos/lufs-sandbox-server/.env 2>/dev/null || echo "")
+TOKEN=$(grep -oP '(?<=LUFSS_GATEWAY_TOKEN=).*' /home/exedev/repos/lufs-sandbox-server/.env 2>/dev/null || echo "")
 curl -sf -H "Authorization: Bearer $TOKEN" http://100.122.170.73:8244/health
-curl -sf https://molimo.exe.xyz:8243/health   # the public Caddy-proxied path — separate from the Carnyx-proxying ports 8246/8247, this one fronts Molimo's OWN gateway
+curl -sf http://molimo.exe.xyz:8243/health   # this host's Caddy listener is intentionally plain HTTP
 ```
 
 Record both as your **before** baseline.
@@ -265,7 +265,7 @@ Group=exedev
 WorkingDirectory=/home/exedev/repos/lsbx
 EnvironmentFile=/home/exedev/lsbx-state/serve.env
 UnsetEnvironment=EXE_TOKEN
-ExecStart=/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 100.122.170.73 --port 8244 --reap-ttl 3h --insecure
+ExecStart=/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 100.122.170.73 --port 8244 --max-sandboxes 8 --reap-ttl 3h --insecure
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -316,7 +316,7 @@ Preserve the local-first/cloud-fallback asymmetry: Molimo keeps the **60-second*
 ## 8. Parallel verification — before touching the old services
 
 ```bash
-/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 127.0.0.1 --port 18244 --token test-token-do-not-use-in-prod &
+/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 127.0.0.1 --port 18244 --max-sandboxes 8 --token test-token-do-not-use-in-prod --reap-ttl 3h --insecure &
 SERVE_PID=$!
 sleep 2
 curl -sf -H "Authorization: Bearer test-token-do-not-use-in-prod" http://127.0.0.1:18244/health
@@ -325,11 +325,11 @@ curl -sf -H "Authorization: Bearer test-token-do-not-use-in-prod" http://127.0.0
 Full functional round trip:
 
 ```bash
-/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state up agent-base --lease 10m
+SBX=$(/usr/local/bin/lsbx --json --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state up agent-base --lease 10m | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["id"])')
 # note $SBX
-/usr/local/bin/lsbx --backend exedev --state-dir /home/exedev/lsbx-state exec $SBX -- echo hello-from-new-lsbx
-/usr/local/bin/lsbx --backend exedev --state-dir /home/exedev/lsbx-state info $SBX --json
-/usr/local/bin/lsbx --backend exedev --state-dir /home/exedev/lsbx-state down $SBX
+/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state exec $SBX -- echo hello-from-new-lsbx
+/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state info $SBX --json
+/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state down $SBX
 kill $SERVE_PID
 ```
 
@@ -385,20 +385,34 @@ If either new service fails to start or crash-loops, execute the rollback in §1
 ## 11. Post-cutover verification suite
 
 ```bash
-curl -sf -H "Authorization: Bearer $LSBX_GATEWAY_TOKEN" http://100.122.170.73:8244/health
-curl -sf https://molimo.exe.xyz:8243/health   # Molimo's own public Caddy-fronted path
+TOKEN=$(sed -n 's/^LSBX_GATEWAY_TOKEN=//p' /home/exedev/lsbx-state/serve.env)
+curl -sf -H "Authorization: Bearer $TOKEN" http://100.122.170.73:8244/health
+curl -sf http://molimo.exe.xyz:8243/health   # Molimo's own public Caddy-fronted path; this listener is plain HTTP
 ```
 
 Full functional round trip via the live gateway's REST API (not just direct CLI):
 
 ```bash
-curl -sf -H "Authorization: Bearer $LSBX_GATEWAY_TOKEN" -X POST http://100.122.170.73:8244/sandboxes -d '{"profile":"default"}' -H 'Content-Type: application/json'
+TOKEN=$(sed -n 's/^LSBX_GATEWAY_TOKEN=//p' /home/exedev/lsbx-state/serve.env)
+CREATE=$(curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -X POST http://100.122.170.73:8244/sandboxes \
+  -d '{"profile":"default","verify":true,"lease_secs":600}')
+SBX=$(printf '%s' "$CREATE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["id"])')
+curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -X POST "http://100.122.170.73:8244/sandboxes/$SBX/exec" \
+  -d '{"command":["echo","molimo-rust-live"]}'
+curl -sf -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "http://100.122.170.73:8244/sandboxes/$SBX"
 ```
 
 CI broker smoke test against the real chaos-test workflow, Molimo placement:
 
 ```bash
-gh workflow run ci-broker-failure-test.yml -f placement=lsbx-molimo --repo lufs-audio/lufs-sandbox-server
+# The legacy chaos workflow currently has no `placement` input; `-f placement=...`
+# is ignored and the workflow schedules both hosts. Do not dispatch it blindly.
+# Use a dedicated, placement-scoped workflow (or obtain explicit maintenance
+# approval before using the legacy workflow) and verify the run/job lifecycle
+# and final Molimo inventory as described below.
 ```
 
 Confirm a sandbox is created within `LSBX_CI_POLL_INTERVAL` seconds, a runner registers, picks up the intentionally-failing job, and the sandbox is torn down cleanly afterward.
@@ -406,7 +420,7 @@ Confirm a sandbox is created within `LSBX_CI_POLL_INTERVAL` seconds, a runner re
 **Also explicitly re-verify Carnyx's proxied reachability is unaffected**, since you didn't touch Carnyx but your host fronts its public exposure:
 
 ```bash
-curl -i https://molimo.exe.xyz:8246/health   # Carnyx's gateway, proxied through YOUR Caddy — should be completely unaffected by anything you did on Molimo today, confirm it actually is
+curl -i http://molimo.exe.xyz:8246/health   # Carnyx's gateway, proxied through YOUR Caddy
 ```
 
 If this last check fails, the regression is almost certainly unrelated to anything in this document (you didn't touch Caddy config) — but confirm that before ruling it out, since a coincidental network blip during your own maintenance window is exactly the kind of thing that gets wrongly blamed on or wrongly cleared of an unrelated change if you don't check explicitly.
@@ -457,3 +471,22 @@ Same minimum-one-week soak recommendation as the Carnyx document, including a re
 - **Keep for at least 30 days**, then re-evaluate: the old `/home/exedev/repos/lufs-sandbox-server` checkout, the old `/home/exedev/.lufs-sandbox/state` directory.
 - **May disable (not delete) once stable**: the old unit files.
 - **Never touch**: `lufs-runner@*.service` or anything under its own separate config — out of scope for this entire migration, start to finish (§1).
+## 15. Final cutover addendum — 2026-08-27
+
+The Rust gateway and CI broker are now the enabled production services on
+Molimo. The active units are `lsbx-serve.service` and
+`lsbx-ci-broker-exe.service`; the legacy Python units remain installed but are
+disabled for rollback. The Rust gateway preserves the old eight-sandbox cap via
+`--max-sandboxes 8`, and the stream sub-router's non-public routes are covered
+by the gateway auth middleware.
+
+The runner provisioner must invoke guest shell commands as `sh -c <command>`.
+Passing a complete shell command as one argv element causes exe.dev's shell to
+look for an executable containing spaces, which was found and fixed during the
+first live broker rehearsal. Cleanup treats an already-gone VM as successful,
+so a broker restart cannot strand a cleaning record after backend deletion.
+
+The current `lufs-sandbox-server` chaos workflow has no `placement` dispatch
+input and schedules both Carnyx and Molimo jobs. Do not use
+`-f placement=lsbx-molimo` with that workflow; use a placement-scoped workflow
+or an explicitly approved maintenance run instead.

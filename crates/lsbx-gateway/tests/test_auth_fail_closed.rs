@@ -17,8 +17,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use lsbx_backend_demo::DemoBackend;
-use lsbx_golden::registry::ImageRegistry;
 use lsbx_gateway::{run_server, GatewayConfig, GatewayDeps, RateLimitConfig};
+use lsbx_golden::registry::ImageRegistry;
 use lsbx_kernel::clock::SystemClock;
 use lsbx_kernel::error::LsbxError;
 use lsbx_ops::LsbxOps;
@@ -57,6 +57,7 @@ fn base_config() -> GatewayConfig {
         token: None,
         allow_local_files: false,
         insecure: false,
+        max_sandboxes: 8,
         rate_limit: RateLimitConfig::default(),
     }
 }
@@ -150,7 +151,9 @@ async fn bound_server_actually_serves_real_http_requests() {
     config.insecure = true;
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let bound = run_server(deps, config, addr).await.expect("bind should succeed");
+    let bound = run_server(deps, config, addr)
+        .await
+        .expect("bind should succeed");
     let local_addr = bound.local_addr;
 
     let server_handle = tokio::spawn(async move {

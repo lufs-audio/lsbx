@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Keep the repository's own CI on the legacy lufs placement until the
+    # Molimo broker has completed its production soak. Broker-managed jobs
+    # must use exactly one placement label.
+    runs-on: [self-hosted, "${{ vars.LSBX_CI_PLACEMENT || 'lufs' }}"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo check
+        run: cargo check --workspace --message-format=json
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace

@@ -21,7 +21,10 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use axum::{extract::State, http::Request};
+use std::sync::Arc;
 
 /// Marker extractor: presence in a handler's argument list means "this
 /// route requires a valid bearer token/API key," enforced by
@@ -94,7 +97,33 @@ pub fn extract_presented_token(headers: &axum::http::HeaderMap) -> Option<String
         .map(str::to_string)
 }
 
-// axum 0.8's `FromRequestParts` uses a native `async fn` in the trait
+/// Middleware used when the stream router is mounted into the gateway.
+/// The stream crate cannot depend on gateway auth without creating a crate
+/// cycle, so the composition root applies the same bearer/API-key check to
+/// `/stream/*` and `/consoles/*` while retaining the public `/console` page.
+pub async fn auth_middleware(
+    State(config): State<Arc<crate::routes::GatewayConfig>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if request.uri().path() == "/console" {
+        return next.run(request).await;
+    }
+
+    let authorized = config
+        .token
+        .as_deref()
+        .and_then(|configured| {
+            extract_presented_token(request.headers()).map(|presented| presented == configured)
+        })
+        .unwrap_or(false);
+    if authorized {
+        next.run(request).await
+    } else {
+        AuthError::InvalidToken.into_response()
+    }
+}
+
 // (not `#[async_trait]`) with a `Send`-bounded return future — implementing
 // it via `#[async_trait]` here mismatches the trait's real desugared
 // signature at the lifetime level (confirmed by the compiler: "lifetimes

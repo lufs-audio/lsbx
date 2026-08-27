@@ -725,7 +725,11 @@ impl<'a> Reconciler<'a> {
     ) -> Result<lsbx_kernel::backend::CommandOutput, LsbxError> {
         let output = self
             .ops
-            .exec(sandbox_id, &[command], Duration::from_secs(300))
+            .exec(
+                sandbox_id,
+                &["sh".to_string(), "-c".to_string(), command],
+                Duration::from_secs(300),
+            )
             .await?;
         if output.exit_code != 0 {
             return Err(LsbxError::BackendUnavailable(format!(
@@ -998,17 +1002,25 @@ impl<'a> Reconciler<'a> {
         record.phase = "cleaning".to_string();
         record.updated_at = now_rfc3339();
         self.job_store.save(record)?;
-        let scrub = self.ops.exec(
-            &sandbox_id,
-            &["sudo rm -rf /tmp/lsbx-ci-broker /tmp/lsbx-ci-broker-runner.log /etc/lsbx-runner.env /etc/lsbx-runner-app.pem".to_string()],
-            Duration::from_secs(60),
-        ).await;
+        let scrub = self
+            .ops
+            .exec(
+                &sandbox_id,
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "sudo rm -rf /tmp/lsbx-ci-broker /tmp/lsbx-ci-broker-runner.log /etc/lsbx-runner.env /etc/lsbx-runner-app.pem".to_string(),
+                ],
+                Duration::from_secs(60),
+            )
+            .await;
         let scrub_error = match scrub {
             Ok(output) if output.exit_code == 0 => None,
             Ok(output) => Some(format!(
                 "scrub failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             )),
+            Err(LsbxError::NotFound(_)) => None,
             Err(e) => Some(format!("scrub failed: {e}")),
         };
         let destroy_result = self.ops.destroy(&sandbox_id).await;
@@ -1143,7 +1155,17 @@ pub async fn run_broker(
         step += 1;
 
         let now = std::time::SystemTime::now();
-        let queued = poller.tick(github, now).await?;
+        let queued = match poller.tick(github, now).await {
+            Ok(queued) => queued,
+            Err(error) if is_retryable_poll_error(&error) => {
+                warn!(error = %error, "GitHub poll failed transiently; will retry on the next poll tick");
+                if iterations.is_none() {
+                    tokio::time::sleep(poller.config().poll_interval).await;
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
 
         for job in &queued {
             let job_id = job.job_id.to_string();
@@ -1193,6 +1215,10 @@ pub async fn run_broker(
 
     Ok(())
 }
+fn is_retryable_poll_error(error: &LsbxError) -> bool {
+    matches!(error, LsbxError::BackendUnavailable(_))
+}
+
 async fn run_runner_broker(
     reconciler: &Reconciler<'_>,
     job_store: &CiJobStore,
@@ -1219,7 +1245,17 @@ async fn run_runner_broker(
             }
         }
         step += 1;
-        let queued = poller.tick(github, std::time::SystemTime::now()).await?;
+        let queued = match poller.tick(github, std::time::SystemTime::now()).await {
+            Ok(queued) => queued,
+            Err(error) if is_retryable_poll_error(&error) => {
+                warn!(error = %error, "GitHub poll failed transiently; will retry on the next poll tick");
+                if iterations.is_none() {
+                    tokio::time::sleep(poller.config().poll_interval).await;
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let mut claimed = false;
         for job in queued {
             // A queued job may remain queued briefly after another broker
@@ -1245,5 +1281,23 @@ async fn run_runner_broker(
         if iterations.is_none() && !claimed {
             tokio::time::sleep(poller.config().poll_interval).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_backend_unavailable_poll_errors_are_retryable() {
+        assert!(is_retryable_poll_error(&LsbxError::BackendUnavailable(
+            "temporary 502".to_string(),
+        )));
+        assert!(!is_retryable_poll_error(&LsbxError::AuthFailed(
+            "invalid credentials".to_string(),
+        )));
+        assert!(!is_retryable_poll_error(&LsbxError::ContractViolated(
+            "invalid response".to_string(),
+        )));
     }
 }

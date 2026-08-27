@@ -171,6 +171,7 @@ fn serve_help_lists_its_flags() {
         &[
             "--host",
             "--port",
+            "--max-sandboxes",
             "--stream-port",
             "--token",
             "--reap-ttl",
