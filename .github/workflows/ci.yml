@@ -11,9 +11,11 @@ permissions:
 
 jobs:
   build:
-    # Molimo's Rust broker has completed its live lifecycle rehearsal; use
-    # the repository variable for an intentional alternate placement.
-    runs-on: [self-hosted, "${{ vars.LSBX_CI_PLACEMENT || 'lsbx-molimo' }}"]
+    # lufs-audio/lsbx is public, while the organization `exe` runner group
+    # intentionally disallows public repositories. Keep project CI on a
+    # GitHub-hosted runner; Molimo's self-hosted broker is exercised by the
+    # private-repository runner workflows and maintenance rehearsal.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: cargo check

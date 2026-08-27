@@ -104,6 +104,8 @@ existing exedev-owned identical copy is the correct least-privilege input.
 ## Current CI policy note
 
 The `exe` runner group disallows public repositories, while `lufs-audio/lsbx`
-is public. This explains the queued self-hosted CI check despite an online
-`lsbx-molimo` runner; changing that organization policy requires an explicit
-security decision.
+is public. The repository's own project CI therefore runs on GitHub-hosted
+infrastructure. Molimo's self-hosted broker explicitly polls the ten private
+installation repositories served by this placement and excludes public
+`lufs-audio/lsbx`; its lifecycle is covered by the maintenance rehearsal. The
+`exe` group policy was not broadened.

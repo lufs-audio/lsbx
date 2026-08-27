@@ -512,6 +512,9 @@ by the `User=exedev` Rust service; retain the existing exedev-owned copy and
 its 0600 permissions.
 
 The organization `exe` runner group currently disallows public repositories,
-while `lufs-audio/lsbx` is public. Its self-hosted CI check can therefore remain
-queued even when an `lsbx-molimo` runner is online. Do not broaden that group
-policy without an explicit organization-level security decision.
+while `lufs-audio/lsbx` is public. Therefore this repository's own project CI
+runs on GitHub-hosted infrastructure; Molimo's self-hosted broker is exercised
+by private repository jobs and its lifecycle is verified by the maintenance
+rehearsal. The broker's host environment explicitly polls the ten private
+installation repositories served by this placement and excludes public
+`lufs-audio/lsbx`; the `exe` group policy was not broadened.

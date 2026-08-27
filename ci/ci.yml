@@ -8,10 +8,9 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, "${{ vars.LSBX_CI_PLACEMENT || 'lsbx-molimo' }}"]
-    # Set LSBX_CI_PLACEMENT to lsbx-carnyx only when intentionally routing
-    # this repository's own CI to Carnyx. Broker jobs carry self-hosted plus
-    # exactly one placement label.
+    # The public lsbx repository cannot use Molimo's private-only `exe`
+    # runner group; project CI runs on GitHub-hosted infrastructure.
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     - name: cargo check
