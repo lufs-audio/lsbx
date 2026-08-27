@@ -491,6 +491,10 @@ input and schedules both Carnyx and Molimo jobs. Do not use
 `-f placement=lsbx-molimo` with that workflow; use a placement-scoped workflow
 or an explicitly approved maintenance run instead.
 
+The latest repository CI run (`33105660060`, commit `319d229`) passed on
+GitHub-hosted infrastructure after installing the native `libvirt-dev` and
+`pkg-config` dependencies required to link the workspace's libvirt crate.
+
 The Molimo App credentials are shared with the existing `lufs-runner` fleet,
 but the Rust service does not need `gh` and must not read the root-only PEM
 directly:

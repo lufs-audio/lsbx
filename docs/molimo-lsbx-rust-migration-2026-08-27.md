@@ -101,7 +101,11 @@ Molimo's existing `lufs-runner` configuration confirms the intended auth path:
 The root-only `/etc` PEM should not be made readable by the Rust service. The
 existing exedev-owned identical copy is the correct least-privilege input.
 
-## Current CI policy note
+The latest repository CI run (`33105660060`, commit `319d229`) passed all
+workspace checks on GitHub-hosted infrastructure after installing the native
+`libvirt-dev` and `pkg-config` dependencies required to link the workspace's
+libvirt crate.
+
 
 The `exe` runner group disallows public repositories, while `lufs-audio/lsbx`
 is public. The repository's own project CI therefore runs on GitHub-hosted
