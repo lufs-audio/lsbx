@@ -201,6 +201,30 @@ impl ImageRegistry {
         self.goldens.iter().find(|g| g.key == key)
     }
 
+    /// Resolves a public profile name (or direct golden key) to its full
+    /// golden configuration. ISO-backed profiles are not provisionable via
+    /// the golden lifecycle.
+    pub fn resolve_golden(&self, name: &str) -> Result<&GoldenConfig, LsbxError> {
+        if let Some(profile) = self.profiles.get(name) {
+            return match profile {
+                ProfileConfig::Golden { golden } => self.find_golden(golden).ok_or_else(|| {
+                    LsbxError::ContractViolated(format!(
+                        "profile '{name}' references unknown golden '{golden}'"
+                    ))
+                }),
+                ProfileConfig::Iso { iso, .. } => Err(LsbxError::Usage(format!(
+                    "profile '{name}' installs ISO '{iso}' and is not provisionable from a golden"
+                ))),
+            };
+        }
+
+        self.find_golden(name).ok_or_else(|| {
+            LsbxError::NotFound(format!(
+                "no profile or golden registered under key '{name}'"
+            ))
+        })
+    }
+
     /// Resolves a profile name to the golden key it maps to. Returns `None`
     /// if the profile doesn't exist or is an ISO-type profile (no golden
     /// mapping).

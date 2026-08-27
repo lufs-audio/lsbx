@@ -64,6 +64,14 @@ fn job_completed_re() -> &'static regex::Regex {
     })
 }
 
+fn running_job_name_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        #[allow(clippy::unwrap_used)]
+        regex::Regex::new(r"Running job: (.+)").unwrap()
+    })
+}
+
 impl LifecycleMarkers {
     /// Matches `Runner registered: (\S+)` against `line`, returning the
     /// captured runner name if present.
@@ -87,6 +95,21 @@ impl LifecycleMarkers {
     /// [`Self::parse_job_completed`]).
     pub fn is_running_job(line: &str) -> bool {
         running_job_re().is_match(line)
+    }
+
+    /// Captures the job name from `Running job: ...` when the runner emits it.
+    pub fn parse_running_job(line: &str) -> Option<String> {
+        running_job_name_re()
+            .captures(line)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().trim().to_string())
+    }
+
+    /// True when the runner reports a terminal listener exit.
+    pub fn is_exited(line: &str) -> bool {
+        line.contains("Exiting runner...")
+            || line.contains("Runner listener exit with")
+            || line.contains("Runner listener exit")
     }
 
     /// Matches `Job (.+) completed with result: (\S+)` against `line`,
@@ -116,7 +139,10 @@ mod tests {
 
     #[test]
     fn parse_runner_registered_returns_none_when_absent() {
-        assert_eq!(LifecycleMarkers::parse_runner_registered("nothing here"), None);
+        assert_eq!(
+            LifecycleMarkers::parse_runner_registered("nothing here"),
+            None
+        );
     }
 
     #[test]

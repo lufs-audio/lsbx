@@ -134,9 +134,11 @@ impl PollConfig {
         let repos = repos_from_env();
 
         Self {
-            poll_interval: duration_from_env_secs(POLL_INTERVAL_ENV).unwrap_or(defaults.poll_interval),
+            poll_interval: duration_from_env_secs(POLL_INTERVAL_ENV)
+                .unwrap_or(defaults.poll_interval),
             repo_refresh_interval: defaults.repo_refresh_interval,
-            fallback_delay: duration_from_env_secs(FALLBACK_DELAY_ENV).unwrap_or(defaults.fallback_delay),
+            fallback_delay: duration_from_env_secs(FALLBACK_DELAY_ENV)
+                .unwrap_or(defaults.fallback_delay),
             queue_labels: if queue_labels.is_empty() {
                 defaults.queue_labels
             } else {
@@ -178,7 +180,12 @@ fn parse_repo_csv(raw: &str) -> Vec<String> {
 }
 
 fn duration_from_env_secs(var: &str) -> Option<Duration> {
-    std::env::var(var).ok()?.trim().parse::<u64>().ok().map(Duration::from_secs)
+    std::env::var(var)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 pub struct QueuedJob {
@@ -186,6 +193,7 @@ pub struct QueuedJob {
     pub run_id: u64,
     pub repository: String,
     pub labels: Vec<String>,
+    pub name: Option<String>,
     pub created_at: Option<String>, // None if unparseable — fail-closed downstream
 }
 
@@ -199,7 +207,11 @@ const RUN_STATUSES: [&str; 2] = ["queued", "in_progress"];
 /// (`GET .../actions/runs?status=<status>`), then for each run lists its
 /// jobs (`GET .../actions/runs/{run_id}/jobs`), keeping only jobs whose
 /// `status == "queued"` and whose `labels` contain `label`.
-pub async fn queued_jobs(client: &GitHubClient, label: &str, repo: &str) -> Result<Vec<QueuedJob>, LsbxError> {
+pub async fn queued_jobs(
+    client: &GitHubClient,
+    label: &str,
+    repo: &str,
+) -> Result<Vec<QueuedJob>, LsbxError> {
     let mut jobs = Vec::new();
 
     for status in RUN_STATUSES {
@@ -215,6 +227,7 @@ pub async fn queued_jobs(client: &GitHubClient, label: &str, repo: &str) -> Resu
                         run_id: job.run_id,
                         repository: repo.to_string(),
                         labels: job.labels,
+                        name: job.name,
                         created_at: job.created_at,
                     });
                 }
@@ -272,7 +285,11 @@ impl Poller {
     /// tick" cadence deterministically with a manually-advanced `now`,
     /// without needing a live or mocked `GitHubClient` at all.
     pub fn should_refresh_repos(&self, now: SystemTime) -> bool {
-        repo_refresh_due(self.last_repo_refresh, self.config.repo_refresh_interval, now)
+        repo_refresh_due(
+            self.last_repo_refresh,
+            self.config.repo_refresh_interval,
+            now,
+        )
     }
 
     /// Runs one poll step at time `now`:
@@ -294,7 +311,11 @@ impl Poller {
     /// itself) so a test can drive multiple ticks with a manually-advanced
     /// clock and assert the refresh-cadence behavior deterministically,
     /// without a real `repo_refresh_interval`-length sleep.
-    pub async fn tick(&mut self, client: &GitHubClient, now: SystemTime) -> Result<Vec<QueuedJob>, LsbxError> {
+    pub async fn tick(
+        &mut self,
+        client: &GitHubClient,
+        now: SystemTime,
+    ) -> Result<Vec<QueuedJob>, LsbxError> {
         // Static-repo (gh-CLI) mode: repos were populated at construction;
         // never hit the App-only installation endpoint. Only the
         // discovery mode (config.repos == None) refreshes via the client.
@@ -324,7 +345,11 @@ impl Poller {
 /// specifically so it's trivial to unit-test directly (see `poll::tests`
 /// below) with nothing but plain `SystemTime` values, no `Poller`
 /// construction or `GitHubClient` required.
-fn repo_refresh_due(last_refresh: Option<SystemTime>, repo_refresh_interval: Duration, now: SystemTime) -> bool {
+fn repo_refresh_due(
+    last_refresh: Option<SystemTime>,
+    repo_refresh_interval: Duration,
+    now: SystemTime,
+) -> bool {
     match last_refresh {
         None => true,
         Some(last) => match now.duration_since(last) {
@@ -378,11 +403,19 @@ mod tests {
         // At t+300s (exactly `repo_refresh_interval`), a refresh is due —
         // boundary is inclusive (`>=`).
         let now_at_boundary = t0 + Duration::from_secs(300);
-        assert!(repo_refresh_due(last_refresh, config_refresh_interval(), now_at_boundary));
+        assert!(repo_refresh_due(
+            last_refresh,
+            config_refresh_interval(),
+            now_at_boundary
+        ));
 
         // Comfortably past the boundary, still due.
         let now_past_boundary = t0 + Duration::from_secs(301);
-        assert!(repo_refresh_due(last_refresh, config_refresh_interval(), now_past_boundary));
+        assert!(repo_refresh_due(
+            last_refresh,
+            config_refresh_interval(),
+            now_past_boundary
+        ));
     }
 
     /// After `Poller::tick` performs a refresh, `last_repo_refresh` advances
@@ -433,8 +466,10 @@ mod tests {
     /// binary would hit under parallel execution.
     #[test]
     fn parse_repo_csv_splits_trims_and_drops_empties() {
-        assert_eq!(parse_repo_csv("a/b, c/d ,"),
-            vec!["a/b".to_string(), "c/d".to_string()]);
+        assert_eq!(
+            parse_repo_csv("a/b, c/d ,"),
+            vec!["a/b".to_string(), "c/d".to_string()]
+        );
         assert_eq!(parse_repo_csv(""), Vec::<String>::new());
         assert_eq!(parse_repo_csv(" , "), Vec::<String>::new());
     }

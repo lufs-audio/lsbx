@@ -15,6 +15,7 @@ use lsbx_kernel::backend::CommandOutput;
 use lsbx_kernel::error::LsbxError;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Serialize)]
 struct ExecRequest {
@@ -63,6 +64,15 @@ impl HttpFallbackClient {
     }
 
     pub async fn exec(&self, command: &str) -> Result<HttpExecOutcome, LsbxError> {
+        self.exec_with_timeout(command, Duration::from_secs(120))
+            .await
+    }
+
+    pub async fn exec_with_timeout(
+        &self,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<HttpExecOutcome, LsbxError> {
         let res = self
             .client
             .post(&self.url)
@@ -70,6 +80,7 @@ impl HttpFallbackClient {
             .json(&ExecRequest {
                 command: command.to_string(),
             })
+            .timeout(timeout)
             .send()
             .await
             .map_err(|e| LsbxError::BackendUnavailable(format!("http exec failed: {}", e)))?;

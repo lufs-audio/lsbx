@@ -24,6 +24,7 @@ fn test_label_eligibility() {
         job_id: 1,
         run_id: 1,
         repository: "foo/bar".to_string(),
+        name: None,
         labels: vec!["dedicated-label".to_string()],
         // Even if created_at is right now (age 0), it should be immediately eligible.
         created_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -38,6 +39,7 @@ fn test_label_eligibility() {
         job_id: 2,
         run_id: 1,
         repository: "foo/bar".to_string(),
+        name: None,
         labels: vec!["other-label".to_string()],
         created_at: Some(chrono::Utc::now().to_rfc3339()),
     };
@@ -64,7 +66,11 @@ fn test_job_with_both_dedicated_and_fallback_labels_is_eligible_immediately() {
         job_id: 3,
         run_id: 1,
         repository: "foo/bar".to_string(),
-        labels: vec!["dedicated-label".to_string(), FALLBACK_QUEUE_LABEL.to_string()],
+        name: None,
+        labels: vec![
+            "dedicated-label".to_string(),
+            FALLBACK_QUEUE_LABEL.to_string(),
+        ],
         created_at: Some(chrono::Utc::now().to_rfc3339()),
     };
 
@@ -84,6 +90,7 @@ fn test_unconfigured_label_that_is_not_the_fallback_string_is_never_eligible() {
         job_id: 4,
         run_id: 1,
         repository: "foo/bar".to_string(),
+        name: None,
         labels: vec!["windows-runner".to_string()],
         created_at: Some(chrono::Utc::now().to_rfc3339()),
     };
@@ -100,6 +107,7 @@ fn test_job_with_no_labels_is_never_eligible() {
         job_id: 5,
         run_id: 1,
         repository: "foo/bar".to_string(),
+        name: None,
         labels: vec![],
         created_at: Some(chrono::Utc::now().to_rfc3339()),
     };

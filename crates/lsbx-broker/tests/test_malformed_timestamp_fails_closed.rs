@@ -21,6 +21,7 @@ fn test_malformed_timestamp_fails_closed() {
         job_id: 1,
         run_id: 1,
         repository: "foo/bar".to_string(),
+        name: None,
         labels: vec![FALLBACK_QUEUE_LABEL.to_string()],
         created_at: Some("not-a-timestamp".to_string()),
     };
@@ -51,6 +52,7 @@ fn test_missing_timestamp_fails_closed() {
         job_id: 2,
         run_id: 1,
         repository: "foo/bar".to_string(),
+        name: None,
         labels: vec![FALLBACK_QUEUE_LABEL.to_string()],
         created_at: None,
     };

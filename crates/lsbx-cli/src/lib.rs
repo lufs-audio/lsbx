@@ -292,10 +292,15 @@ async fn connect_libvirt(state_dir: &std::path::Path) -> Result<LibvirtBackend, 
         .map(PathBuf::from)
         .unwrap_or_else(|_| state_dir.join("vms"));
 
+    let username = std::env::var("LSBX_LIBVIRT_USER")
+        .or_else(|_| std::env::var("LUFSS_LIBVIRT_USER"))
+        .unwrap_or_else(|_| "exedev".to_string());
+
     let backend = LibvirtBackend::connect(transport)
         .await?
         .with_images_dir(images_dir)
-        .with_work_dir(vm_dir);
+        .with_work_dir(vm_dir)
+        .with_guest_username(username);
     Ok(backend)
 }
 
@@ -313,8 +318,17 @@ async fn connect_libvirt(state_dir: &std::path::Path) -> Result<LibvirtBackend, 
 /// anything must still call [`probe_backend`].
 fn build_exedev() -> Result<ExedevBackend, LsbxError> {
     let ssh_key = std::env::var("LSBX_EXEDEV_SSH_KEY").ok().map(PathBuf::from);
+    let token_env = std::env::var("LSBX_EXEDEV_TOKEN_ENV")
+        .or_else(|_| std::env::var("LUFSS_EXEDEV_TOKEN_ENV"))
+        .unwrap_or_else(|_| "EXE_TOKEN".to_string());
+    let token = std::env::var(&token_env)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let ssh_alias = std::env::var("LSBX_EXEDEV_SSH_ALIAS")
+        .or_else(|_| std::env::var("LUFSS_EXEDEV_SSH_ALIAS"))
+        .unwrap_or_else(|_| "exe.dev".to_string());
 
-    let auth = if let Ok(token) = std::env::var("EXE_TOKEN") {
+    let auth = if let Some(token) = token {
         match ssh_key {
             Some(key) => ExedevAuth::account_token_with_fallback(token, key),
             None => ExedevAuth::account_token(token),
@@ -322,9 +336,10 @@ fn build_exedev() -> Result<ExedevBackend, LsbxError> {
     } else if let Some(key) = ssh_key {
         ExedevAuth::Ssh { key_path: key }
     } else {
-        return Err(LsbxError::BackendUnavailable(
-            "no exedev auth configured (set EXE_TOKEN and/or LSBX_EXEDEV_SSH_KEY)".to_string(),
-        ));
+        // The old Molimo service deliberately unsets EXE_TOKEN and relies
+        // on the existing `ssh exe.dev` alias/agent configuration. Preserve
+        // that behavior instead of requiring a new credential file.
+        ExedevAuth::ssh_alias(ssh_alias)
     };
 
     Ok(ExedevBackend::new(auth))
@@ -357,6 +372,9 @@ fn resolve_state_dir(explicit: Option<&std::path::Path>) -> PathBuf {
     if let Ok(from_env) = std::env::var("LSBX_STATE_DIR") {
         return PathBuf::from(from_env);
     }
+    if let Ok(from_env) = std::env::var("LUFSS_SANDBOX_STATE_DIR") {
+        return PathBuf::from(from_env);
+    }
     dirs_home()
         .map(|home| home.join(".local/share/lsbx"))
         .unwrap_or_else(|| PathBuf::from("/tmp/lsbx"))
@@ -384,6 +402,10 @@ fn resolve_images_path(explicit: Option<&std::path::Path>, state_dir: &std::path
         return PathBuf::from(from_env);
     }
     if let Ok(from_env) = std::env::var("LSBX_IMAGES") {
+        return PathBuf::from(from_env);
+    }
+    // Legacy predecessor spelling; modern LSBX_* settings take precedence.
+    if let Ok(from_env) = std::env::var("LUFSS_IMAGES") {
         return PathBuf::from(from_env);
     }
     state_dir.join("images.json")
@@ -441,7 +463,10 @@ impl OpsDeps {
 /// solely for this one internal call site would be a needless surface
 /// change to `cli.rs`, whose own module doc comment reserves it for
 /// argument-parsing definitions only).
-async fn build_deps(args: &Cli, backend_override: Option<BackendChoice>) -> Result<OpsDeps, LsbxError> {
+async fn build_deps(
+    args: &Cli,
+    backend_override: Option<BackendChoice>,
+) -> Result<OpsDeps, LsbxError> {
     let state_dir = resolve_state_dir(args.state_dir.as_deref());
     let images_path = resolve_images_path(args.images.as_deref(), &state_dir);
 
@@ -453,7 +478,21 @@ async fn build_deps(args: &Cli, backend_override: Option<BackendChoice>) -> Resu
     // seam to land in rather than this crate silently ignoring the flag.
     let _config_path = args.config.clone();
 
-    let backend_choice = backend_override.or_else(|| args.backend.clone()).unwrap_or(BackendChoice::Demo);
+    let backend_choice = backend_override
+        .or_else(|| args.backend.clone())
+        .or_else(|| {
+            std::env::var("LSBX_BACKEND")
+                .or_else(|_| std::env::var("LUFSS_BACKEND"))
+                .ok()
+                .and_then(|value| match value.to_ascii_lowercase().as_str() {
+                    "libvirt" => Some(BackendChoice::Libvirt),
+                    "exedev" => Some(BackendChoice::Exedev),
+                    "demo" => Some(BackendChoice::Demo),
+                    "auto" => Some(BackendChoice::Auto),
+                    _ => None,
+                })
+        })
+        .unwrap_or(BackendChoice::Demo);
     let built = build_backend(&backend_choice, &state_dir).await?;
 
     let sandbox_store = SandboxStore::new(state_dir.clone());
@@ -508,9 +547,9 @@ fn parse_duration(input: &str) -> Result<Duration, LsbxError> {
         _ => (input, 's'),
     };
 
-    let value: u64 = num_part.parse().map_err(|_| {
-        LsbxError::Usage(format!("invalid duration '{input}': not a valid number"))
-    })?;
+    let value: u64 = num_part
+        .parse()
+        .map_err(|_| LsbxError::Usage(format!("invalid duration '{input}': not a valid number")))?;
 
     let seconds = match unit {
         's' => value,
@@ -539,7 +578,9 @@ const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 /// Returns just the public key line; the private half is cleaned up
 /// immediately after use since a golden-build/verify VM's own lifecycle
 /// (not a persisted `SandboxRecord`) is what would otherwise need it again.
-fn generate_pubkey_for(label: &str) -> Result<(String, lsbx_keys::keygen::EphemeralKeypair), LsbxError> {
+fn generate_pubkey_for(
+    label: &str,
+) -> Result<(String, lsbx_keys::keygen::EphemeralKeypair), LsbxError> {
     let keypair = lsbx_keys::keygen::generate_ephemeral_keypair(label)?;
     Ok((keypair.public_key_line.clone(), keypair))
 }
@@ -556,7 +597,12 @@ fn generate_pubkey_for(label: &str) -> Result<(String, lsbx_keys::keygen::Epheme
 /// stores were built from, which `LsbxOps` itself has no accessor for (its
 /// `sandbox_store`/`ci_job_store` fields are private by design — see
 /// `lsbx-ops`'s own module doc comment).
-async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) -> Result<i32, LsbxError> {
+async fn dispatch(
+    ops: &LsbxOps,
+    state_dir: PathBuf,
+    args: &Cli,
+    as_json: bool,
+) -> Result<i32, LsbxError> {
     match &args.command {
         None => {
             // TODO: hand off to lsbx-tui once wired as a dependency of this
@@ -569,7 +615,10 @@ async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) 
             // this crate's dependency graph honest about what it actually
             // ships today.
             let status = ops.status().await?;
-            println!("{}", format::render(&StatusReportDto::from(status), as_json));
+            println!(
+                "{}",
+                format::render(&StatusReportDto::from(status), as_json)
+            );
             Ok(0)
         }
         Some(Command::Up {
@@ -605,6 +654,11 @@ async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) 
 
                 let req = lsbx_lifecycle::create::CreateRequest {
                     profile,
+                    golden: None,
+                    cpu: None,
+                    memory: None,
+                    flavor: None,
+                    streaming: None,
                     name: per_instance_name.as_deref(),
                     task_id: task_id.as_deref(),
                     lease: lease_duration,
@@ -660,7 +714,11 @@ async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) 
             println!("{}", format::render(&SandboxList(sandboxes), as_json));
             Ok(0)
         }
-        Some(Command::Exec { id, timeout, command }) => {
+        Some(Command::Exec {
+            id,
+            timeout,
+            command,
+        }) => {
             let timeout_duration = timeout
                 .map(Duration::from_secs)
                 .unwrap_or(DEFAULT_EXEC_TIMEOUT);
@@ -669,14 +727,28 @@ async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) 
             println!("{}", format::render(&dto, as_json));
             Ok(output.exit_code)
         }
-        Some(Command::Put { id, source, destination }) => {
+        Some(Command::Put {
+            id,
+            source,
+            destination,
+        }) => {
             ops.put(id, source, destination).await?;
-            println!("{}", format::render(&PutGetResult { id: id.clone() }, as_json));
+            println!(
+                "{}",
+                format::render(&PutGetResult { id: id.clone() }, as_json)
+            );
             Ok(0)
         }
-        Some(Command::Get { id, source, destination }) => {
+        Some(Command::Get {
+            id,
+            source,
+            destination,
+        }) => {
             ops.get(id, source, destination).await?;
-            println!("{}", format::render(&PutGetResult { id: id.clone() }, as_json));
+            println!(
+                "{}",
+                format::render(&PutGetResult { id: id.clone() }, as_json)
+            );
             Ok(0)
         }
         Some(Command::Renew { id, duration }) => {
@@ -697,7 +769,10 @@ async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) 
         }
         Some(Command::Status) => {
             let status = ops.status().await?;
-            println!("{}", format::render(&StatusReportDto::from(status), as_json));
+            println!(
+                "{}",
+                format::render(&StatusReportDto::from(status), as_json)
+            );
             Ok(0)
         }
         Some(Command::Profiles { full }) => {
@@ -739,8 +814,8 @@ async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) 
             stream_port,
             token,
             reap_ttl,
-            daemon,
             insecure,
+            daemon,
         }) => {
             dispatch_serve(
                 args,
@@ -750,8 +825,8 @@ async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) 
                 *stream_port,
                 token.clone(),
                 reap_ttl.as_deref(),
-                *daemon,
                 *insecure,
+                *daemon,
             )
             .await
         }
@@ -761,11 +836,25 @@ async fn dispatch(ops: &LsbxOps, state_dir: PathBuf, args: &Cli, as_json: bool) 
             no_verify,
             force,
             dry_run,
-        }) => dispatch_bootstrap(target.clone(), *no_services, *no_verify, *force, *dry_run, as_json).await,
-        Some(Command::Golden { action }) => dispatch_golden(ops, action, as_json).await,
-        Some(Command::Config { show, init, set, path, force }) => {
-            dispatch_config(ops, *show, *init, set.as_deref(), *path, *force, as_json).await
+        }) => {
+            dispatch_bootstrap(
+                target.clone(),
+                *no_services,
+                *no_verify,
+                *force,
+                *dry_run,
+                as_json,
+            )
+            .await
         }
+        Some(Command::Golden { action }) => dispatch_golden(ops, action, as_json).await,
+        Some(Command::Config {
+            show,
+            init,
+            set,
+            path,
+            force,
+        }) => dispatch_config(ops, *show, *init, set.as_deref(), *path, *force, as_json).await,
         Some(Command::Logs { since, limit, .. }) => {
             let result = ops.logs_query(since.as_deref(), limit.unwrap_or(100)).await;
             match result {
@@ -837,12 +926,15 @@ async fn dispatch_golden(
                 cleanup: !no_cleanup,
                 dry_run: *dry_run,
                 pubkey: &pubkey,
+                key_path: keypair.as_ref().map(|kp| kp.private_key_path.as_path()),
             };
 
             let result = ops.golden_build(req).await;
 
             if let Some(kp) = keypair {
-                let _ = lsbx_keys::keygen::cleanup_keypair(&kp);
+                if !*no_cleanup {
+                    let _ = lsbx_keys::keygen::cleanup_keypair(&kp);
+                }
             }
 
             let outcome = result?;
@@ -855,12 +947,17 @@ async fn dispatch_golden(
         GoldenCommand::Verify { name } => {
             let (pubkey, keypair) = generate_pubkey_for(&format!("golden-verify-{name}"))?;
             let verify_name = format!("verify-{name}");
-            let result = ops.golden_verify(name, &verify_name, &pubkey).await;
+            let result = ops
+                .golden_verify(name, &verify_name, &pubkey, Some(&keypair.private_key_path))
+                .await;
             let _ = lsbx_keys::keygen::cleanup_keypair(&keypair);
 
             let results = result?;
             let dto = HealthcheckResultsDto(
-                results.into_iter().map(HealthcheckResultDto::from).collect(),
+                results
+                    .into_iter()
+                    .map(HealthcheckResultDto::from)
+                    .collect(),
             );
             let all_passed = dto.0.iter().all(|r| r.passed);
             println!("{}", format::render(&dto, as_json));
@@ -912,10 +1009,16 @@ async fn dispatch_golden(
             };
 
             ops.golden_register(config).await?;
-            println!("{}", format::render(&RegisteredGolden(name.clone()), as_json));
+            println!(
+                "{}",
+                format::render(&RegisteredGolden(name.clone()), as_json)
+            );
             Ok(0)
         }
-        GoldenCommand::Delete { name, keep_snapshot } => {
+        GoldenCommand::Delete {
+            name,
+            keep_snapshot,
+        } => {
             ops.golden_delete(name, *keep_snapshot).await?;
             println!("{}", format::render(&DeletedGolden(name.clone()), as_json));
             Ok(0)
@@ -1003,7 +1106,10 @@ async fn dispatch_bootstrap(
     };
 
     let report = lsbx_bootstrap::systemd::bootstrap(config).await?;
-    println!("{}", format::render(&BootstrapReportDto::from(report), as_json));
+    println!(
+        "{}",
+        format::render(&BootstrapReportDto::from(report), as_json)
+    );
     Ok(0)
 }
 
@@ -1140,21 +1246,25 @@ async fn dispatch_serve(
     stream_port: Option<u16>,
     token: Option<String>,
     reap_ttl: Option<&str>,
-    daemon: bool,
     insecure: bool,
+    daemon: bool,
 ) -> Result<i32, LsbxError> {
     let host_str = host.unwrap_or("127.0.0.1");
-    let host_ip: std::net::IpAddr = host_str.parse().map_err(|e| {
-        LsbxError::Usage(format!("invalid --host value '{host_str}': {e}"))
-    })?;
+    let host_ip: std::net::IpAddr = host_str
+        .parse()
+        .map_err(|e| LsbxError::Usage(format!("invalid --host value '{host_str}': {e}")))?;
     let gateway_port = port.unwrap_or(DEFAULT_SERVE_PORT);
     let reap_ttl_duration = match reap_ttl {
         Some(s) => parse_duration(s)?,
         None => DEFAULT_SERVE_REAP_TTL,
     };
 
+    let gateway_token = token
+        .or_else(|| std::env::var("LSBX_GATEWAY_TOKEN").ok())
+        .or_else(|| std::env::var("LUFSS_GATEWAY_TOKEN").ok());
+
     let gateway_config = || lsbx_gateway::GatewayConfig {
-        token: token.clone(),
+        token: gateway_token.clone(),
         allow_local_files: false,
         insecure,
         rate_limit: lsbx_gateway::RateLimitConfig::default(),
@@ -1234,27 +1344,41 @@ async fn dispatch_serve(
     } else {
         // Dual listener: gateway-only on `port`, stream-only on
         // `stream_port` — two independent bound servers run concurrently.
-        #[allow(clippy::unwrap_used)] // `dual_listener` above already proved `stream_port` is `Some`.
+        #[allow(clippy::unwrap_used)]
+        // `dual_listener` above already proved `stream_port` is `Some`.
         let stream_port_value = stream_port.unwrap();
 
-        let gateway_router = lsbx_gateway::build_router(std::sync::Arc::clone(&reap_ops), gateway_config());
+        let gateway_router =
+            lsbx_gateway::build_router(std::sync::Arc::clone(&reap_ops), gateway_config());
         let gateway_addr = std::net::SocketAddr::new(host_ip, gateway_port);
-        let gateway_listener = tokio::net::TcpListener::bind(gateway_addr).await.map_err(|e| {
-            LsbxError::ContractViolated(format!("failed to bind gateway listener on {gateway_addr}: {e}"))
-        })?;
+        let gateway_listener = tokio::net::TcpListener::bind(gateway_addr)
+            .await
+            .map_err(|e| {
+                LsbxError::ContractViolated(format!(
+                    "failed to bind gateway listener on {gateway_addr}: {e}"
+                ))
+            })?;
 
-        let stream_store = std::sync::Arc::new(lsbx_store::sandbox_store::SandboxStore::new(state_dir.clone()));
+        let stream_store = std::sync::Arc::new(lsbx_store::sandbox_store::SandboxStore::new(
+            state_dir.clone(),
+        ));
         let stream_router = lsbx_stream::router(lsbx_stream::StreamState {
             ops: reap_ops,
             store: stream_store,
         });
         let stream_addr = std::net::SocketAddr::new(host_ip, stream_port_value);
-        let stream_listener = tokio::net::TcpListener::bind(stream_addr).await.map_err(|e| {
-            LsbxError::ContractViolated(format!("failed to bind stream listener on {stream_addr}: {e}"))
-        })?;
+        let stream_listener = tokio::net::TcpListener::bind(stream_addr)
+            .await
+            .map_err(|e| {
+                LsbxError::ContractViolated(format!(
+                    "failed to bind stream listener on {stream_addr}: {e}"
+                ))
+            })?;
 
         if !daemon {
-            println!("lsbx serve: listening on {gateway_addr} (gateway) and {stream_addr} (stream)");
+            println!(
+                "lsbx serve: listening on {gateway_addr} (gateway) and {stream_addr} (stream)"
+            );
         }
 
         let gateway_serve = axum::serve(
@@ -1363,7 +1487,10 @@ const DEFAULT_CI_BROKER_LEASE: Duration = Duration::from_secs(3600);
 /// not invent a new fallback mechanism, it invokes the existing one).
 async fn dispatch_ci_broker(args: &Cli, action: &CiBrokerCommand) -> Result<i32, LsbxError> {
     match action {
-        CiBrokerCommand::Run { backend, queue_label } => {
+        CiBrokerCommand::Run {
+            backend,
+            queue_label,
+        } => {
             // Reuse build_deps()'s exact construction path for
             // backend/store/registry, the same way dispatch_mcp/dispatch_serve
             // do — see those functions' own doc comments for the general
@@ -1388,16 +1515,41 @@ async fn dispatch_ci_broker(args: &Cli, action: &CiBrokerCommand) -> Result<i32,
                 .clone()
                 .or_else(|| std::env::var(QUEUE_LABEL_ENV).ok())
                 .unwrap_or_else(|| lsbx_broker::poll::FALLBACK_QUEUE_LABEL.to_string());
-            let poll_config = lsbx_broker::poll::PollConfig::from_queue_label_and_env(&queue_label_value);
+            let poll_config =
+                lsbx_broker::poll::PollConfig::from_queue_label_and_env(&queue_label_value);
 
             let github = build_github_client().await?;
+            let runner = match lsbx_broker::reconcile::RunnerConfig::from_env(
+                match backend {
+                    BackendChoice::Libvirt => "libvirt",
+                    BackendChoice::Exedev => "exedev",
+                    BackendChoice::Demo => "demo",
+                    BackendChoice::Auto => "exedev",
+                },
+                &queue_label_value,
+            ) {
+                Ok(config) => Some(config),
+                // Carnyx's gh-CLI mode has no GitHub App PEM. It still needs
+                // the poll/dispatch broker, but runner provisioning is App-
+                // credentialed and must remain disabled until a gh-based
+                // registration-token path exists. A partially configured App
+                // is still a hard failure; do not soften Molimo's App path.
+                Err(LsbxError::AuthFailed(message))
+                    if message == "GitHub App id is not configured" =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
 
             let broker_config = lsbx_broker::reconcile::BrokerConfig {
                 poll: poll_config,
                 lease: DEFAULT_CI_BROKER_LEASE,
+                runner,
             };
 
-            lsbx_broker::reconcile::run_broker(&job_store, &ops, &github, broker_config, None).await?;
+            lsbx_broker::reconcile::run_broker(&job_store, &ops, &github, broker_config, None)
+                .await?;
             Ok(0)
         }
     }
@@ -1409,8 +1561,12 @@ async fn dispatch_ci_broker(args: &Cli, action: &CiBrokerCommand) -> Result<i32,
 /// otherwise. See [`dispatch_ci_broker`]'s own doc comment for the full
 /// design writeup.
 async fn build_github_client() -> Result<lsbx_broker::github_client::GitHubClient, LsbxError> {
-    let app_id = std::env::var(GITHUB_APP_ID_ENV).ok();
-    let private_key_path = std::env::var(GITHUB_APP_PRIVATE_KEY_PATH_ENV).ok();
+    let app_id = std::env::var(GITHUB_APP_ID_ENV)
+        .or_else(|_| std::env::var("GITHUB_APP_ID"))
+        .ok();
+    let private_key_path = std::env::var(GITHUB_APP_PRIVATE_KEY_PATH_ENV)
+        .or_else(|_| std::env::var("GITHUB_APP_KEY"))
+        .ok();
 
     match (app_id, private_key_path) {
         (Some(app_id_str), Some(key_path)) => {
@@ -1425,6 +1581,7 @@ async fn build_github_client() -> Result<lsbx_broker::github_client::GitHubClien
                 ))
             })?;
             let installation_id = std::env::var(GITHUB_APP_INSTALLATION_ID_ENV)
+                .or_else(|_| std::env::var("GITHUB_INSTALLATION_ID"))
                 .ok()
                 .map(|s| {
                     s.parse::<u64>().map_err(|_| {
@@ -1434,13 +1591,15 @@ async fn build_github_client() -> Result<lsbx_broker::github_client::GitHubClien
                     })
                 })
                 .transpose()?;
-            let owner = std::env::var(GITHUB_APP_OWNER_ENV).map_err(|_| {
-                LsbxError::Usage(format!(
-                    "{GITHUB_APP_OWNER_ENV} is required when {GITHUB_APP_ID_ENV} and \
+            let owner = std::env::var(GITHUB_APP_OWNER_ENV)
+                .or_else(|_| std::env::var("GITHUB_OWNER"))
+                .map_err(|_| {
+                    LsbxError::Usage(format!(
+                        "{GITHUB_APP_OWNER_ENV} is required when {GITHUB_APP_ID_ENV} and \
                      {GITHUB_APP_PRIVATE_KEY_PATH_ENV} are set (the installation-token \
                      exchange is scoped per-owner)"
-                ))
-            })?;
+                    ))
+                })?;
 
             let auth = lsbx_broker::auth::GitHubAppAuth::new(lsbx_broker::auth::GitHubAppConfig {
                 app_id,
@@ -1515,10 +1674,7 @@ impl Formattable for PublicSandbox {
                 "lease_expires_at",
                 self.lease_expires_at.clone().unwrap_or_default(),
             ),
-            (
-                "console_url",
-                self.console_url.clone().unwrap_or_default(),
-            ),
+            ("console_url", self.console_url.clone().unwrap_or_default()),
             ("cleanup_failed", self.cleanup_failed.to_string()),
             ("repository", self.repository.clone().unwrap_or_default()),
         ])
@@ -1543,7 +1699,10 @@ impl Formattable for SandboxList {
                 ]
             })
             .collect();
-        format::row_table(&["ID", "NAME", "PROFILE", "STREAMING", "LEASE_EXPIRES_AT"], &rows)
+        format::row_table(
+            &["ID", "NAME", "PROFILE", "STREAMING", "LEASE_EXPIRES_AT"],
+            &rows,
+        )
     }
 }
 
@@ -1770,7 +1929,11 @@ impl Formattable for HealthcheckResultsDto {
             .map(|r| {
                 vec![
                     r.command.clone(),
-                    if r.passed { "pass".to_string() } else { "fail".to_string() },
+                    if r.passed {
+                        "pass".to_string()
+                    } else {
+                        "fail".to_string()
+                    },
                 ]
             })
             .collect();
@@ -1783,7 +1946,9 @@ struct ConsoleUrlDto(Option<String>);
 
 impl Formattable for ConsoleUrlDto {
     fn to_human_table(&self) -> String {
-        self.0.clone().unwrap_or_else(|| "(no console available)".to_string())
+        self.0
+            .clone()
+            .unwrap_or_else(|| "(no console available)".to_string())
     }
 }
 

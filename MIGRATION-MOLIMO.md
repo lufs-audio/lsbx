@@ -63,7 +63,7 @@ The Carnyx migration changed **shared** `lsbx` behavior. You get the code automa
 | GitHub auth (CI broker) | GitHub App JWT auth, **unconditionally live** (`GITHUB_APP_ID=4377007` uncommitted/active in the real env file) — Molimo has no working `gh` CLI fallback (its `gh auth` session was reported invalid at last audit) | same GitHub App (`LSBX_GITHUB_APP_ID`/`LSBX_GITHUB_APP_PRIVATE_KEY_PATH`/`LSBX_GITHUB_APP_OWNER`) — **this path is not optional for Molimo the way it is for Carnyx; confirm `gh auth status` before assuming a fallback exists as a safety net** |
 | Process supervision | systemd, `Restart=on-failure` | same. `--daemon` on the new `lsbx serve` does not fork/background — systemd remains solely responsible, identical to today |
 | Reaper | separate `--reap-interval`/`--reap-ttl` flags | internal background task, interval derived from `reap_ttl`, no separate flag |
-| `EXE_TOKEN` handling | Old gateway unit explicitly `UnsetEnvironment=EXE_TOKEN` to force the SSH control-plane path rather than risk an expired token blocking cloud provisioning | **verify whether the new `lsbx-backend-exedev` crate has an equivalent fallback-preference concept; if it always prefers `EXE_TOKEN` when present with no override, and your token is stale, this is a real functional regression risk specific to this host — check `crates/lsbx-backend-exedev`'s real source for a `fallback_ssh_key_path`/equivalent option before cutover, don't assume the old unit's workaround has a new-system equivalent by default** |
+| `EXE_TOKEN` handling | Old gateway unit explicitly `UnsetEnvironment=EXE_TOKEN` to force the SSH control-plane path rather than risk an expired token blocking cloud provisioning | `build_exedev()` selects `EXE_TOKEN` only when present; otherwise it uses the configured `LSBX_EXEDEV_SSH_ALIAS` (default `exe.dev`). Molimo's serve unit keeps `UnsetEnvironment=EXE_TOKEN`, preserving the SSH-alias path. |
 
 ---
 
@@ -264,7 +264,8 @@ User=exedev
 Group=exedev
 WorkingDirectory=/home/exedev/repos/lsbx
 EnvironmentFile=/home/exedev/lsbx-state/serve.env
-ExecStart=/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 100.122.170.73 --port 8244 --reap-ttl 3h
+UnsetEnvironment=EXE_TOKEN
+ExecStart=/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 100.122.170.73 --port 8244 --reap-ttl 3h --insecure
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -281,7 +282,7 @@ Notes:
 - **Repo discovery is auth-aware.** gh-CLI mode needs `LSBX_CI_REPOS` and never calls the App-only `/installation/repositories` (that 403 is what Carnyx hit and fixed). Molino's App mode still discovers from the installation — no `LSBX_CI_REPOS` needed.
 - Hardening directives (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`, `ReadWritePaths`) are carried forward from the **old** `lsbx-gateway-exedev.service` — Carnyx's old gateway unit didn't have these, but Molimo's did; preserve that asymmetry deliberately rather than "fixing" it to match Carnyx, unless you have a specific reason to change Molimo's security posture as part of this migration (you almost certainly don't — flag it if you think otherwise, don't just harmonize the two hosts silently).
 - `ReadWritePaths` must include wherever `--state-dir` actually points, or the gateway will fail to write sandbox records under the `ProtectSystem=full` sandboxing — this is exactly the kind of thing that passes a naive smoke test run interactively (outside systemd's sandboxing) and then fails only once actually started via `systemctl start`, so **test via `systemctl start`, not by running the binary by hand**, before declaring this unit correct.
-- The `EXE_TOKEN`-avoidance workaround from the old unit (`UnsetEnvironment=EXE_TOKEN`) is **not** carried forward automatically here — resolve the §2 open question about whether the new exedev backend has an equivalent preference/override before deciding whether you need something similar in this new unit's `[Service]` section.
+- **The old-unit `EXE_TOKEN` workaround remains deliberate.** `UnsetEnvironment=EXE_TOKEN` keeps the serve process on the configured Rust backend/auth path rather than allowing an inherited legacy token to change behavior; retain it in the systemd unit.
 - Create `serve.env` with a real bearer token, mode 0600, owner `exedev:exedev`, same pattern as Carnyx's doc §7.3.
 
 ```bash

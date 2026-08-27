@@ -58,7 +58,9 @@ use std::time::Duration;
 /// *domain* `LsbxError` (one `LsbxOps` itself returned) is rendered this
 /// way — inside a successful `CallToolResult` — rather than as
 /// `Err(McpError)`.
-fn envelope_result<T: serde::Serialize>(result: Result<T, LsbxError>) -> Result<CallToolResult, McpError> {
+fn envelope_result<T: serde::Serialize>(
+    result: Result<T, LsbxError>,
+) -> Result<CallToolResult, McpError> {
     let envelope = Envelope::from_result(result);
     // `ContentBlock::json` serializes and wraps as text content, mapping a
     // serialization failure onto `ErrorCode::INTERNAL_ERROR` itself — this
@@ -428,11 +430,19 @@ impl LsbxMcpServer {
     }
 
     #[tool(description = "Create a new ephemeral sandbox from a profile")]
-    pub async fn create(&self, Parameters(p): Parameters<CreateParams>) -> Result<CallToolResult, McpError> {
+    pub async fn create(
+        &self,
+        Parameters(p): Parameters<CreateParams>,
+    ) -> Result<CallToolResult, McpError> {
         let result = self
             .ops
             .create(lsbx_lifecycle::create::CreateRequest {
                 profile: &p.profile,
+                golden: None,
+                cpu: None,
+                memory: None,
+                flavor: None,
+                streaming: None,
                 name: p.name.as_deref(),
                 task_id: p.task_id.as_deref(),
                 lease: duration_from_secs(p.lease_secs),
@@ -445,21 +455,33 @@ impl LsbxMcpServer {
     }
 
     #[tool(description = "Destroy a sandbox by id")]
-    pub async fn destroy(&self, Parameters(p): Parameters<DestroyParams>) -> Result<CallToolResult, McpError> {
+    pub async fn destroy(
+        &self,
+        Parameters(p): Parameters<DestroyParams>,
+    ) -> Result<CallToolResult, McpError> {
         require_non_empty("id", &p.id)?;
         let result = self.ops.destroy(&p.id).await;
         envelope_result(result)
     }
 
     #[tool(description = "Extend a sandbox's lease")]
-    pub async fn renew(&self, Parameters(p): Parameters<RenewParams>) -> Result<CallToolResult, McpError> {
+    pub async fn renew(
+        &self,
+        Parameters(p): Parameters<RenewParams>,
+    ) -> Result<CallToolResult, McpError> {
         require_non_empty("id", &p.id)?;
-        let result = self.ops.renew(&p.id, duration_from_secs(p.duration_secs)).await;
+        let result = self
+            .ops
+            .renew(&p.id, duration_from_secs(p.duration_secs))
+            .await;
         envelope_result(result)
     }
 
     #[tool(description = "Sweep lease-expired sandboxes and reconcile orphaned keys")]
-    pub async fn reap(&self, Parameters(p): Parameters<ReapParams>) -> Result<CallToolResult, McpError> {
+    pub async fn reap(
+        &self,
+        Parameters(p): Parameters<ReapParams>,
+    ) -> Result<CallToolResult, McpError> {
         let result = self
             .ops
             .reap(duration_from_secs(p.ttl_secs), p.dry_run)
@@ -475,27 +497,39 @@ impl LsbxMcpServer {
     }
 
     #[tool(description = "List every known sandbox")]
-    pub async fn list(&self, Parameters(_p): Parameters<ListParams>) -> Result<CallToolResult, McpError> {
+    pub async fn list(
+        &self,
+        Parameters(_p): Parameters<ListParams>,
+    ) -> Result<CallToolResult, McpError> {
         let result = self.ops.list().await;
         envelope_result(result)
     }
 
     #[tool(description = "Get public info for a sandbox by id")]
-    pub async fn info(&self, Parameters(p): Parameters<InfoParams>) -> Result<CallToolResult, McpError> {
+    pub async fn info(
+        &self,
+        Parameters(p): Parameters<InfoParams>,
+    ) -> Result<CallToolResult, McpError> {
         require_non_empty("id", &p.id)?;
         let result = self.ops.info(&p.id).await;
         envelope_result(result)
     }
 
     #[tool(description = "Compute the console URL for a sandbox, if it has one")]
-    pub async fn console_url(&self, Parameters(p): Parameters<ConsoleUrlParams>) -> Result<CallToolResult, McpError> {
+    pub async fn console_url(
+        &self,
+        Parameters(p): Parameters<ConsoleUrlParams>,
+    ) -> Result<CallToolResult, McpError> {
         require_non_empty("id", &p.id)?;
         let result = self.ops.console_url(&p.id).await;
         envelope_result(result)
     }
 
     #[tool(description = "Run a command inside a sandbox")]
-    pub async fn exec(&self, Parameters(p): Parameters<ExecParams>) -> Result<CallToolResult, McpError> {
+    pub async fn exec(
+        &self,
+        Parameters(p): Parameters<ExecParams>,
+    ) -> Result<CallToolResult, McpError> {
         require_non_empty("id", &p.id)?;
         if p.command.is_empty() {
             return Err(lsbx_error_to_mcp_error(LsbxError::Usage(
@@ -517,7 +551,10 @@ impl LsbxMcpServer {
     }
 
     #[tool(description = "Copy a local file into a sandbox")]
-    pub async fn put(&self, Parameters(p): Parameters<PutParams>) -> Result<CallToolResult, McpError> {
+    pub async fn put(
+        &self,
+        Parameters(p): Parameters<PutParams>,
+    ) -> Result<CallToolResult, McpError> {
         require_non_empty("id", &p.id)?;
         require_non_empty("source", &p.source)?;
         require_non_empty("destination", &p.destination)?;
@@ -529,7 +566,10 @@ impl LsbxMcpServer {
     }
 
     #[tool(description = "Copy a file out of a sandbox to a local path")]
-    pub async fn get(&self, Parameters(p): Parameters<GetParams>) -> Result<CallToolResult, McpError> {
+    pub async fn get(
+        &self,
+        Parameters(p): Parameters<GetParams>,
+    ) -> Result<CallToolResult, McpError> {
         require_non_empty("id", &p.id)?;
         require_non_empty("source", &p.source)?;
         require_non_empty("destination", &p.destination)?;
@@ -541,7 +581,10 @@ impl LsbxMcpServer {
     }
 
     #[tool(description = "Report the backend name, live availability, and sandbox count")]
-    pub async fn status(&self, Parameters(_p): Parameters<StatusParams>) -> Result<CallToolResult, McpError> {
+    pub async fn status(
+        &self,
+        Parameters(_p): Parameters<StatusParams>,
+    ) -> Result<CallToolResult, McpError> {
         let result = self.ops.status().await.map(|s| {
             serde_json::json!({
                 "backend_name": s.backend_name,
@@ -553,7 +596,10 @@ impl LsbxMcpServer {
     }
 
     #[tool(description = "Build a golden image by provisioning a fresh VM from a base")]
-    pub async fn golden_build(&self, Parameters(p): Parameters<GoldenBuildParams>) -> Result<CallToolResult, McpError> {
+    pub async fn golden_build(
+        &self,
+        Parameters(p): Parameters<GoldenBuildParams>,
+    ) -> Result<CallToolResult, McpError> {
         require_non_empty("name", &p.name)?;
         require_non_empty("from", &p.from)?;
         require_non_empty("script", &p.script)?;
@@ -562,6 +608,7 @@ impl LsbxMcpServer {
         let result = self
             .ops
             .golden_build(lsbx_golden::build::GoldenBuildRequest {
+                key_path: None,
                 name: &p.name,
                 from: &p.from,
                 script: &script_path,
@@ -585,13 +632,16 @@ impl LsbxMcpServer {
     }
 
     #[tool(description = "Create a fresh instance of a registered golden and run its healthchecks")]
-    pub async fn golden_verify(&self, Parameters(p): Parameters<GoldenVerifyParams>) -> Result<CallToolResult, McpError> {
+    pub async fn golden_verify(
+        &self,
+        Parameters(p): Parameters<GoldenVerifyParams>,
+    ) -> Result<CallToolResult, McpError> {
         require_non_empty("name", &p.name)?;
         require_non_empty("verify_name", &p.verify_name)?;
         require_non_empty("pubkey", &p.pubkey)?;
         let result = self
             .ops
-            .golden_verify(&p.name, &p.verify_name, &p.pubkey)
+            .golden_verify(&p.name, &p.verify_name, &p.pubkey, None)
             .await
             .map(|results| {
                 results
@@ -609,7 +659,10 @@ impl LsbxMcpServer {
     }
 
     #[tool(description = "Register a golden into the in-process image registry")]
-    pub async fn golden_register(&self, Parameters(p): Parameters<GoldenRegisterParams>) -> Result<CallToolResult, McpError> {
+    pub async fn golden_register(
+        &self,
+        Parameters(p): Parameters<GoldenRegisterParams>,
+    ) -> Result<CallToolResult, McpError> {
         require_non_empty("key", &p.key)?;
         let config: lsbx_golden::registry::GoldenConfig = p.into();
         let result = self.ops.golden_register(config).await;
@@ -617,26 +670,40 @@ impl LsbxMcpServer {
     }
 
     #[tool(description = "Remove a golden from the in-process image registry")]
-    pub async fn golden_delete(&self, Parameters(p): Parameters<GoldenDeleteParams>) -> Result<CallToolResult, McpError> {
+    pub async fn golden_delete(
+        &self,
+        Parameters(p): Parameters<GoldenDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
         require_non_empty("name", &p.name)?;
         let result = self.ops.golden_delete(&p.name, p.keep_snapshot).await;
         envelope_result(result)
     }
 
     #[tool(description = "List every golden currently in the in-process image registry")]
-    pub async fn golden_list(&self, Parameters(_p): Parameters<GoldenListParams>) -> Result<CallToolResult, McpError> {
+    pub async fn golden_list(
+        &self,
+        Parameters(_p): Parameters<GoldenListParams>,
+    ) -> Result<CallToolResult, McpError> {
         let result = self.ops.golden_list().await;
         envelope_result(result)
     }
 
     #[tool(description = "Summarize the running registry's image/golden/profile counts and keys")]
-    pub async fn config_show(&self, Parameters(_p): Parameters<ConfigShowParams>) -> Result<CallToolResult, McpError> {
+    pub async fn config_show(
+        &self,
+        Parameters(_p): Parameters<ConfigShowParams>,
+    ) -> Result<CallToolResult, McpError> {
         let result = self.ops.config_show().await;
         envelope_result(result)
     }
 
-    #[tool(description = "Query structured logs (currently always fails: no log backend is wired up yet)")]
-    pub async fn logs_query(&self, Parameters(p): Parameters<LogsQueryParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Query structured logs (currently always fails: no log backend is wired up yet)"
+    )]
+    pub async fn logs_query(
+        &self,
+        Parameters(p): Parameters<LogsQueryParams>,
+    ) -> Result<CallToolResult, McpError> {
         let result = self.ops.logs_query(p.since.as_deref(), p.limit).await;
         envelope_result(result)
     }
@@ -645,15 +712,14 @@ impl LsbxMcpServer {
 #[tool_handler]
 impl ServerHandler for LsbxMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "lsbx MCP door: one tool per LsbxOps operation (create, destroy, renew, reap, \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "lsbx MCP door: one tool per LsbxOps operation (create, destroy, renew, reap, \
                  list, info, console_url, exec, put, get, status, golden_build, golden_verify, \
                  golden_register, golden_delete, golden_list, config_show, logs_query). Every \
                  tool response is the same Envelope<T> shape lsbx --json and the HTTP gateway \
                  produce."
-                    .to_string(),
-            )
+                .to_string(),
+        )
     }
 }
 
@@ -689,18 +755,28 @@ mod tests {
     #[test]
     fn destroy_tool_schema_is_derived_from_the_real_destroyparams_fields() {
         let router = LsbxMcpServer::tool_router();
-        let tool = router.get("destroy").expect("destroy tool must be registered");
+        let tool = router
+            .get("destroy")
+            .expect("destroy tool must be registered");
         let schema = &*tool.input_schema;
-        let required = schema["required"].as_array().expect("schema must have a required array");
+        let required = schema["required"]
+            .as_array()
+            .expect("schema must have a required array");
         let required_names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(required_names, vec!["id"], "DestroyParams has exactly one field: id");
+        assert_eq!(
+            required_names,
+            vec!["id"],
+            "DestroyParams has exactly one field: id"
+        );
         assert!(schema["properties"]["id"]["type"] == "string");
     }
 
     #[test]
     fn create_tool_schema_marks_optional_fields_not_required() {
         let router = LsbxMcpServer::tool_router();
-        let tool = router.get("create").expect("create tool must be registered");
+        let tool = router
+            .get("create")
+            .expect("create tool must be registered");
         let schema = &*tool.input_schema;
         let required: Vec<&str> = schema["required"]
             .as_array()
@@ -738,6 +814,10 @@ mod tests {
         let mut deduped = names.clone();
         deduped.sort_unstable();
         deduped.dedup();
-        assert_eq!(names.len(), deduped.len(), "duplicate tool name(s) registered: {names:?}");
+        assert_eq!(
+            names.len(),
+            deduped.len(),
+            "duplicate tool name(s) registered: {names:?}"
+        );
     }
 }

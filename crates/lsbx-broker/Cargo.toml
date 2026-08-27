@@ -29,6 +29,7 @@ http.workspace = true
 # dependency of this crate here for the first time, not a new workspace
 # addition.
 regex.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

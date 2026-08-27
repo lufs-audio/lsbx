@@ -160,9 +160,10 @@ pub async fn reap(
         .list()?
         .into_iter()
         .filter_map(|r| r.key_name)
+        .map(|label| label.strip_prefix("lsbx:").unwrap_or(&label).to_string())
         .collect();
 
-    let keys_reconciled = reconcile_keys(backend, &known_labels).await?;
+    let keys_reconciled = backend.reconcile_orphaned_keys(&known_labels).await?;
 
     Ok(ReapReport {
         destroyed,
@@ -210,24 +211,7 @@ fn tracing_unknown_golden(sandbox_id: &str, profile: &str) {
     );
 }
 
-/// Reconciles orphaned ephemeral keys against `known_labels` via Unit 03's
-/// `reconcile_orphaned_keys`. The `TaggedKey` listing itself is
-/// backend-specific (Unit 03's own doc comment: each backend builds its own
-/// listing from wherever *it* stores authorized keys) and neither the
-/// generic `Backend` trait (Unit 01) nor this unit's contract exposes a
-/// method for it — `list_vms`/`run`/etc. have no "list registered keys"
-/// operation. Until a backend-specific key-listing hook exists (a
-/// reasonable Unit 06/07 follow-up, or an addition to the `Backend` trait
-/// itself), this reconciliation pass has no `TaggedKey`s to check and
-/// therefore always revokes zero keys against the generic `&dyn Backend`
-/// this unit is scoped to. The call to `reconcile_orphaned_keys` itself is
-/// real (not stubbed out) so the moment a backend can supply a real
-/// `Vec<TaggedKey>`, this function's signature does not need to change —
-/// only its call site does.
-async fn reconcile_keys(
-    _backend: &dyn Backend,
-    known_labels: &[String],
-) -> Result<usize, LsbxError> {
-    let tagged_keys: Vec<lsbx_keys::reconcile::TaggedKey> = Vec::new();
-    lsbx_keys::reconcile::reconcile_orphaned_keys(tagged_keys, known_labels)
-}
+// Backend-specific key reconciliation is exposed through the defaulted
+// `Backend::reconcile_orphaned_keys` hook. Keeping the hook on the kernel
+// trait lets the generic reaper invoke the real exe.dev implementation while
+// preserving a no-op for libvirt/demo backends.

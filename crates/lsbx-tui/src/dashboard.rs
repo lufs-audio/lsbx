@@ -13,7 +13,9 @@
 //! `Backend` or a store directly (this unit's own Boundaries section).
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
 use lsbx_kernel::error::LsbxError;
@@ -125,9 +127,8 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> Result<Self, LsbxError> {
         let tui_active = crate::TuiActiveGuard::enter();
-        enable_raw_mode().map_err(|e| {
-            LsbxError::ContractViolated(format!("failed to enable raw mode: {e}"))
-        })?;
+        enable_raw_mode()
+            .map_err(|e| LsbxError::ContractViolated(format!("failed to enable raw mode: {e}")))?;
         let mut stdout = std::io::stdout();
         stdout.execute(EnterAlternateScreen).map_err(|e| {
             LsbxError::ContractViolated(format!("failed to enter alternate screen: {e}"))
@@ -483,7 +484,11 @@ mod tests {
     #[test]
     fn move_selection_wraps_around_both_directions() {
         let mut state = DashboardState::new();
-        state.sandboxes = vec![sample_sandbox("a"), sample_sandbox("b"), sample_sandbox("c")];
+        state.sandboxes = vec![
+            sample_sandbox("a"),
+            sample_sandbox("b"),
+            sample_sandbox("c"),
+        ];
 
         assert_eq!(state.selected, 0);
         state.move_selection(1);
@@ -579,6 +584,11 @@ mod tests {
         let created = ops
             .create(lsbx_lifecycle::create::CreateRequest {
                 profile: "demo-profile",
+                golden: None,
+                cpu: None,
+                memory: None,
+                flavor: None,
+                streaming: None,
                 name: Some("dashboard-test-vm"),
                 task_id: None,
                 lease: std::time::Duration::from_secs(3600),
@@ -627,6 +637,11 @@ mod tests {
         let created = ops
             .create(lsbx_lifecycle::create::CreateRequest {
                 profile: "demo-profile",
+                golden: None,
+                cpu: None,
+                memory: None,
+                flavor: None,
+                streaming: None,
                 name: Some("info-detail-test-vm"),
                 task_id: Some("task-77"),
                 lease: std::time::Duration::from_secs(3600),
@@ -678,6 +693,11 @@ mod tests {
         let created = ops
             .create(lsbx_lifecycle::create::CreateRequest {
                 profile: "demo-profile",
+                golden: None,
+                cpu: None,
+                memory: None,
+                flavor: None,
+                streaming: None,
                 name: Some("will-be-destroyed"),
                 task_id: None,
                 lease: std::time::Duration::from_secs(3600),
@@ -694,7 +714,9 @@ mod tests {
         // Destroy out-of-band (simulating a race with another caller),
         // without going through the dashboard's own refresh, so `state`
         // still shows the now-stale sandbox as selected.
-        ops.destroy(&created.id).await.expect("destroy should succeed");
+        ops.destroy(&created.id)
+            .await
+            .expect("destroy should succeed");
 
         handle_key(&mut state, &ops, KeyCode::Enter).await;
         assert!(
@@ -702,7 +724,11 @@ mod tests {
             "a NotFound info() call must not populate info_detail"
         );
         assert!(
-            state.status_line.as_deref().unwrap_or_default().contains("failed"),
+            state
+                .status_line
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed"),
             "expected a status-line error message, got: {:?}",
             state.status_line
         );

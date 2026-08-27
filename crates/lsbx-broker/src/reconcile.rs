@@ -99,7 +99,11 @@
 
 use lsbx_kernel::error::LsbxError;
 use lsbx_store::ci_job_store::{CiJobRecord, CiJobStore};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tempfile::{Builder as TempDirBuilder, TempDir};
 use tracing::{info, warn};
 
 use super::github_client::GitHubClient;
@@ -141,8 +145,16 @@ pub struct Reconciler<'a> {
 }
 
 impl<'a> Reconciler<'a> {
-    pub fn new(ops: &'a lsbx_ops::LsbxOps, job_store: &'a CiJobStore, github: &'a GitHubClient) -> Self {
-        Self { ops, job_store, github }
+    pub fn new(
+        ops: &'a lsbx_ops::LsbxOps,
+        job_store: &'a CiJobStore,
+        github: &'a GitHubClient,
+    ) -> Self {
+        Self {
+            ops,
+            job_store,
+            github,
+        }
     }
 
     /// Calls `LsbxOps::create` with `profile: "ci"`, `task_id: job.job_id`,
@@ -162,12 +174,21 @@ impl<'a> Reconciler<'a> {
     /// at a conservative bound rather than threaded through the interface
     /// contract's `dispatch(job, lease)` signature, which has no readiness-
     /// timeout parameter to accept one.
-    pub async fn dispatch(&self, job: &QueuedJob, lease: Duration) -> Result<CiJobRecord, LsbxError> {
+    pub async fn dispatch(
+        &self,
+        job: &QueuedJob,
+        lease: Duration,
+    ) -> Result<CiJobRecord, LsbxError> {
         let job_id_str = job.job_id.to_string();
         let sandbox = self
             .ops
             .create(lsbx_lifecycle::create::CreateRequest {
                 profile: CI_PROFILE,
+                golden: None,
+                cpu: None,
+                memory: None,
+                flavor: None,
+                streaming: None,
                 name: None,
                 task_id: Some(job_id_str.as_str()),
                 lease,
@@ -188,7 +209,7 @@ impl<'a> Reconciler<'a> {
             phase: "dispatched".to_string(),
             sandbox_id: Some(sandbox.id.clone()),
             runner_name: None,
-            dispatched_job_name: None,
+            dispatched_job_name: job.name.clone(),
             actual_job_id: None,
             actual_job_name: None,
             diverged: false,
@@ -243,6 +264,12 @@ impl<'a> Reconciler<'a> {
             )
             .await?;
 
+        if output.exit_code != 0 {
+            return Err(LsbxError::BackendUnavailable(format!(
+                "runner log read failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
         let log_text = String::from_utf8_lossy(&output.stdout);
 
         let mut changed = false;
@@ -253,7 +280,10 @@ impl<'a> Reconciler<'a> {
                     record.runner_name = Some(runner_name);
                     changed = true;
                 }
-                if record.phase != "running" && record.phase != PHASE_COMPLETED && record.phase != PHASE_FAILED {
+                if record.phase != "running"
+                    && record.phase != PHASE_COMPLETED
+                    && record.phase != PHASE_FAILED
+                {
                     record.phase = "registered".to_string();
                     changed = true;
                 }
@@ -277,6 +307,20 @@ impl<'a> Reconciler<'a> {
                 changed = true;
             }
 
+            if let Some(running_job) = LifecycleMarkers::parse_running_job(line) {
+                if record.actual_job_name.as_deref() != Some(running_job.as_str()) {
+                    record.actual_job_name = Some(running_job);
+                    changed = true;
+                }
+                if record.phase != PHASE_COMPLETED
+                    && record.phase != PHASE_FAILED
+                    && record.phase != "running"
+                {
+                    record.phase = "running".to_string();
+                    changed = true;
+                }
+            }
+
             if let Some((job_name, result)) = LifecycleMarkers::parse_job_completed(line) {
                 if record.actual_job_name.as_deref() != Some(job_name.as_str()) {
                     record.actual_job_name = Some(job_name.clone());
@@ -292,7 +336,8 @@ impl<'a> Reconciler<'a> {
                     changed = true;
                 }
                 if record.last_error.is_none() && terminal_phase == PHASE_FAILED {
-                    record.last_error = Some(format!("job {job_name} completed with result: {result}"));
+                    record.last_error =
+                        Some(format!("job {job_name} completed with result: {result}"));
                     changed = true;
                 }
             }
@@ -327,7 +372,10 @@ impl<'a> Reconciler<'a> {
             return Ok(());
         };
 
-        let actual_job_id = self.github.job_for_runner(&record.repository, &runner_name).await?;
+        let actual_job_id = self
+            .github
+            .job_for_runner(&record.repository, &runner_name)
+            .await?;
 
         let dispatched_job_id: Option<u64> = record.job_id.parse().ok();
 
@@ -354,9 +402,10 @@ impl<'a> Reconciler<'a> {
             );
         }
 
-        if record.diverged != diverged {
+        let actual_job_id_value = actual_job_id.map(|id| id.to_string());
+        if record.diverged != diverged || record.actual_job_id != actual_job_id_value {
             record.diverged = diverged;
-            record.actual_job_id = actual_job_id.map(|id| id.to_string());
+            record.actual_job_id = actual_job_id_value;
             record.updated_at = now_rfc3339();
             self.job_store.save(record)?;
         }
@@ -398,7 +447,8 @@ impl<'a> Reconciler<'a> {
                     "failed to resume tailing for in-flight CI job during startup recovery; \
                      continuing with the remaining in-flight jobs"
                 );
-                record.last_error = Some(format!("resume-tail failed during startup recovery: {e}"));
+                record.last_error =
+                    Some(format!("resume-tail failed during startup recovery: {e}"));
                 record.updated_at = now_rfc3339();
                 // Best-effort persistence of the failure note; if even this
                 // save fails, the in-memory record returned to the caller
@@ -429,9 +479,603 @@ fn rfc3339_plus(duration: Duration) -> String {
 pub struct BrokerConfig {
     pub poll: super::poll::PollConfig,
     pub lease: Duration,
+    /// `Some` enables full Python-equivalent guest runner provisioning;
+    /// `None` retains the lower-level monitor-only behavior used by unit tests.
+    pub runner: Option<RunnerConfig>,
 }
 
-/// Fills the gap named in this module's doc comment ("Gap 5"): no
+/// Backend-neutral runner provisioning policy. Transport remains entirely in
+/// `LsbxOps`; this struct only describes the guest-side Actions runner.
+#[derive(Clone)]
+pub struct RunnerConfig {
+    pub app_id: u64,
+    pub app_key_path: PathBuf,
+    pub owner: String,
+    pub scope: String,
+    pub labels: String,
+    pub group: Option<String>,
+    pub runner_user: String,
+    pub runner_dir: String,
+    pub host_prefix: String,
+    pub provision_script: PathBuf,
+    pub runner_wait_timeout: Duration,
+    pub job_timeout: Duration,
+}
+
+impl RunnerConfig {
+    /// Loads both the new `LSBX_*` names and the Python broker's legacy names.
+    /// The private key is required: a runner without App authentication cannot
+    /// safely be registered by this broker.
+    pub fn from_env(backend: &str, queue_label: &str) -> Result<Self, LsbxError> {
+        let file_values = std::env::var("LSBX_CI_RUNNER_ENV_FILE")
+            .or_else(|_| std::env::var("RUNNER_ENV_FILE"))
+            .ok()
+            .map(|path| load_simple_env_file(Path::new(&path)))
+            .transpose()?;
+        let file_values = file_values.unwrap_or_default();
+
+        let value = |new_name: &str, old_name: &str, default: Option<&str>| {
+            std::env::var(new_name)
+                .or_else(|_| std::env::var(old_name))
+                .ok()
+                .or_else(|| file_values.get(new_name).cloned())
+                .or_else(|| file_values.get(old_name).cloned())
+                .or_else(|| default.map(str::to_string))
+        };
+
+        let app_id_value = value("LSBX_GITHUB_APP_ID", "GITHUB_APP_ID", None)
+            .ok_or_else(|| LsbxError::AuthFailed("GitHub App id is not configured".to_string()))?;
+        let app_id = app_id_value.parse::<u64>().map_err(|_| {
+            LsbxError::Usage(format!("GitHub App id '{app_id_value}' is not a valid u64"))
+        })?;
+        let app_key_path = PathBuf::from(
+            value("LSBX_GITHUB_APP_PRIVATE_KEY_PATH", "GITHUB_APP_KEY", None).ok_or_else(|| {
+                LsbxError::AuthFailed("GitHub App private key path is not configured".to_string())
+            })?,
+        );
+        if !app_key_path.is_file() {
+            return Err(LsbxError::AuthFailed(format!(
+                "GitHub App private key does not exist: {}",
+                app_key_path.display()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&app_key_path)
+                .map_err(|e| {
+                    LsbxError::AuthFailed(format!("cannot stat GitHub App private key: {e}"))
+                })?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode != 0o600 {
+                return Err(LsbxError::AuthFailed(format!(
+                    "GitHub App private key must be mode 0600: {} (mode {mode:o})",
+                    app_key_path.display()
+                )));
+            }
+        }
+
+        let owner = value("LSBX_GITHUB_APP_OWNER", "GITHUB_OWNER", None)
+            .ok_or_else(|| LsbxError::Usage("GitHub App owner is not configured".to_string()))?;
+        let scope = value("LSBX_CI_RUNNER_SCOPE", "GITHUB_SCOPE", Some("org"))
+            .unwrap_or_else(|| "org".to_string());
+        if scope != "org" && scope != "repo" {
+            return Err(LsbxError::Usage(
+                "runner scope must be 'org' or 'repo'".to_string(),
+            ));
+        }
+        let group_default = if backend == "libvirt" {
+            "continuo"
+        } else {
+            "exe"
+        };
+        let labels = value("LSBX_CI_RUNNER_LABELS", "RUNNER_LABELS", Some(queue_label))
+            .unwrap_or_else(|| queue_label.to_string());
+        let group = value("LSBX_CI_RUNNER_GROUP", "RUNNER_GROUP", Some(group_default));
+        let host_prefix = value(
+            "LSBX_CI_RUNNER_HOST_PREFIX",
+            "LUFSS_VM_PREFIX",
+            Some(if backend == "libvirt" {
+                "lsbx-carnyx-"
+            } else {
+                "lsbx-molimo-"
+            }),
+        )
+        .unwrap_or_default()
+        .trim_start_matches("lsbx-")
+        .trim_end_matches('-')
+        .to_string();
+        let provision_script = std::env::var("LSBX_CI_PROVISION_SCRIPT")
+            .or_else(|_| std::env::var("RUNNER_SCRIPT"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("scripts/provision-ci-runner.sh"));
+        let runner_wait_timeout = duration_env("LSBX_CI_RUNNER_WAIT", 240);
+        let job_timeout = duration_env("LSBX_CI_JOB_TIMEOUT", 3600);
+
+        Ok(Self {
+            app_id,
+            app_key_path,
+            owner,
+            scope,
+            labels,
+            group,
+            runner_user: value("LSBX_CI_RUNNER_USER", "RUNNER_USER", Some("exedev"))
+                .unwrap_or_else(|| "exedev".to_string()),
+            runner_dir: value(
+                "LSBX_CI_RUNNER_DIR",
+                "RUNNER_DIR",
+                Some("/opt/actions-runner"),
+            )
+            .unwrap_or_else(|| "/opt/actions-runner".to_string()),
+            host_prefix,
+            provision_script,
+            runner_wait_timeout,
+            job_timeout,
+        })
+    }
+}
+
+fn duration_env(name: &str, default_seconds: u64) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(default_seconds))
+}
+
+fn load_simple_env_file(path: &Path) -> Result<HashMap<String, String>, LsbxError> {
+    let text = fs::read_to_string(path).map_err(|e| {
+        LsbxError::BackendUnavailable(format!(
+            "failed to read runner env file '{}': {e}",
+            path.display()
+        ))
+    })?;
+    let mut values = HashMap::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(|c| c == '\"' || c == '\'');
+        values.insert(key.trim().to_string(), value.to_string());
+    }
+    Ok(values)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn shell_assignment(key: &str, value: &str) -> String {
+    format!("{key}={}\n", shell_quote(value))
+}
+
+/// Creates the small, sanitized upload set consumed by the guest provisioner.
+fn prepare_runner_upload(config: &RunnerConfig, repository: &str) -> Result<TempDir, LsbxError> {
+    let directory = TempDirBuilder::new()
+        .prefix("lsbx-ci-broker-")
+        .tempdir()
+        .map_err(|e| {
+            LsbxError::ContractViolated(format!("failed to create runner upload directory: {e}"))
+        })?;
+    let key_bytes = fs::read(&config.app_key_path).map_err(|e| {
+        LsbxError::AuthFailed(format!(
+            "failed to read GitHub App private key '{}': {e}",
+            config.app_key_path.display()
+        ))
+    })?;
+    let repo_name = repository.rsplit('/').next().unwrap_or(repository);
+    let mut env = String::new();
+    for (key, value) in [
+        ("GITHUB_APP_ID", config.app_id.to_string()),
+        (
+            "GITHUB_APP_KEY",
+            "/tmp/lsbx-ci-broker/lsbx-runner-app.pem".to_string(),
+        ),
+        ("GITHUB_SCOPE", config.scope.clone()),
+        ("GITHUB_OWNER", config.owner.clone()),
+        ("GITHUB_REPO", repo_name.to_string()),
+        ("RUNNER_LABELS", config.labels.clone()),
+        ("RUNNER_USER", config.runner_user.clone()),
+        ("RUNNER_DIR", config.runner_dir.clone()),
+    ] {
+        env.push_str(&shell_assignment(key, &value));
+    }
+    if let Some(group) = &config.group {
+        env.push_str(&shell_assignment("RUNNER_GROUP", group));
+    }
+    let env_path = directory.path().join("lsbx-runner.env");
+    let key_path = directory.path().join("lsbx-runner-app.pem");
+    let script_path = directory.path().join("provision-ci-runner.sh");
+    fs::write(&env_path, env)
+        .map_err(|e| LsbxError::ContractViolated(format!("failed to write runner env: {e}")))?;
+    fs::write(&key_path, key_bytes)
+        .map_err(|e| LsbxError::ContractViolated(format!("failed to write runner key: {e}")))?;
+    fs::copy(&config.provision_script, &script_path).map_err(|e| {
+        LsbxError::ContractViolated(format!(
+            "failed to copy runner provision script '{}': {e}",
+            config.provision_script.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&env_path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| LsbxError::ContractViolated(format!("failed to chmod runner env: {e}")))?;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| LsbxError::ContractViolated(format!("failed to chmod runner key: {e}")))?;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            LsbxError::ContractViolated(format!("failed to chmod runner script: {e}"))
+        })?;
+    }
+    Ok(directory)
+}
+
+impl<'a> Reconciler<'a> {
+    async fn exec_runner_command(
+        &self,
+        sandbox_id: &str,
+        command: String,
+    ) -> Result<lsbx_kernel::backend::CommandOutput, LsbxError> {
+        let output = self
+            .ops
+            .exec(sandbox_id, &[command], Duration::from_secs(300))
+            .await?;
+        if output.exit_code != 0 {
+            return Err(LsbxError::BackendUnavailable(format!(
+                "runner command failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(output)
+    }
+
+    async fn read_runner_log(&self, sandbox_id: &str) -> Result<String, LsbxError> {
+        let output = self
+            .ops
+            .exec(
+                sandbox_id,
+                &["cat".to_string(), RUNNER_LOG_PATH.to_string()],
+                TAIL_EXEC_TIMEOUT,
+            )
+            .await?;
+        if output.exit_code != 0 {
+            return Err(LsbxError::BackendUnavailable(format!(
+                "runner log read failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    async fn provision_runner(
+        &self,
+        record: &mut CiJobRecord,
+        config: &RunnerConfig,
+    ) -> Result<(), LsbxError> {
+        let sandbox_id = record.sandbox_id.as_deref().ok_or_else(|| {
+            LsbxError::ContractViolated(format!(
+                "CI job {} has no sandbox to provision",
+                record.job_id
+            ))
+        })?;
+        record.phase = "provisioning".to_string();
+        record.updated_at = now_rfc3339();
+        self.job_store.save(record)?;
+
+        let upload = prepare_runner_upload(config, &record.repository)?;
+        let _ = self
+            .exec_runner_command(sandbox_id, "sudo rm -rf /tmp/lsbx-ci-broker".to_string())
+            .await;
+        self.ops
+            .put(sandbox_id, upload.path(), "/tmp/lsbx-ci-broker")
+            .await?;
+        for command in [
+            "sudo install -m 0600 /tmp/lsbx-ci-broker/lsbx-runner.env /etc/lsbx-runner.env",
+            "sudo install -m 0600 /tmp/lsbx-ci-broker/lsbx-runner-app.pem /etc/lsbx-runner-app.pem",
+            "sudo install -m 0755 /tmp/lsbx-ci-broker/provision-ci-runner.sh /usr/local/sbin/lsbx-provision-ci-runner",
+        ] {
+            self.exec_runner_command(sandbox_id, command.to_string()).await?;
+        }
+        let provision_command = format!(
+            "sudo env RUNNER_HOST_PREFIX={} LUFSS_RUNNER_ENV=/etc/lsbx-runner.env bash /usr/local/sbin/lsbx-provision-ci-runner",
+            shell_quote(&config.host_prefix)
+        );
+        let output = self
+            .exec_runner_command(sandbox_id, provision_command)
+            .await?;
+        let runner_name = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(LifecycleMarkers::parse_runner_registered)
+            .ok_or_else(|| {
+                LsbxError::BackendUnavailable(
+                    "runner provisioning did not report a runner name".to_string(),
+                )
+            })?;
+        record.runner_name = Some(runner_name);
+        record.updated_at = now_rfc3339();
+        self.job_store.save(record)?;
+
+        let start = format!(
+            "sudo -u {} nohup {}/run.sh </dev/null >/tmp/lsbx-ci-broker-runner.log 2>&1 &",
+            shell_quote(&config.runner_user),
+            shell_quote(&config.runner_dir)
+        );
+        self.exec_runner_command(sandbox_id, start).await?;
+        Ok(())
+    }
+
+    async fn monitor_runner(
+        &self,
+        record: &mut CiJobRecord,
+        config: &RunnerConfig,
+        lease: Duration,
+    ) -> Result<(), LsbxError> {
+        let sandbox_id = record.sandbox_id.clone().ok_or_else(|| {
+            LsbxError::ContractViolated(format!(
+                "CI job {} has no sandbox to monitor",
+                record.job_id
+            ))
+        })?;
+        let wait_deadline = std::time::Instant::now() + config.runner_wait_timeout;
+        record.phase = "waiting_runner".to_string();
+        record.updated_at = now_rfc3339();
+        self.job_store.save(record)?;
+
+        // Registration/listening is a separate bounded phase. A VM that
+        // boots successfully but never registers must not consume the full
+        // Actions job timeout.
+        loop {
+            if std::time::Instant::now() >= wait_deadline {
+                return Err(LsbxError::Interrupted(format!(
+                    "runner for Actions job {} did not reach Listening for Jobs",
+                    record.job_id
+                )));
+            }
+            let log = match self.read_runner_log(&sandbox_id).await {
+                Ok(log) => log,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            };
+            let mut listening = false;
+            let mut exited = false;
+            for line in log.lines() {
+                if let Some(name) = LifecycleMarkers::parse_runner_registered(line) {
+                    record.runner_name = Some(name);
+                }
+                listening |= LifecycleMarkers::is_listening_for_jobs(line);
+                exited |= LifecycleMarkers::is_exited(line);
+            }
+            if record.runner_name.is_some() {
+                if let Err(error) = self.check_divergence(record).await {
+                    warn!(job_id = record.job_id.as_str(), error = %error, "runner divergence check failed during registration; continuing");
+                }
+            }
+            record.updated_at = now_rfc3339();
+            self.job_store.save(record)?;
+            if listening {
+                record.phase = "running".to_string();
+                record.updated_at = now_rfc3339();
+                self.job_store.save(record)?;
+                break;
+            }
+            if exited {
+                return Err(LsbxError::BackendUnavailable(format!(
+                    "runner {} exited before listening for jobs",
+                    record.runner_name.as_deref().unwrap_or("unknown")
+                )));
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
+        let deadline = std::time::Instant::now() + config.job_timeout;
+        let mut next_renew = std::time::Instant::now();
+        while std::time::Instant::now() < deadline {
+            let log = match self.read_runner_log(&sandbox_id).await {
+                Ok(log) => log,
+                Err(error) => {
+                    warn!(job_id = record.job_id.as_str(), error = %error, "runner log read failed; retrying");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            };
+            let mut completion: Option<(String, String)> = None;
+            let mut exited = false;
+            for line in log.lines() {
+                if let Some(name) = LifecycleMarkers::parse_runner_registered(line) {
+                    record.runner_name = Some(name);
+                }
+                if LifecycleMarkers::is_listening_for_jobs(line) && record.phase == "waiting_runner"
+                {
+                    record.phase = "running".to_string();
+                }
+                if let Some(name) = LifecycleMarkers::parse_running_job(line) {
+                    record.actual_job_name = Some(name.clone());
+                    if record
+                        .dispatched_job_name
+                        .as_deref()
+                        .is_some_and(|expected| expected != name)
+                    {
+                        record.diverged = true;
+                    }
+                }
+                if completion.is_none() {
+                    completion = LifecycleMarkers::parse_job_completed(line);
+                }
+                exited |= LifecycleMarkers::is_exited(line);
+            }
+            if record.runner_name.is_some() {
+                if let Err(error) = self.check_divergence(record).await {
+                    warn!(job_id = record.job_id.as_str(), error = %error, "runner divergence check failed; continuing");
+                }
+            }
+            record.updated_at = now_rfc3339();
+            self.job_store.save(record)?;
+
+            if let Some((job_name, result)) = completion {
+                record.actual_job_name = Some(job_name);
+                if !record.diverged
+                    && !result.eq_ignore_ascii_case("success")
+                    && !result.eq_ignore_ascii_case("succeeded")
+                {
+                    return Err(LsbxError::BackendUnavailable(format!(
+                        "runner reported job result {result}"
+                    )));
+                }
+                break;
+            }
+            if exited {
+                if record.diverged {
+                    break;
+                }
+                return Err(LsbxError::BackendUnavailable(format!(
+                    "runner {} exited before completing job {}",
+                    record.runner_name.as_deref().unwrap_or("unknown"),
+                    record.job_id
+                )));
+            }
+
+            let job_id = record.job_id.parse::<u64>().map_err(|_| {
+                LsbxError::ContractViolated(format!("invalid Actions job id {}", record.job_id))
+            })?;
+            match self.github.job(&record.repository, job_id).await {
+                Ok(job) => {
+                    if job.runner_name.is_some()
+                        && record.runner_name.is_some()
+                        && job.runner_name != record.runner_name
+                    {
+                        record.diverged = true;
+                    }
+                    if job.status == "completed" {
+                        if record.diverged {
+                            break;
+                        }
+                        if job.conclusion.as_deref() != Some("success") {
+                            return Err(LsbxError::BackendUnavailable(format!(
+                                "Actions job {} concluded {}",
+                                record.job_id,
+                                job.conclusion.as_deref().unwrap_or("without a conclusion")
+                            )));
+                        }
+                        break;
+                    }
+                }
+                Err(error) => {
+                    warn!(job_id = record.job_id.as_str(), error = %error, "Actions job status lookup failed; continuing");
+                }
+            }
+
+            if std::time::Instant::now() >= next_renew {
+                let renewed = self.ops.renew(&sandbox_id, lease).await?;
+                record.lease_expires_at = renewed.lease_expires_at;
+                record.updated_at = now_rfc3339();
+                self.job_store.save(record)?;
+                next_renew = std::time::Instant::now() + (lease / 3).max(Duration::from_secs(30));
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(LsbxError::Interrupted(format!(
+                "timed out waiting for Actions job {}",
+                record.job_id
+            )));
+        }
+        Ok(())
+    }
+
+    async fn cleanup_runner(&self, record: &mut CiJobRecord) -> Result<(), LsbxError> {
+        let Some(sandbox_id) = record.sandbox_id.clone() else {
+            return self.job_store.delete(&record.job_id);
+        };
+        record.phase = "cleaning".to_string();
+        record.updated_at = now_rfc3339();
+        self.job_store.save(record)?;
+        let scrub = self.ops.exec(
+            &sandbox_id,
+            &["sudo rm -rf /tmp/lsbx-ci-broker /tmp/lsbx-ci-broker-runner.log /etc/lsbx-runner.env /etc/lsbx-runner-app.pem".to_string()],
+            Duration::from_secs(60),
+        ).await;
+        let scrub_error = match scrub {
+            Ok(output) if output.exit_code == 0 => None,
+            Ok(output) => Some(format!(
+                "scrub failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(e) => Some(format!("scrub failed: {e}")),
+        };
+        let destroy_result = self.ops.destroy(&sandbox_id).await;
+        let destroy_error = match destroy_result {
+            Ok(()) | Err(LsbxError::NotFound(_)) => None,
+            Err(e) => Some(format!("destroy failed: {e}")),
+        };
+        if scrub_error.is_none() && destroy_error.is_none() {
+            return self.job_store.delete(&record.job_id);
+        }
+        let error = [scrub_error, destroy_error]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
+        record.last_error = Some(error.clone());
+        record.updated_at = now_rfc3339();
+        self.job_store.save(record)?;
+        Err(LsbxError::BackendUnavailable(error))
+    }
+
+    /// Full Python-equivalent lifecycle: upload credentials/script, provision
+    /// an ephemeral Actions runner, monitor/renew it, and scrub/destroy it on
+    /// every exit path. The same method is used by libvirt and exe.dev.
+    pub async fn run_runner_job(
+        &self,
+        record: &mut CiJobRecord,
+        config: &RunnerConfig,
+        lease: Duration,
+    ) -> Result<(), LsbxError> {
+        let primary = async {
+            let existing_log = match record.sandbox_id.as_deref() {
+                Some(sandbox_id) => self.read_runner_log(sandbox_id).await.ok(),
+                None => None,
+            };
+            if existing_log.as_deref().is_some_and(|log| {
+                log.lines()
+                    .any(|line| LifecycleMarkers::parse_runner_registered(line).is_some())
+            }) {
+                self.monitor_runner(record, config, lease).await
+            } else {
+                self.provision_runner(record, config).await?;
+                self.monitor_runner(record, config, lease).await
+            }
+        }
+        .await;
+        if let Err(error) = &primary {
+            record.last_error = Some(error.to_string());
+            record.updated_at = now_rfc3339();
+            let _ = self.job_store.save(record);
+        } else {
+            record.phase = "completed".to_string();
+            record.updated_at = now_rfc3339();
+            let _ = self.job_store.save(record);
+        }
+        let cleanup = self.cleanup_runner(record).await;
+        match (primary, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(cleanup_error)) => Err(LsbxError::BackendUnavailable(format!(
+                "{error}; {cleanup_error}"
+            ))),
+        }
+    }
+}
+
 /// `lsbx-broker` entry point existed anywhere in the merged workspace before
 /// this unit. Acquires `CiJobStore::broker_lock()` once and holds the
 /// returned `LockGuard` for this function's own stack frame — which is this
@@ -472,6 +1116,19 @@ pub async fn run_broker(
     let _lock_guard = job_store.broker_lock()?;
 
     let reconciler = Reconciler::new(ops, job_store, github);
+    if let Some(runner) = config.runner.as_ref() {
+        return run_runner_broker(
+            &reconciler,
+            job_store,
+            github,
+            config.poll,
+            config.lease,
+            runner,
+            iterations,
+        )
+        .await;
+    }
+
     let mut in_flight = reconciler.reconcile_on_startup().await?;
 
     let mut poller = super::poll::Poller::new(config.poll);
@@ -489,6 +1146,14 @@ pub async fn run_broker(
         let queued = poller.tick(github, now).await?;
 
         for job in &queued {
+            let job_id = job.job_id.to_string();
+            if in_flight.iter().any(|record| {
+                record.job_id == job_id
+                    && record.phase != PHASE_COMPLETED
+                    && record.phase != PHASE_FAILED
+            }) {
+                continue;
+            }
             match reconciler.dispatch(job, config.lease).await {
                 Ok(record) => in_flight.push(record),
                 Err(e) => {
@@ -527,4 +1192,58 @@ pub async fn run_broker(
     }
 
     Ok(())
+}
+async fn run_runner_broker(
+    reconciler: &Reconciler<'_>,
+    job_store: &CiJobStore,
+    github: &GitHubClient,
+    poll_config: super::poll::PollConfig,
+    lease: Duration,
+    runner: &RunnerConfig,
+    iterations: Option<u32>,
+) -> Result<(), LsbxError> {
+    let mut poller = super::poll::Poller::new(poll_config);
+    let mut step = 0u32;
+
+    // Resume guests left behind by a broker restart before claiming new work.
+    for mut record in reconciler.reconcile_on_startup().await? {
+        if let Err(error) = reconciler.run_runner_job(&mut record, runner, lease).await {
+            warn!(job_id = record.job_id.as_str(), error = %error, "failed to resume CI runner after broker restart");
+        }
+    }
+
+    loop {
+        if let Some(max) = iterations {
+            if step >= max {
+                return Ok(());
+            }
+        }
+        step += 1;
+        let queued = poller.tick(github, std::time::SystemTime::now()).await?;
+        let mut claimed = false;
+        for job in queued {
+            // A queued job may remain queued briefly after another broker
+            // poll observes it. Durable records are the idempotency barrier.
+            if job_store.load(&job.job_id.to_string()).is_ok() {
+                continue;
+            }
+            let mut record = match reconciler.dispatch(&job, lease).await {
+                Ok(record) => record,
+                Err(error) => {
+                    warn!(job_id = job.job_id, error = %error, "failed to dispatch CI job");
+                    continue;
+                }
+            };
+            claimed = true;
+            if let Err(error) = reconciler.run_runner_job(&mut record, runner, lease).await {
+                warn!(job_id = job.job_id, error = %error, "CI runner job failed");
+            }
+            // Match the Python broker's one-runner-at-a-time behavior. This
+            // prevents two same-label jobs from racing for one fresh runner.
+            break;
+        }
+        if iterations.is_none() && !claimed {
+            tokio::time::sleep(poller.config().poll_interval).await;
+        }
+    }
 }
