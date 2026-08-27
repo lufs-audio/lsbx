@@ -1,0 +1,55 @@
+One-time sudo check (you'll be prompted for your password)...
+### sudo OK
+### === LSBX MIGRATION CUTOVER ===
+### Will stop old systemd units: lsbx-gateway, lsbx-stream-proxy, lsbx-ci-broker
+### Will kill detached old Python broker PID 1529305 (if present & is ci_broker)
+### Will install + enable + start new: lsbx-serve.service, lsbx-ci-broker.service
+### Will run post-cutover verification against http://100.125.210.60:8243
+### CI queue empty (0 pending).
+### Stopping old systemd services...
+### Killing detached old Python ci_broker (PID 1529305)...
+###   sent SIGTERM (will confirm gone below)
+### Installing new units...
+Created symlink '/etc/systemd/system/multi-user.target.wants/lsbx-serve.service' → '/etc/systemd/system/lsbx-serve.service'.
+Created symlink '/etc/systemd/system/multi-user.target.wants/lsbx-ci-broker.service' → '/etc/systemd/system/lsbx-ci-broker.service'.
+### Starting new services...
+### Waiting for services...
+### === lsbx-serve.service status ===
+● lsbx-serve.service - lsbx HTTP gateway + stream proxy (Carnyx / local libvirt)
+     Loaded: loaded (/etc/systemd/system/lsbx-serve.service; enabled; preset: disabled)
+     Active: active (running) since Wed 2026-08-26 22:32:18 CDT; 3s ago
+ Invocation: 565ac27fe9054f6ea036631de329bcba
+   Main PID: 3705334 (lsbx)
+      Tasks: 26 (limit: 231282)
+     Memory: 5M (peak: 6.8M)
+        CPU: 21ms
+     CGroup: /system.slice/lsbx-serve.service
+             └─3705334 /home/carnyx/repos/lsbx/target/release/lsbx --backend libvirt --images /home/carnyx/repos/lsbx/images.carnyx.json --state-dir /home/carnyx/lsbx-state serve --host 100.125.210.60 --port 8243 --token <REDACTED> --reap-ttl 3h --insecure
+
+Aug 26 22:32:18 carnyx lsbx[3705334]: libvirt: QEMU Driver error : Domain not found: no domain with matching name 'sbx-18cf1f119f18fcd1-a47ddcae'
+Aug 26 22:32:18 carnyx lsbx[3705334]: libvirt: QEMU Driver error : Domain not found: no domain with matching name 'sbx-18cf1f11af0df47b-068bd839'
+Aug 26 22:32:18 carnyx lsbx[3705334]: libvirt: QEMU Driver error : Domain not found: no domain with matching name 'sbx-18cf1f11bf883297-1ba6606c'
+Aug 26 22:32:18 carnyx lsbx[3705334]: libvirt: QEMU Driver error : Domain not found: no domain with matching name 'sbx-18cf1f11d02a757c-b77974f8'
+Aug 26 22:32:18 carnyx lsbx[3705334]: libvirt: QEMU Driver error : Domain not found: no domain with matching name 'sbx-18cf1f13cb094f0f-4227c70e'
+Aug 26 22:32:18 carnyx lsbx[3705334]: libvirt: QEMU Driver error : Domain not found: no domain with matching name 'sbx-18cf1f2fdcf523ff-5913bc42'
+Aug 26 22:32:18 carnyx lsbx[3705334]: libvirt: QEMU Driver error : Domain not found: no domain with matching name 'sbx-18cf1f2fec96a1b0-6f014976'
+Aug 26 22:32:18 carnyx lsbx[3705334]: libvirt: QEMU Driver error : Domain not found: no domain with matching name 'sbx-18cf1f2ffcc93e30-ef68d287'
+Aug 26 22:32:18 carnyx lsbx[3705334]: libvirt: QEMU Driver error : Domain not found: no domain with matching name 'sbx-18cf1f300c8f194d-ccd6e605'
+Aug 26 22:32:18 carnyx lsbx[3705334]: libvirt: QEMU Driver error : Domain not found: no domain with matching name 'sbx-18cf1f301c3ef4ca-02a611fe'
+### === lsbx-ci-broker.service status ===
+● lsbx-ci-broker.service - lsbx CI broker (Carnyx / local libvirt backend)
+     Loaded: loaded (/etc/systemd/system/lsbx-ci-broker.service; enabled; preset: disabled)
+     Active: activating (auto-restart) (Result: exit-code) since Wed 2026-08-26 22:32:18 CDT; 2s ago
+ Invocation: 4eaaaf6a8b13497894bb59f9f842aeb3
+    Process: 3705340 ExecStart=/home/carnyx/repos/lsbx/target/release/lsbx ci-broker run --backend=libvirt (code=exited, status=7)
+   Main PID: 3705340 (code=exited, status=7)
+   Mem peak: 34M
+        CPU: 59ms
+### === new gateway /health === (expect Rust backend, profiles ci/default/desktop/web/win11)
+{"data":{"backend_available":true,"backend_name":"libvirt","sandbox_count":15},"status":"success"}
+### SUCCESS: new gateway /health is OK.
+### 
+### === CUTOVER SCRIPT COMPLETE ===
+### Next (operator): run the §11 functional round-trip (create/exec/destroy via REST), the
+### CI broker smoke workflow, and the desktop-console smoke, and paste results back.
+### If anything did NOT come up, re-run this script with --rollback.

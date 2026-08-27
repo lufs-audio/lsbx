@@ -370,11 +370,20 @@ fn resolve_state_dir(explicit: Option<&std::path::Path>) -> PathBuf {
 /// etc. all work against an empty catalog just fine), so [`build_deps`]
 /// falls back to an empty, in-memory `ImageRegistry` rather than making
 /// every invocation of this CLI fail before a real `images.json` exists.
+///
+/// Precedence: explicit `--images` flag, then `LSBX_IMAGES_PATH`, then
+/// `LSBX_IMAGES` (the long-standing host convention — the CI-broker systemd
+/// env file sets `LSBX_IMAGES`, and without honoring it the broker would
+/// load an empty registry and fail to resolve even the `ci` profile's
+/// `ci-runner` golden), then `<state_dir>/images.json`.
 fn resolve_images_path(explicit: Option<&std::path::Path>, state_dir: &std::path::Path) -> PathBuf {
     if let Some(p) = explicit {
         return p.to_path_buf();
     }
     if let Ok(from_env) = std::env::var("LSBX_IMAGES_PATH") {
+        return PathBuf::from(from_env);
+    }
+    if let Ok(from_env) = std::env::var("LSBX_IMAGES") {
         return PathBuf::from(from_env);
     }
     state_dir.join("images.json")
