@@ -8,6 +8,7 @@ fn cfg() -> PollConfig {
         repo_refresh_interval: Duration::from_secs(300),
         fallback_delay: Duration::from_secs(60),
         queue_labels: vec![FALLBACK_QUEUE_LABEL.to_string()],
+        repos: None,
     }
 }
 

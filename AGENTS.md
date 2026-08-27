@@ -92,10 +92,27 @@ the same `LSBX_*` naming convention, for GitHub App credential configuration:
   `LSBX_GITHUB_APP_PRIVATE_KEY_PATH` both set), since the installation-token
   exchange is scoped per-owner.
 
-When `LSBX_GITHUB_APP_ID`/`LSBX_GITHUB_APP_PRIVATE_KEY_PATH` are not both
-set, `ci-broker run` falls back to `GitHubClient::from_gh_cli_fallback()` —
-the same `gh` CLI fallback `lsbx-broker` already documents for local
-dev/testing without full GitHub App credentials.
+`LSBX_GITHUB_APP_ID`/`LSBX_GITHUB_APP_PRIVATE_KEY_PATH` are **not** both set,
+`ci-broker run` uses `GitHubClient::from_gh_cli_fallback()`.
+
+### GitHub auth: two co-equal methods, not "primary" + "fallback"
+
+GH-CLI and GitHub-App are **equally-first-class auth methods**; a given
+deployment uses exactly one, selected by env. App deployments (Molimo) set
+the `LSBX_GITHUB_APP_*` vars and discover repos from the App installation.
+GH-CLI deployments (Carnyx) leave those unset, authenticate via the host's
+`gh` login, and must configure an explicit repo list — the gh-CLI mode never
+queries the App-only `/installation/repositories` endpoint (doing so returns
+`HTTP 403` under a normal `gh` user).
+
+- `LSBX_CI_REPOS` — comma-separated `owner/repo` list the broker polls.
+  Read by `PollConfig::from_queue_label_and_env`. When unset, falls back to
+  `GITHUB_OWNER`+`GITHUB_REPO` (single repo). gh-CLI deployments should set
+  this to the repos whose CI jobs this placement serves (e.g. Carnyx's
+  `lufs-audio/kb,lufs-audio/lrex,lufs-audio/lufs-sandbox-server,lufs-audio/resume`).
+- When `LSBX_CI_REPOS`/`GITHUB_REPO` are both absent, `repos` is `None` and
+  the broker uses App-installation discovery — correct only for the
+  `LSBX_GITHUB_APP_*` (App) path.
 
 `LSBX_CI_POLL_INTERVAL` / `LSBX_CI_FALLBACK_DELAY` are pre-existing
 `lsbx-broker` env vars (`PollConfig::from_queue_label_and_env`), not new to

@@ -11,6 +11,7 @@ fn cfg() -> PollConfig {
             FALLBACK_QUEUE_LABEL.to_string(),
             "dedicated-label".to_string(),
         ],
+        repos: None,
     }
 }
 

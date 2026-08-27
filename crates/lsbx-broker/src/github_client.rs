@@ -109,9 +109,16 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
-    /// Builds a client authenticated as `owner`'s GitHub App installation,
+/// Builds a client authenticated as `owner`'s GitHub App installation,
     /// exchanging (and caching, via `auth`) a real installation access
     /// token.
+    ///
+    /// This is **one of two co-equal, equally-first-class GitHub auth
+    /// methods**, not a "primary." A deployment on a host that owns an
+    /// App installation (e.g. Molimo/exe.dev) uses this; a deployment that
+    /// authenticates with a normal `gh` login (e.g. Carnyx) uses
+    /// [`from_gh_cli_fallback`]. The two must *only* ever be configured one
+    /// at a time — `build_github_client` in `lsbx-cli` selects by env.
     ///
     /// An installation access token behaves like a classic personal access
     /// token for authorization purposes (see GitHub's own docs on
@@ -128,8 +135,20 @@ impl GitHubClient {
         })
     }
 
-    /// Builds a client that falls back to the `gh` CLI, for local dev/testing
-    /// without full GitHub App credentials.
+    /// Builds a client backed by the local `gh` CLI, for deployments that
+    /// authenticate as a normal GitHub user/OAuth (`gh auth`) rather than as
+    /// an App installation — e.g. Carnyx's real setup. Co-equal with
+    /// [`from_app_auth`]: a given deployment uses one or the other, never
+    /// both, and neither is a degraded "secondary" path.
+    ///
+    /// The repo list in this mode is always an explicit, configured one
+    /// (`LSBX_CI_REPOS`, or `GITHUB_OWNER`+`GITHUB_REPO` — see
+    /// [`crate::poll::PollConfig::from_queue_label_and_env`]). It never
+    /// enumerates `/installation/repositories`, because that endpoint is
+    /// scoped to an App-installation token and does not exist for a normal
+    /// `gh` user login — a gh-CLI broker MUST NOT call it (doing so produced
+    /// `HTTP 403: You must authenticate with an installation access token`
+    /// on Carnyx before this was fixed).
     pub fn from_gh_cli_fallback() -> Self {
         Self {
             backing: Backing::GhCli(GhCliFallback),
