@@ -30,6 +30,24 @@ You are replacing both with services from `lufs-audio/lsbx` (Rust):
 
 ---
 
+## 1.5 Changes from the Carnyx migration to incorporate (cite: shared `lsbx` codebase through PR #29, 2026-08-25/26)
+
+The Carnyx migration changed **shared** `lsbx` behavior. You get the code automatically by building the same branch, but it changes how you **configure** your units. Read this before §5–§9, and note which changes are automatic-in-code vs. host-specific:
+
+**Code changes you get for free (correct-and-shared; do not remove):**
+- **GitHub auth is two co-equal methods, not "primary + fallback."** `lsbx ci-broker run` selects by env only: App if both `LSBX_GITHUB_APP_ID` and `LSBX_GITHUB_APP_PRIVATE_KEY_PATH` are set; `gh` CLI otherwise. Molimo is App-based → unchanged, **but** there is now no "gh fallback as safety net"; a stale App path fails hard. Treat App misconfig as a hard stop (consistent with §7.4).
+- **Repo discovery is auth-aware.** `installation_repositories()` is App-installation-only (`gh` user gets `HTTP 403`). App mode (Molimo) still discovers from the installation; gh-CLI mode must set `LSBX_CI_REPOS` and never calls that endpoint.
+- **`resolve_images_path` honors `LSBX_IMAGES`.** The gateway/broker load their registry from `--images`, `LSBX_IMAGES_PATH`, `LSBX_IMAGES`, then `<state-dir>/images.json`. Keep `--images`/`LSBX_IMAGES` set to your `images.json` — an unset one silently empties the registry and breaks golden resolution (the `ci.qcow2`-missing bug Carnyx hit on dispatch).
+
+### Configuration changes to mirror on Molimo
+- **Serve reap TTL → `3h`** (was `3600h`). Carnyx chose a bounded 3-hour sweep; keep Molino's serve unit comparable (see §7.3).
+- **`LSBX_CI_REPOS`** only needed if you want the gh-CLI path to work; App mode doesn't need it.
+
+### Do NOT copy Carnyx-specific artifacts
+`images.carnyx.json` (Molino uses `images.json`); all `lsbx-backend-libvirt` fixes (cloud-init seed ISO, guest-IP caching, `UserKnownHostsFile=/dev/null`, `shell_quote` for `sh -c`, orphan create-rollback — irrelevant to the exedev backend); the `GH_TOKEN`-in-keyring workaround (App-based Molino doesn't need it). Leave those shared fixes in the code — build them, don't remove them.
+
+---
+
 ## 2. Architecture comparison
 
 | Aspect | Old (Python, currently running) | New (Rust, `lsbx`) |
@@ -246,7 +264,7 @@ User=exedev
 Group=exedev
 WorkingDirectory=/home/exedev/repos/lsbx
 EnvironmentFile=/home/exedev/lsbx-state/serve.env
-ExecStart=/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 100.122.170.73 --port 8244 --reap-ttl 3600h
+ExecStart=/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 100.122.170.73 --port 8244 --reap-ttl 3h
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -257,6 +275,10 @@ EOF
 ```
 
 Notes:
+- **`--reap-ttl 3h` (changed from an earlier `3600h` draft)**: revised during Carnyx's cutover — a bounded 3-hour sweep is the deliberate default; `3600h` effectively disabled reaping. Keep a bounded value here unless Molino has a specific reason to differ; document whichever you choose.
+- **`resolve_images_path` now honors `LSBX_IMAGES` (Carnyx fix).** The gateway/broker fall back to `<state-dir>/images.json` if neither `--images` nor `LSBX_IMAGES`/`LSBX_IMAGES_PATH` is set — on Carnyx an unset `LSBX_IMAGES` produced an empty registry and a silent "golden missing"-style dispatch failure. This unit passes `--images` explicitly, so it's consistent either way; keep that `--images` (or set `LSBX_IMAGES`) rather than relying on the default path.
+- **GitHub auth is two co-equal methods (Carnyx fix).** `ci-broker run` selects App auth iff both `LSBX_GITHUB_APP_ID` and `LSBX_GITHUB_APP_PRIVATE_KEY_PATH` are set; gh-CLI otherwise. Molimo is App-based so nothing changes here, but there is now **no** "gh fallback as safety net" — confirm your App creds are live (§4.2/§7.4), because a stale App path fails hard.
+- **Repo discovery is auth-aware.** gh-CLI mode needs `LSBX_CI_REPOS` and never calls the App-only `/installation/repositories` (that 403 is what Carnyx hit and fixed). Molino's App mode still discovers from the installation — no `LSBX_CI_REPOS` needed.
 - Hardening directives (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`, `ReadWritePaths`) are carried forward from the **old** `lsbx-gateway-exedev.service` — Carnyx's old gateway unit didn't have these, but Molimo's did; preserve that asymmetry deliberately rather than "fixing" it to match Carnyx, unless you have a specific reason to change Molimo's security posture as part of this migration (you almost certainly don't — flag it if you think otherwise, don't just harmonize the two hosts silently).
 - `ReadWritePaths` must include wherever `--state-dir` actually points, or the gateway will fail to write sandbox records under the `ProtectSystem=full` sandboxing — this is exactly the kind of thing that passes a naive smoke test run interactively (outside systemd's sandboxing) and then fails only once actually started via `systemctl start`, so **test via `systemctl start`, not by running the binary by hand**, before declaring this unit correct.
 - The `EXE_TOKEN`-avoidance workaround from the old unit (`UnsetEnvironment=EXE_TOKEN`) is **not** carried forward automatically here — resolve the §2 open question about whether the new exedev backend has an equivalent preference/override before deciding whether you need something similar in this new unit's `[Service]` section.
