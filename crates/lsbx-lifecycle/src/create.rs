@@ -11,6 +11,7 @@ use lsbx_kernel::clock::Clock;
 use lsbx_kernel::error::LsbxError;
 use lsbx_kernel::types::{GoldenKey, PublicSandbox, SandboxRecord};
 use lsbx_store::sandbox_store::SandboxStore;
+use std::path::Path;
 use std::time::Duration;
 
 /// Request to provision a new sandbox.
@@ -25,11 +26,19 @@ use std::time::Duration;
 /// returning `Ok` alone.
 pub struct CreateRequest<'a> {
     pub profile: &'a str,
+    /// Resolved backend golden base. When absent, `profile` is retained as
+    /// the legacy direct golden key used by lower-level callers/tests.
+    pub golden: Option<&'a str>,
     pub name: Option<&'a str>,
     pub task_id: Option<&'a str>,
     pub lease: Duration,
     pub ready_timeout: Duration,
     pub verify: bool, // false when --no-verify
+    /// Resolved golden metadata supplied by `lsbx-ops`.
+    pub cpu: Option<u32>,
+    pub memory: Option<&'a str>,
+    pub flavor: Option<&'a str>,
+    pub streaming: Option<&'a str>,
     /// Optional healthcheck commands to run via `Backend::run` while
     /// polling readiness. See the struct-level doc comment above; this
     /// field exists only because this unit does not depend on
@@ -43,14 +52,8 @@ pub struct CreateRequest<'a> {
 /// retry; not so short that a real poll loop busy-spins.
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-fn golden_key_for_profile(profile: &str) -> GoldenKey {
-    // This unit does not parse the golden registry (Unit 08's job) — it
-    // only needs *some* `GoldenKey` to pass through `Backend::create_from_golden`.
-    // Resolving a profile name to its actual golden is Unit 08's
-    // `ImageRegistry`/`Profile` responsibility and, per this unit's own
-    // Boundaries, out of scope here; until `lsbx-ops` (Unit 10) wires that
-    // resolution in, the profile string is used directly as the golden key.
-    GoldenKey::new_unchecked(profile.to_string())
+fn golden_key_for_profile(req: &CreateRequest<'_>) -> GoldenKey {
+    GoldenKey::new_unchecked(req.golden.unwrap_or(req.profile).to_string())
 }
 
 fn rfc3339_now_plus(clock: &dyn Clock, duration: Duration) -> String {
@@ -85,9 +88,13 @@ async fn healthchecks_pass(
     vm_tag: &str,
     healthchecks: &[Vec<String>],
     per_call_timeout: Duration,
+    identity_file: Option<&Path>,
 ) -> bool {
     for command in healthchecks {
-        match backend.run(vm_tag, command, per_call_timeout).await {
+        match backend
+            .run(vm_tag, command, per_call_timeout, identity_file)
+            .await
+        {
             Ok(output) if output.exit_code == 0 => continue,
             _ => return false,
         }
@@ -124,6 +131,7 @@ async fn poll_ready(
     vm_tag: &str,
     healthchecks: &[Vec<String>],
     ready_timeout: Duration,
+    identity_file: Option<&Path>,
 ) -> Result<(), LsbxError> {
     let deadline = std::time::Instant::now() + ready_timeout;
     let probe: Vec<Vec<String>> = if healthchecks.is_empty() {
@@ -142,7 +150,7 @@ async fn poll_ready(
 
         let attempt = tokio::time::timeout(
             remaining,
-            healthchecks_pass(backend, vm_tag, &probe, remaining),
+            healthchecks_pass(backend, vm_tag, &probe, remaining, identity_file),
         )
         .await;
 
@@ -205,16 +213,17 @@ pub async fn create(
     let id = uuid_like_id(clock);
     let name = req.name.unwrap_or(id.as_str()).to_string();
 
-    let keypair = lsbx_keys::keygen::generate_ephemeral_keypair(&id)?;
+    let keypair =
+        lsbx_keys::keygen::generate_ephemeral_keypair_in(&store.state_dir().join("keys"), &id)?;
 
-    let golden = golden_key_for_profile(req.profile);
+    let golden = golden_key_for_profile(&req);
     let create_result = backend
         .create_from_golden(CreateFromGoldenRequest {
             golden: &golden,
             name: &name,
             pubkey: &keypair.public_key_line,
-            cpu: 1,
-            memory: "1G",
+            cpu: req.cpu.unwrap_or(1),
+            memory: req.memory.unwrap_or("1G"),
         })
         .await;
 
@@ -227,6 +236,15 @@ pub async fn create(
         }
     };
 
+    if let Err(error) = backend
+        .register_vm_key(&created_vm.vm_tag, &keypair.private_key_path)
+        .await
+    {
+        let _ = backend.destroy(&created_vm.vm_tag).await;
+        let _ = lsbx_keys::keygen::cleanup_keypair(&keypair);
+        return Err(error);
+    }
+
     let created_at = rfc3339_now(clock);
     let lease_expires_at = rfc3339_now_plus(clock, req.lease);
 
@@ -235,12 +253,14 @@ pub async fn create(
         name: name.clone(),
         host: created_vm.host.clone(),
         profile: req.profile.to_string(),
-        flavor: "default".to_string(),
-        streaming: if created_vm.https_url.is_some() {
-            "novnc".to_string()
-        } else {
-            "none".to_string()
-        },
+        flavor: req.flavor.unwrap_or("default").to_string(),
+        streaming: req.streaming.map(str::to_string).unwrap_or_else(|| {
+            if created_vm.https_url.is_some() {
+                "novnc".to_string()
+            } else {
+                "none".to_string()
+            }
+        }),
         username: None,
         key_name: Some(keypair.label.clone()),
         key_path: Some(keypair.private_key_path.to_string_lossy().into_owned()),
@@ -270,6 +290,7 @@ pub async fn create(
             &created_vm.vm_tag,
             &req.healthchecks,
             req.ready_timeout,
+            Some(&keypair.private_key_path),
         )
         .await?;
     }
@@ -315,7 +336,11 @@ pub async fn destroy(
     let record = store.load(id)?;
 
     if let Some(vm_tag) = record.vm_tag.as_deref() {
-        backend.destroy(vm_tag).await?;
+        if let Some(pubkey) = record.pubkey.as_deref() {
+            backend.destroy_with_key(vm_tag, pubkey).await?;
+        } else {
+            backend.destroy(vm_tag).await?;
+        }
     }
 
     if let Some(key_path) = record.key_path.clone() {

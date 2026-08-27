@@ -53,7 +53,7 @@ async fn test_fault_hang_on_run() {
 
     let _ = tokio::time::timeout(
         timeout,
-        backend.run(&vm.vm_tag, &[String::from("echo")], timeout),
+        backend.run(&vm.vm_tag, &[String::from("echo")], timeout, None),
     )
     .await;
 

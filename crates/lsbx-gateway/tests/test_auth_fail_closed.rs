@@ -17,8 +17,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use lsbx_backend_demo::DemoBackend;
+use lsbx_gateway::{run_server, GatewayConfig, GatewayDeps, RateLimitConfig};
 use lsbx_golden::registry::ImageRegistry;
-use lsbx_gateway::{run_server, GatewayConfig, RateLimitConfig};
 use lsbx_kernel::clock::SystemClock;
 use lsbx_kernel::error::LsbxError;
 use lsbx_ops::LsbxOps;
@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-fn build_test_ops() -> (Arc<LsbxOps>, tempfile::TempDir) {
+fn build_test_deps() -> (GatewayDeps, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let sandbox_store = SandboxStore::new(dir.path().to_path_buf());
     let ci_job_store = CiJobStore::new(dir.path().to_path_buf());
@@ -45,7 +45,11 @@ fn build_test_ops() -> (Arc<LsbxOps>, tempfile::TempDir) {
         registry,
         Box::new(SystemClock),
     );
-    (Arc::new(ops), dir)
+    let deps = GatewayDeps {
+        ops: Arc::new(ops),
+        state_dir: dir.path().to_path_buf(),
+    };
+    (deps, dir)
 }
 
 fn base_config() -> GatewayConfig {
@@ -53,6 +57,7 @@ fn base_config() -> GatewayConfig {
         token: None,
         allow_local_files: false,
         insecure: false,
+        max_sandboxes: 8,
         rate_limit: RateLimitConfig::default(),
     }
 }
@@ -62,10 +67,10 @@ fn base_config() -> GatewayConfig {
 /// real listening socket) rather than binding unauthenticated.
 #[tokio::test]
 async fn refuses_to_bind_non_loopback_with_no_token_and_no_insecure() {
-    let (ops, _dir) = build_test_ops();
+    let (deps, _dir) = build_test_deps();
     let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-    let result = run_server(ops, base_config(), addr).await;
+    let result = run_server(deps, base_config(), addr).await;
     assert!(
         matches!(result, Err(LsbxError::AuthFailed(_))),
         "expected AuthFailed, got {result:?}",
@@ -75,23 +80,23 @@ async fn refuses_to_bind_non_loopback_with_no_token_and_no_insecure() {
 
 #[tokio::test]
 async fn refuses_to_bind_non_loopback_with_token_but_no_insecure() {
-    let (ops, _dir) = build_test_ops();
+    let (deps, _dir) = build_test_deps();
     let mut config = base_config();
     config.token = Some("a-real-token".to_string());
     let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-    let result = run_server(ops, config, addr).await;
+    let result = run_server(deps, config, addr).await;
     assert!(matches!(result, Err(LsbxError::AuthFailed(_))));
 }
 
 #[tokio::test]
 async fn refuses_to_bind_non_loopback_with_insecure_but_no_token() {
-    let (ops, _dir) = build_test_ops();
+    let (deps, _dir) = build_test_deps();
     let mut config = base_config();
     config.insecure = true;
     let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-    let result = run_server(ops, config, addr).await;
+    let result = run_server(deps, config, addr).await;
     assert!(matches!(result, Err(LsbxError::AuthFailed(_))));
 }
 
@@ -102,13 +107,13 @@ async fn refuses_to_bind_non_loopback_with_insecure_but_no_token() {
 /// needs no fixed port and cannot collide with anything else running.
 #[tokio::test]
 async fn actually_binds_a_real_listener_once_the_check_passes() {
-    let (ops, _dir) = build_test_ops();
+    let (deps, _dir) = build_test_deps();
     let mut config = base_config();
     config.token = Some("a-real-token".to_string());
     config.insecure = true;
     let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-    let bound = run_server(ops, config, addr)
+    let bound = run_server(deps, config, addr)
         .await
         .expect("bind should succeed once both token and insecure are set");
 
@@ -124,10 +129,10 @@ async fn actually_binds_a_real_listener_once_the_check_passes() {
 /// not about requiring auth configuration universally.
 #[tokio::test]
 async fn loopback_bind_succeeds_even_with_no_token_and_no_insecure() {
-    let (ops, _dir) = build_test_ops();
+    let (deps, _dir) = build_test_deps();
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let bound = run_server(ops, base_config(), addr)
+    let bound = run_server(deps, base_config(), addr)
         .await
         .expect("loopback bind should always be permitted");
     assert_ne!(bound.local_addr.port(), 0);
@@ -140,13 +145,15 @@ async fn loopback_bind_succeeds_even_with_no_token_and_no_insecure() {
 /// server and not merely an accepted-but-inert `TcpListener`.
 #[tokio::test]
 async fn bound_server_actually_serves_real_http_requests() {
-    let (ops, _dir) = build_test_ops();
+    let (deps, _dir) = build_test_deps();
     let mut config = base_config();
     config.token = Some("a-real-token".to_string());
     config.insecure = true;
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let bound = run_server(ops, config, addr).await.expect("bind should succeed");
+    let bound = run_server(deps, config, addr)
+        .await
+        .expect("bind should succeed");
     let local_addr = bound.local_addr;
 
     let server_handle = tokio::spawn(async move {

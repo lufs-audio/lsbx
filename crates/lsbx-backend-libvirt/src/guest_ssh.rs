@@ -44,13 +44,17 @@
 //! This module intentionally passes `-o StrictHostKeyChecking=accept-new`
 //! (accept and pin an unseen host key, but still fail on a *changed* one)
 //! rather than `-o StrictHostKeyChecking=no` (silently accept anything,
-//! every time). Ephemeral, freshly-created VMs have never been seen before,
-//! so `StrictHostKeyChecking=yes` would never succeed; but disabling host
-//! key checking entirely removes any protection against a
-//! machine-in-the-middle presenting itself as the guest on a later
-//! reconnect within the same lease. `accept-new` is the documented OpenSSH
-//! mechanism for exactly this "trust on first use for a disposable host, but
-//! not blindly forever" case.
+//! every time) — but, matching the Python reference's libvirt backend
+//! (`libvirt.py`'s `_key_flags`), pairs it with
+//! `-o UserKnownHostsFile=/dev/null`. Ephemeral, freshly-created VMs have
+//! never been seen before, so `StrictHostKeyChecking=yes` would never
+//! succeed; and because libvirt's DHCP pool recycles IPs across sandbox
+//! lifetimes, a *new* VM frequently reuses an IP a previous VM held, so a
+//! persistent `known_hosts` file would trip "host key changed" on the very
+//! first connect (the old entry pinned the previous VM's key). Pointing
+//! known-host storage at `/dev/null` keeps `accept-new`'s never-fail-on-new
+//! semantics while discarding host keys with the sandbox — the same policy
+//! the reference implementation uses.
 
 use lsbx_kernel::error::LsbxError;
 use std::path::Path;
@@ -88,6 +92,10 @@ fn base_ssh_args(target: &GuestSshTarget<'_>) -> Vec<std::ffi::OsString> {
         "StrictHostKeyChecking=accept-new".into(),
         "-o".into(),
         format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}").into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "ClearAllForwardings=yes".into(),
         "-i".into(),
         target.identity_file.as_os_str().to_owned(),
     ]
@@ -107,14 +115,55 @@ fn is_ssh_client_failure(exit_code: Option<i32>) -> bool {
     exit_code == Some(255)
 }
 
+/// POSIX-shell-quotes a single argv element so the guest shell re-parses it
+/// as one token. The safe charset (no quoting needed) mirrors `shlex.quote`'s
+/// conservative default; anything else is single-quoted with embedded quotes
+/// escaped the standard `'…'\''…'` way. An empty string becomes `''`.
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@%+=:,./-_".contains(&b))
+    {
+        return arg.to_string();
+    }
+    let mut out = String::from("'");
+    let mut parts = arg.split('\'');
+    if let Some(first) = parts.next() {
+        out.push_str(first);
+    }
+    for part in parts {
+        out.push_str("'\\''");
+        out.push_str(part);
+    }
+    out.push('\'');
+    out
+}
+
+/// Joins an argv array into a single shell command line, quoting each
+/// element with [`shell_quote`], for use as ssh's one remote-command
+/// argument.
+fn shell_quote_join(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|c| shell_quote(c))
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
 /// Runs `command` inside the guest over batch-mode SSH, with stdin
 /// isolated from `/dev/null` — the acceptance criterion this module exists
-/// to satisfy. `command` is passed as a single already-assembled remote
-/// command line (SSH itself concatenates argv with spaces and re-parses it
-/// through the guest's shell; this module does not attempt to bypass that
-/// with `ssh`'s exec-argv-array mode, since OpenSSH's client doesn't expose
-/// one — the same limitation the existing Python implementation lives
-/// with).
+/// to satisfy. `command` is an argv array; because OpenSSH's client only
+/// accepts a single remote *command line* (it concatenates trailing argv
+/// with spaces and the guest shell re-parses it — there is no
+/// exec-argv-array transport), the argv is reconstructed into one
+/// faithfully-quoted shell command via [`shell_quote`]/[`shell_quote_join`]
+/// before being passed to `ssh` as a single element. Without that quoting,
+/// a conventional `["sh", "-c", "git --version"]` healthcheck would arrive
+/// in the guest as `sh -c git --version` and execute `sh -c git` with
+/// `--version` in `$0` — `git` printing usage and exiting 1 — exactly the
+/// argv-collapse hazard the Python reference avoids by accepting its
+/// command as a single pre-joined string.
 pub async fn run_command(
     target: &GuestSshTarget<'_>,
     command: &[String],
@@ -122,7 +171,7 @@ pub async fn run_command(
 ) -> Result<lsbx_kernel::backend::CommandOutput, LsbxError> {
     let mut args = base_ssh_args(target);
     args.push(format!("{}@{}", target.username, target.host).into());
-    args.extend(command.iter().map(std::ffi::OsString::from));
+    args.push(shell_quote_join(command).into());
 
     let child = Command::new("ssh")
         .args(&args)
@@ -172,6 +221,9 @@ pub async fn put_file(
     destination: &str,
 ) -> Result<(), LsbxError> {
     let mut args = base_ssh_args(target);
+    if source.is_dir() {
+        args.insert(0, "-r".into());
+    }
     args.push(source.as_os_str().to_owned());
     args.push(format!("{}@{}:{}", target.username, target.host, destination).into());
     run_scp(&args, target.host).await
@@ -258,6 +310,36 @@ mod tests {
         assert!(!is_ssh_client_failure(Some(0)));
         assert!(!is_ssh_client_failure(Some(1)));
         assert!(!is_ssh_client_failure(None));
+    }
+
+    #[test]
+    fn shell_quote_leaves_safe_words_unquoted() {
+        assert_eq!(shell_quote("git"), "git");
+        assert_eq!(shell_quote("python3"), "python3");
+        assert_eq!(shell_quote("web-search"), "web-search");
+    }
+
+    #[test]
+    fn shell_quote_quotes_spaces_and_singletons() {
+        assert_eq!(shell_quote("git --version"), "'git --version'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn shell_quote_join_preserves_argv_for_sh_c() {
+        // The canonical healthcheck shape `["sh", "-c", "git --version"]`
+        // must round-trip into one shell command line that the guest parses
+        // back as `sh -c 'git --version'` — not `sh -c git --version`.
+        assert_eq!(
+            shell_quote_join(&[
+                "sh".to_string(),
+                "-c".to_string(),
+                "git --version".to_string(),
+            ]),
+            "sh -c 'git --version'"
+        );
+        assert_eq!(shell_quote_join(&["true".to_string()]), "true");
     }
 
     /// The named acceptance scenario from the unit contract: a remote

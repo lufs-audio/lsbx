@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # lufs-audio/lsbx is public, while the organization `exe` runner group
+    # intentionally disallows public repositories. Keep project CI on a
+    # GitHub-hosted runner; Molimo's self-hosted broker is exercised by the
+    # private-repository runner workflows and maintenance rehearsal.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libvirt-dev pkg-config
+      - name: cargo check
+        run: cargo check --workspace --message-format=json
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace

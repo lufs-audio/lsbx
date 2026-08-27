@@ -32,7 +32,9 @@
 //! Boundaries: "the wizard is a UI, not a second validation path").
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
 use lsbx_kernel::error::LsbxError;
@@ -65,7 +67,8 @@ pub struct WizardAnswers {
 /// only when the registry has nothing registered yet (e.g. a fresh demo
 /// instance) — never silently inventing profiles a real registry
 /// contradicts.
-const FALLBACK_PROFILE_CHOICES: &[&str] = &["agent-default", "ci-runner-default", "desktop-default"];
+const FALLBACK_PROFILE_CHOICES: &[&str] =
+    &["agent-default", "ci-runner-default", "desktop-default"];
 
 const CPU_CHOICES: &[u32] = &[1, 2, 4, 8];
 const MEMORY_CHOICES: &[&str] = &["512M", "1G", "2G", "4G", "8G"];
@@ -192,12 +195,13 @@ impl TerminalGuard {
         enable_raw_mode()
             .map_err(|e| LsbxError::ContractViolated(format!("failed to enable raw mode: {e}")))?;
         let mut stdout = std::io::stdout();
-        stdout
-            .execute(EnterAlternateScreen)
-            .map_err(|e| LsbxError::ContractViolated(format!("failed to enter alternate screen: {e}")))?;
+        stdout.execute(EnterAlternateScreen).map_err(|e| {
+            LsbxError::ContractViolated(format!("failed to enter alternate screen: {e}"))
+        })?;
         let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)
-            .map_err(|e| LsbxError::ContractViolated(format!("failed to construct ratatui terminal: {e}")))?;
+        let terminal = Terminal::new(backend).map_err(|e| {
+            LsbxError::ContractViolated(format!("failed to construct ratatui terminal: {e}"))
+        })?;
         Ok(Self {
             terminal,
             _tui_active: tui_active,
@@ -287,7 +291,10 @@ pub async fn run_up_wizard(ops: &lsbx_ops::LsbxOps) -> Result<PublicSandbox, Lsb
 async fn candidate_profiles(ops: &lsbx_ops::LsbxOps) -> Vec<String> {
     match ops.golden_list().await {
         Ok(goldens) if !goldens.is_empty() => goldens.into_iter().map(|g| g.key).collect(),
-        _ => FALLBACK_PROFILE_CHOICES.iter().map(|s| s.to_string()).collect(),
+        _ => FALLBACK_PROFILE_CHOICES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     }
 }
 
@@ -344,21 +351,30 @@ fn draw_up_wizard(frame: &mut Frame, state: &UpWizardState) {
             frame,
             chunks[1],
             "cpu",
-            &CPU_CHOICES.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+            &CPU_CHOICES
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>(),
             state.cpu_index,
         ),
         Step::Memory => draw_choice_step(
             frame,
             chunks[1],
             "memory",
-            &MEMORY_CHOICES.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+            &MEMORY_CHOICES
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>(),
             state.memory_index,
         ),
         Step::Lease => draw_choice_step(
             frame,
             chunks[1],
             "lease",
-            &LEASE_CHOICES_SECS.iter().map(|s| format_lease(*s)).collect::<Vec<_>>(),
+            &LEASE_CHOICES_SECS
+                .iter()
+                .map(|s| format_lease(*s))
+                .collect::<Vec<_>>(),
             state.lease_index,
         ),
         Step::Confirm => draw_confirm_step(frame, chunks[1], state),
@@ -380,19 +396,35 @@ fn draw_profile_step(frame: &mut Frame, area: ratatui::layout::Rect, state: &UpW
         .enumerate()
         .map(|(i, profile)| {
             let style = if i == state.profile_index {
-                Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
             ListItem::new(Line::from(Span::styled(profile.clone(), style)))
         })
         .collect();
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("select a profile"));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("select a profile"),
+    );
     frame.render_widget(list, area);
 }
 
-fn draw_choice_step(frame: &mut Frame, area: ratatui::layout::Rect, label: &str, choices: &[String], index: usize) {
-    let text = format!("{label}: < {} >", choices.get(index).map(String::as_str).unwrap_or("?"));
+fn draw_choice_step(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    label: &str,
+    choices: &[String],
+    index: usize,
+) {
+    let text = format!(
+        "{label}: < {} >",
+        choices.get(index).map(String::as_str).unwrap_or("?")
+    );
     let widget = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(label));
     frame.render_widget(widget, area);
 }
@@ -403,7 +435,8 @@ fn draw_confirm_step(frame: &mut Frame, area: ratatui::layout::Rect, state: &UpW
         "profile={}\ncpu={}\nmemory={}\nlease={:?}\n\npress enter to create",
         answers.profile, answers.cpu, answers.memory, answers.lease
     );
-    let widget = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("confirm"));
+    let widget =
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("confirm"));
     frame.render_widget(widget, area);
 }
 
@@ -433,9 +466,16 @@ fn draw_confirm_step(frame: &mut Frame, area: ratatui::layout::Rect, state: &UpW
 /// same way on both paths, which is exactly why this function is the one
 /// shared place that would need to grow that resolution, once it exists,
 /// rather than each caller reimplementing it independently.
-pub fn answers_to_create_request(answers: &WizardAnswers) -> lsbx_lifecycle::create::CreateRequest<'_> {
+pub fn answers_to_create_request(
+    answers: &WizardAnswers,
+) -> lsbx_lifecycle::create::CreateRequest<'_> {
     lsbx_lifecycle::create::CreateRequest {
         profile: &answers.profile,
+        golden: None,
+        cpu: None,
+        memory: None,
+        flavor: None,
+        streaming: None,
         name: None,
         task_id: None,
         lease: answers.lease,
@@ -505,6 +545,7 @@ pub async fn run_golden_build_wizard(
     let script_path = std::path::PathBuf::from(state.script_path.clone());
     let outcome = ops
         .golden_build(lsbx_golden::build::GoldenBuildRequest {
+            key_path: None,
             name: &state.name,
             from: &state.from,
             script: &script_path,
@@ -561,8 +602,12 @@ fn handle_golden_build_wizard_key(state: &mut GoldenBuildWizardState, code: KeyC
         KeyCode::Esc | KeyCode::Char('q') => state.cancelled = true,
         KeyCode::Left => state.cpu_index = clamp_index(state.cpu_index, -1, CPU_CHOICES.len()),
         KeyCode::Right => state.cpu_index = clamp_index(state.cpu_index, 1, CPU_CHOICES.len()),
-        KeyCode::Up => state.memory_index = clamp_index(state.memory_index, -1, MEMORY_CHOICES.len()),
-        KeyCode::Down => state.memory_index = clamp_index(state.memory_index, 1, MEMORY_CHOICES.len()),
+        KeyCode::Up => {
+            state.memory_index = clamp_index(state.memory_index, -1, MEMORY_CHOICES.len())
+        }
+        KeyCode::Down => {
+            state.memory_index = clamp_index(state.memory_index, 1, MEMORY_CHOICES.len())
+        }
         KeyCode::Enter => state.confirmed = true,
         _ => {}
     }
@@ -578,7 +623,11 @@ fn draw_golden_build_wizard(frame: &mut Frame, state: &GoldenBuildWizardState) {
         CPU_CHOICES[state.cpu_index],
         MEMORY_CHOICES[state.memory_index],
     );
-    let widget = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("golden build wizard"));
+    let widget = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("golden build wizard"),
+    );
     frame.render_widget(widget, area);
 }
 
@@ -664,7 +713,8 @@ mod tests {
 
     #[test]
     fn answers_reflects_current_indices() {
-        let mut state = UpWizardState::new(vec!["agent-default".to_string(), "ci-runner".to_string()]);
+        let mut state =
+            UpWizardState::new(vec!["agent-default".to_string(), "ci-runner".to_string()]);
         state.profile_index = 1;
         state.cpu_index = 2;
         state.memory_index = 1;

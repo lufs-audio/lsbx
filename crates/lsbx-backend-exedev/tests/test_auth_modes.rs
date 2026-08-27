@@ -109,6 +109,7 @@ async fn ssh_variant_attempts_a_real_connection_and_fails_cleanly_offline() {
             "irrelevant-vm-tag",
             &["echo".to_string(), "hi".to_string()],
             std::time::Duration::from_millis(500),
+            None,
         )
         .await;
 
@@ -146,6 +147,7 @@ async fn account_token_run_fails_cleanly_with_no_reachable_endpoint() {
             "some-vm-tag",
             &["echo".to_string(), "hi".to_string()],
             std::time::Duration::from_millis(200),
+            None,
         )
         .await;
     // Whatever the exact failure (DNS resolution failure, connection

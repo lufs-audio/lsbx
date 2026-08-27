@@ -124,6 +124,7 @@ impl GatewayDeps {
     /// `routes::build_router` already needed, and it exists solely to
     /// satisfy `lsbx-stream`'s own documented `StreamState` shape.
     pub fn build_router(self, config: GatewayConfig) -> axum::Router {
+        let stream_auth_config = Arc::new(config.clone());
         let rest_router = routes::build_router_for_merge(Arc::clone(&self.ops), config);
 
         let stream_store = Arc::new(lsbx_store::sandbox_store::SandboxStore::new(
@@ -133,7 +134,9 @@ impl GatewayDeps {
             ops: self.ops,
             store: stream_store,
         };
-        let stream_router = lsbx_stream::router(stream_state);
+        let stream_router = lsbx_stream::router(stream_state).layer(
+            axum::middleware::from_fn_with_state(stream_auth_config, crate::auth::auth_middleware),
+        );
 
         rest_router.merge(stream_router)
     }
@@ -198,7 +201,9 @@ pub async fn run_server(
         LsbxError::ContractViolated(format!("failed to bind gateway listener on {addr}: {e}"))
     })?;
     let local_addr = listener.local_addr().map_err(|e| {
-        LsbxError::ContractViolated(format!("failed to read bound listener's local address: {e}"))
+        LsbxError::ContractViolated(format!(
+            "failed to read bound listener's local address: {e}"
+        ))
     })?;
 
     Ok(BoundServer {
@@ -259,6 +264,7 @@ mod tests {
             token: token.map(str::to_string),
             allow_local_files: false,
             insecure,
+            max_sandboxes: 8,
             rate_limit: crate::ratelimit::RateLimitConfig::default(),
         }
     }
@@ -342,7 +348,11 @@ mod tests {
             .header("Authorization", "Bearer test-token")
             .body(axum::body::Body::empty())
             .expect("build health request");
-        let health_response = router.clone().oneshot(health_req).await.expect("oneshot health");
+        let health_response = router
+            .clone()
+            .oneshot(health_req)
+            .await
+            .expect("oneshot health");
         assert_eq!(health_response.status(), axum::http::StatusCode::OK);
 
         // One stream-crate route (the unauthenticated /console page from
@@ -353,7 +363,35 @@ mod tests {
             .uri("/console?target=sbx-does-not-matter")
             .body(axum::body::Body::empty())
             .expect("build console request");
-        let console_response = router.oneshot(console_req).await.expect("oneshot console");
+        let console_response = router
+            .clone()
+            .oneshot(console_req)
+            .await
+            .expect("oneshot console");
         assert_eq!(console_response.status(), axum::http::StatusCode::OK);
+
+        // Stream and console-detail routes are protected by the gateway
+        // composition layer even though their handlers live in lsbx-stream.
+        let unauthenticated_detail = axum::http::Request::builder()
+            .uri("/consoles/missing")
+            .body(axum::body::Body::empty())
+            .expect("build unauthenticated console-detail request");
+        let response = router
+            .clone()
+            .oneshot(unauthenticated_detail)
+            .await
+            .expect("oneshot unauthenticated console detail");
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let authenticated_detail = axum::http::Request::builder()
+            .uri("/consoles/missing")
+            .header("Authorization", "Bearer test-token")
+            .body(axum::body::Body::empty())
+            .expect("build authenticated console-detail request");
+        let response = router
+            .oneshot(authenticated_detail)
+            .await
+            .expect("oneshot authenticated console detail");
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }

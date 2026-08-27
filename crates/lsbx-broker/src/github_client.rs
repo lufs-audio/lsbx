@@ -109,9 +109,16 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
-    /// Builds a client authenticated as `owner`'s GitHub App installation,
+/// Builds a client authenticated as `owner`'s GitHub App installation,
     /// exchanging (and caching, via `auth`) a real installation access
     /// token.
+    ///
+    /// This is **one of two co-equal, equally-first-class GitHub auth
+    /// methods**, not a "primary." A deployment on a host that owns an
+    /// App installation (e.g. Molimo/exe.dev) uses this; a deployment that
+    /// authenticates with a normal `gh` login (e.g. Carnyx) uses
+    /// [`from_gh_cli_fallback`]. The two must *only* ever be configured one
+    /// at a time — `build_github_client` in `lsbx-cli` selects by env.
     ///
     /// An installation access token behaves like a classic personal access
     /// token for authorization purposes (see GitHub's own docs on
@@ -128,8 +135,20 @@ impl GitHubClient {
         })
     }
 
-    /// Builds a client that falls back to the `gh` CLI, for local dev/testing
-    /// without full GitHub App credentials.
+    /// Builds a client backed by the local `gh` CLI, for deployments that
+    /// authenticate as a normal GitHub user/OAuth (`gh auth`) rather than as
+    /// an App installation — e.g. Carnyx's real setup. Co-equal with
+    /// [`from_app_auth`]: a given deployment uses one or the other, never
+    /// both, and neither is a degraded "secondary" path.
+    ///
+    /// The repo list in this mode is always an explicit, configured one
+    /// (`LSBX_CI_REPOS`, or `GITHUB_OWNER`+`GITHUB_REPO` — see
+    /// [`crate::poll::PollConfig::from_queue_label_and_env`]). It never
+    /// enumerates `/installation/repositories`, because that endpoint is
+    /// scoped to an App-installation token and does not exist for a normal
+    /// `gh` user login — a gh-CLI broker MUST NOT call it (doing so produced
+    /// `HTTP 403: You must authenticate with an installation access token`
+    /// on Carnyx before this was fixed).
     pub fn from_gh_cli_fallback() -> Self {
         Self {
             backing: Backing::GhCli(GhCliFallback),
@@ -155,7 +174,10 @@ impl GitHubClient {
     /// unrelated mock endpoint the test would otherwise need to stand up
     /// just to reach this one.
     #[cfg(feature = "test-util")]
-    pub fn from_installation_token_with_base_uri(token: String, base_uri: &str) -> Result<Self, LsbxError> {
+    pub fn from_installation_token_with_base_uri(
+        token: String,
+        base_uri: &str,
+    ) -> Result<Self, LsbxError> {
         let client = installation_token_client_with_base_uri(token, Some(base_uri))?;
         Ok(Self {
             backing: Backing::Installation(client),
@@ -200,7 +222,11 @@ impl GitHubClient {
     /// `poll::queued_jobs`, which calls this once per status it cares
     /// about (`"queued"`, then `"in_progress"`) rather than trying to
     /// combine them into one request.
-    pub async fn workflow_runs(&self, repo: &str, status: &str) -> Result<Vec<WorkflowRunSummary>, LsbxError> {
+    pub async fn workflow_runs(
+        &self,
+        repo: &str,
+        status: &str,
+    ) -> Result<Vec<WorkflowRunSummary>, LsbxError> {
         match &self.backing {
             Backing::Installation(client) => workflow_runs_via_octocrab(client, repo, status).await,
             Backing::GhCli(fallback) => workflow_runs_via_gh_cli(fallback, repo, status).await,
@@ -214,6 +240,29 @@ impl GitHubClient {
         match &self.backing {
             Backing::Installation(client) => run_jobs_via_octocrab(client, repo, run_id).await,
             Backing::GhCli(fallback) => run_jobs_via_gh_cli(fallback, repo, run_id).await,
+        }
+    }
+
+    /// Current status of one Actions job, used by the runner monitor to
+    /// distinguish a successful GitHub completion from a local runner exit.
+    pub async fn job(&self, repo: &str, job_id: u64) -> Result<JobSummary, LsbxError> {
+        match &self.backing {
+            Backing::Installation(client) => {
+                let route = format!("/repos/{repo}/actions/jobs/{job_id}");
+                client
+                    .get(&route, None::<&()>)
+                    .await
+                    .map_err(|e| map_octocrab_error(e, &route))
+            }
+            Backing::GhCli(fallback) => {
+                let route = format!("/repos/{repo}/actions/jobs/{job_id}");
+                let value = fallback.api(&route).await?;
+                serde_json::from_value(value).map_err(|e| {
+                    LsbxError::ContractViolated(format!(
+                        "GitHub job response had unexpected shape: {e}"
+                    ))
+                })
+            }
         }
     }
 
@@ -233,7 +282,11 @@ impl GitHubClient {
     /// status — this is not itself an error: a runner between "registered"
     /// and "GitHub has attached it to a job's `runner_name` field" is a
     /// real, transient, non-error state.
-    pub async fn job_for_runner(&self, repo: &str, runner_name: &str) -> Result<Option<u64>, LsbxError> {
+    pub async fn job_for_runner(
+        &self,
+        repo: &str,
+        runner_name: &str,
+    ) -> Result<Option<u64>, LsbxError> {
         for status in DIVERGENCE_SCAN_STATUSES {
             let runs = self.workflow_runs(repo, status).await?;
             for run in runs {
@@ -269,6 +322,10 @@ pub struct JobSummary {
     pub id: u64,
     pub run_id: u64,
     pub status: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub conclusion: Option<String>,
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default)]
@@ -308,9 +365,9 @@ fn installation_token_client_with_base_uri(
             .map_err(|e| LsbxError::AuthFailed(format!("invalid test base_uri: {e}")))?;
     }
 
-    builder
-        .build()
-        .map_err(|e| LsbxError::AuthFailed(format!("failed to build installation-token client: {e}")))
+    builder.build().map_err(|e| {
+        LsbxError::AuthFailed(format!("failed to build installation-token client: {e}"))
+    })
 }
 
 const PER_PAGE: u8 = 100;
@@ -320,7 +377,9 @@ const PER_PAGE: u8 = 100;
 /// same-crate duplicate rather than a shared import.
 const DIVERGENCE_SCAN_STATUSES: [&str; 2] = ["queued", "in_progress"];
 
-async fn installation_repositories_via_octocrab(client: &Octocrab) -> Result<Vec<String>, LsbxError> {
+async fn installation_repositories_via_octocrab(
+    client: &Octocrab,
+) -> Result<Vec<String>, LsbxError> {
     let mut full_names = Vec::new();
     let mut page: u32 = 1;
 
@@ -352,7 +411,9 @@ async fn installation_repositories_via_octocrab(client: &Octocrab) -> Result<Vec
     Ok(full_names)
 }
 
-async fn installation_repositories_via_gh_cli(fallback: &GhCliFallback) -> Result<Vec<String>, LsbxError> {
+async fn installation_repositories_via_gh_cli(
+    fallback: &GhCliFallback,
+) -> Result<Vec<String>, LsbxError> {
     let mut full_names = Vec::new();
     let mut page: u32 = 1;
 
@@ -365,7 +426,8 @@ async fn installation_repositories_via_gh_cli(fallback: &GhCliFallback) -> Resul
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
                 LsbxError::ContractViolated(
-                    "gh api installation/repositories response had no `repositories` array".to_string(),
+                    "gh api installation/repositories response had no `repositories` array"
+                        .to_string(),
                 )
             })?;
 
@@ -438,7 +500,8 @@ async fn workflow_runs_via_gh_cli(
     let mut page: u32 = 1;
 
     loop {
-        let path = format!("/repos/{repo}/actions/runs?status={status}&per_page={PER_PAGE}&page={page}");
+        let path =
+            format!("/repos/{repo}/actions/runs?status={status}&per_page={PER_PAGE}&page={page}");
         let value = fallback.api(&path).await?;
 
         let workflow_runs = value
@@ -458,7 +521,9 @@ async fn workflow_runs_via_gh_cli(
         let page_len = workflow_runs.len();
         for run in workflow_runs {
             let parsed: WorkflowRunSummary = serde_json::from_value(run.clone()).map_err(|e| {
-                LsbxError::ContractViolated(format!("gh api actions/runs entry had unexpected shape: {e}"))
+                LsbxError::ContractViolated(format!(
+                    "gh api actions/runs entry had unexpected shape: {e}"
+                ))
             })?;
             runs.push(parsed);
         }
@@ -472,7 +537,11 @@ async fn workflow_runs_via_gh_cli(
     Ok(runs)
 }
 
-async fn run_jobs_via_octocrab(client: &Octocrab, repo: &str, run_id: u64) -> Result<Vec<JobSummary>, LsbxError> {
+async fn run_jobs_via_octocrab(
+    client: &Octocrab,
+    repo: &str,
+    run_id: u64,
+) -> Result<Vec<JobSummary>, LsbxError> {
     let route = format!("/repos/{repo}/actions/runs/{run_id}/jobs");
     let mut jobs = Vec::new();
     let mut page: u32 = 1;
@@ -497,12 +566,17 @@ async fn run_jobs_via_octocrab(client: &Octocrab, repo: &str, run_id: u64) -> Re
     Ok(jobs)
 }
 
-async fn run_jobs_via_gh_cli(fallback: &GhCliFallback, repo: &str, run_id: u64) -> Result<Vec<JobSummary>, LsbxError> {
+async fn run_jobs_via_gh_cli(
+    fallback: &GhCliFallback,
+    repo: &str,
+    run_id: u64,
+) -> Result<Vec<JobSummary>, LsbxError> {
     let mut jobs = Vec::new();
     let mut page: u32 = 1;
 
     loop {
-        let path = format!("/repos/{repo}/actions/runs/{run_id}/jobs?per_page={PER_PAGE}&page={page}");
+        let path =
+            format!("/repos/{repo}/actions/runs/{run_id}/jobs?per_page={PER_PAGE}&page={page}");
         let value = fallback.api(&path).await?;
 
         let jobs_array = value

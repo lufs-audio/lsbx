@@ -3,31 +3,51 @@
 //! default per Unit 07's acceptance criteria — normal CI has no exe.dev
 //! credentials and no reachable exe.dev endpoint.
 //!
-//! Run against a real account with:
+//! Run against the live exe.dev SSH alias (the default on Molimo), or an
+//! account token:
 //! ```bash
-//! EXE_TOKEN=<your account token> \
-//!   cargo test -p lsbx-backend-exedev --test test_conformance -- --ignored
+//! cargo test -p lsbx-backend-exedev --test test_conformance -- --ignored
+//! # or: EXE_TOKEN=<account-token> cargo test -p lsbx-backend-exedev --test test_conformance -- --ignored
 //! ```
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use lsbx_backend_exedev::{ExedevAuth, ExedevBackend};
 use lsbx_backend_testkit::run_conformance_suite;
+use lsbx_kernel::backend::Backend;
 use lsbx_kernel::types::GoldenKey;
 
 #[tokio::test]
-#[ignore = "requires a real exe.dev account and EXE_TOKEN — run with `cargo test -- --ignored`"]
+#[ignore = "requires a reachable exe.dev control plane; uses EXE_TOKEN or the configured SSH alias"]
 async fn exedev_backend_passes_conformance_suite() {
-    let token = std::env::var("EXE_TOKEN")
-        .expect("EXE_TOKEN must be set to run this ignored test against a real exe.dev account");
-    let backend = ExedevBackend::new(ExedevAuth::account_token(token));
+    let auth = match std::env::var("EXE_TOKEN") {
+        Ok(token) if !token.is_empty() => ExedevAuth::account_token(token),
+        _ => ExedevAuth::ssh_alias(
+            std::env::var("LSBX_EXEDEV_SSH_ALIAS").unwrap_or_else(|_| "exe.dev".to_string()),
+        ),
+    };
+    let backend = ExedevBackend::new(auth);
 
-    // A minimal, backend-appropriate golden identifier — exe.dev's smallest
-    // provisionable image, per this crate's own `golden_ref` contract from
-    // Unit 04 (this crate does not decide what golden this key resolves to;
-    // that's Unit 08's registry job, this is just a string exe.dev's `new`
-    // verb accepts as a base image name against a real account).
-    let golden_ref = GoldenKey::new_unchecked("exeuntu".to_string());
+    let golden_ref = GoldenKey::new_unchecked(
+        std::env::var("LSBX_EXEDEV_TEST_GOLDEN").unwrap_or_else(|_| "lsbx-default-v1".to_string()),
+    );
 
     let report = run_conformance_suite(&backend, &golden_ref).await;
+
+    // The shared suite intentionally calls plain `destroy`, so remove the
+    // fixed conformance key explicitly. The removal is idempotent: it also
+    // cleans up a key left by an interrupted prior run or a failed create.
+    let cleanup = backend
+        .destroy_with_key(
+            "lsbx-conformance-test-vm",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFcFi7kjVO1u+zN87aUSxqktiGksMgqfNe/o5ICyMeSi conformance@lsbx",
+        )
+        .await;
+    assert!(
+        matches!(
+            cleanup,
+            Ok(()) | Err(lsbx_kernel::error::LsbxError::NotFound(_))
+        ),
+        "conformance cleanup failed: {cleanup:?}"
+    );
 
     for check in &report.checks {
         println!(

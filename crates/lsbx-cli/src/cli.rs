@@ -113,11 +113,15 @@ pub enum Command {
         #[arg(long)]
         port: Option<u16>,
         #[arg(long)]
+        max_sandboxes: Option<usize>,
+        #[arg(long)]
         stream_port: Option<u16>,
         #[arg(long)]
         token: Option<String>,
         #[arg(long)]
         reap_ttl: Option<String>,
+        #[arg(long)]
+        insecure: bool,
         #[arg(long)]
         daemon: bool,
     },

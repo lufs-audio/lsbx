@@ -70,7 +70,7 @@ impl Backend for ConformantFakeBackend {
         })
     }
 
-    async fn run(&self, vm_tag: &str, _command: &[String], _timeout: Duration) -> Result<CommandOutput, LsbxError> {
+    async fn run(&self, vm_tag: &str, _command: &[String], _timeout: Duration, _identity_file: Option<&std::path::Path>) -> Result<CommandOutput, LsbxError> {
         let exists = self.vms.lock().expect("lock poisoned").iter().any(|t| t == vm_tag);
         if exists {
             Ok(CommandOutput {
@@ -83,11 +83,11 @@ impl Backend for ConformantFakeBackend {
         }
     }
 
-    async fn put_file(&self, _vm_tag: &str, _source: &std::path::Path, _destination: &str) -> Result<(), LsbxError> {
+    async fn put_file(&self, _vm_tag: &str, _source: &std::path::Path, _destination: &str, _identity_file: Option<&std::path::Path>) -> Result<(), LsbxError> {
         Ok(())
     }
 
-    async fn get_file(&self, _vm_tag: &str, _source: &str, _destination: &std::path::Path) -> Result<(), LsbxError> {
+    async fn get_file(&self, _vm_tag: &str, _source: &str, _destination: &std::path::Path, _identity_file: Option<&std::path::Path>) -> Result<(), LsbxError> {
         Ok(())
     }
 
@@ -152,7 +152,7 @@ impl Backend for DestroyNoOpsBackend {
         })
     }
 
-    async fn run(&self, vm_tag: &str, _command: &[String], _timeout: Duration) -> Result<CommandOutput, LsbxError> {
+    async fn run(&self, vm_tag: &str, _command: &[String], _timeout: Duration, _identity_file: Option<&std::path::Path>) -> Result<CommandOutput, LsbxError> {
         // Deliberately reports the VM as still runnable even after a
         // "successful" destroy, matching the no-op destroy defect: from the
         // outside, nothing about this backend's state ever changed.
@@ -168,11 +168,11 @@ impl Backend for DestroyNoOpsBackend {
         }
     }
 
-    async fn put_file(&self, _vm_tag: &str, _source: &std::path::Path, _destination: &str) -> Result<(), LsbxError> {
+    async fn put_file(&self, _vm_tag: &str, _source: &std::path::Path, _destination: &str, _identity_file: Option<&std::path::Path>) -> Result<(), LsbxError> {
         Ok(())
     }
 
-    async fn get_file(&self, _vm_tag: &str, _source: &str, _destination: &std::path::Path) -> Result<(), LsbxError> {
+    async fn get_file(&self, _vm_tag: &str, _source: &str, _destination: &std::path::Path, _identity_file: Option<&std::path::Path>) -> Result<(), LsbxError> {
         Ok(())
     }
 
@@ -323,15 +323,15 @@ async fn suite_still_runs_never_created_checks_when_create_fails() {
             Err(LsbxError::BackendUnavailable("control plane unreachable".to_string()))
         }
 
-        async fn run(&self, _vm_tag: &str, _command: &[String], _timeout: Duration) -> Result<CommandOutput, LsbxError> {
+        async fn run(&self, _vm_tag: &str, _command: &[String], _timeout: Duration, _identity_file: Option<&std::path::Path>) -> Result<CommandOutput, LsbxError> {
             Err(LsbxError::NotFound("no such vm".to_string()))
         }
 
-        async fn put_file(&self, _vm_tag: &str, _source: &std::path::Path, _destination: &str) -> Result<(), LsbxError> {
+        async fn put_file(&self, _vm_tag: &str, _source: &std::path::Path, _destination: &str, _identity_file: Option<&std::path::Path>) -> Result<(), LsbxError> {
             Err(LsbxError::BackendUnavailable("control plane unreachable".to_string()))
         }
 
-        async fn get_file(&self, _vm_tag: &str, _source: &str, _destination: &std::path::Path) -> Result<(), LsbxError> {
+        async fn get_file(&self, _vm_tag: &str, _source: &str, _destination: &std::path::Path, _identity_file: Option<&std::path::Path>) -> Result<(), LsbxError> {
             Err(LsbxError::BackendUnavailable("control plane unreachable".to_string()))
         }
 

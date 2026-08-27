@@ -1,0 +1,101 @@
+{
+  "images": [
+    {
+      "key": "win11",
+      "os": "windows",
+      "arch": "x86_64",
+      "iso_path": "/home/carnyx/ISOs/Win11_25H2_English_x64_v2.iso",
+      "description": "Windows 11 installer (local-only: libvirt/KVM)"
+    },
+    {
+      "key": "ubuntu-2404",
+      "os": "linux",
+      "arch": "x86_64",
+      "iso_path": "/home/carnyx/ISOs/ubuntu-24.04.4-desktop-amd64.iso",
+      "description": "Ubuntu 24.04 desktop ISO"
+    }
+  ],
+  "goldens": [
+    {
+      "key": "agent-base",
+      "flavor": "agent",
+      "os": "linux",
+      "base": "lsbx-agent-v1",
+      "mode": "copy",
+      "cpu": 2,
+      "memory": "4GB",
+      "streaming": "none",
+      "capabilities": [
+        "web-search"
+      ],
+      "healthcheck": [
+        "git --version",
+        "python3 --version",
+        "curl --version",
+        "test -x /usr/local/bin/web-search"
+      ],
+      "description": "Lean agent golden with an explicit DuckDuckGo HTML web-search CLI (carnyx)"
+    },
+    {
+      "key": "ci-runner",
+      "flavor": "ci-runner",
+      "os": "linux",
+      "base": "lsbx-ci-v1",
+      "mode": "copy",
+      "cpu": 4,
+      "memory": "8GB",
+      "streaming": "none",
+      "healthcheck": [
+        "python3 --version",
+        "python3 -m venv /tmp/lsbx-venv-check",
+        "/tmp/lsbx-venv-check/bin/python --version",
+        "rm -rf /tmp/lsbx-venv-check",
+        "node --version",
+        "docker --version",
+        "cc --version",
+        "pkg-config --version",
+        "test -x /opt/lufs-runner/lufs-runner.sh",
+        "docker image inspect myoung34/github-runner:ubuntu-noble"
+      ],
+      "description": "carnyx CI runner VM golden with Docker, lufs-runner, build-essential, and python3-venv"
+    },
+    {
+      "key": "agent-web",
+      "flavor": "desktop",
+      "os": "linux",
+      "base": "lsbx-web-v1",
+      "mode": "copy",
+      "cpu": 2,
+      "memory": "4GB",
+      "streaming": "novnc",
+      "capabilities": [
+        "desktop",
+        "computer-use"
+      ],
+      "healthcheck": [
+        "sudo systemctl start lsbx-desktop.service",
+        "systemctl is-active --quiet lsbx-desktop.service",
+        "curl -fsS --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8000/vnc.html >/dev/null"
+      ],
+      "description": "Shared desktop/operator golden for browser and computer-use agents (carnyx)"
+    }
+  ],
+  "profiles": {
+    "default": {
+      "golden": "agent-base"
+    },
+    "desktop": {
+      "golden": "agent-web"
+    },
+    "web": {
+      "golden": "agent-web"
+    },
+    "ci": {
+      "golden": "ci-runner"
+    },
+    "win11": {
+      "iso": "win11",
+      "flavor": "desktop"
+    }
+  }
+}

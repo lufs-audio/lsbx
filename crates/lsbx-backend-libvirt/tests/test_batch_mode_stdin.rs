@@ -17,6 +17,14 @@
 
 use lsbx_backend_libvirt::guest_ssh::{run_command, GuestSshTarget};
 use std::path::Path;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+
+static PATH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn path_lock() -> &'static Mutex<()> {
+    PATH_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Writes a fake `ssh` script into a fresh temp directory and prepends
 /// that directory to `PATH` for the duration of the returned guard's life.
@@ -68,8 +76,9 @@ impl Drop for FakeSshOnPath {
 /// and reports isolation.
 #[tokio::test]
 async fn run_command_never_inherits_the_calling_processs_stdin() {
+    let _path_guard = path_lock().lock().await;
     let _guard = FakeSshOnPath::install(
-        "#!/bin/sh\nif read -t 0.2 _line; then\n  echo \"stdin was NOT at EOF\" >&2\n  exit 1\nelse\n  echo \"stdin-isolated\"\n  exit 0\nfi\n",
+        "#!/usr/bin/env bash\nif read -t 0.2 _line; then\n  echo \"stdin was NOT at EOF\" >&2\n  exit 1\nelse\n  echo \"stdin-isolated\"\n  exit 0\nfi\n",
     );
 
     let target = GuestSshTarget {
@@ -103,8 +112,9 @@ async fn run_command_never_inherits_the_calling_processs_stdin() {
 /// data pending.
 #[tokio::test]
 async fn negative_control_fake_ssh_detects_a_live_stdin_when_actually_given_one() {
+    let _path_guard = path_lock().lock().await;
     let _guard = FakeSshOnPath::install(
-        "#!/bin/sh\nif read -t 0.2 _line; then\n  echo \"stdin was NOT at EOF\" >&2\n  exit 1\nelse\n  echo \"stdin-isolated\"\n  exit 0\nfi\n",
+        "#!/usr/bin/env bash\nif read -t 0.2 _line; then\n  echo \"stdin was NOT at EOF\" >&2\n  exit 1\nelse\n  echo \"stdin-isolated\"\n  exit 0\nfi\n",
     );
 
     use std::process::Stdio;

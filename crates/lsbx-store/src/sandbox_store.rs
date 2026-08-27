@@ -46,6 +46,13 @@ impl SandboxStore {
         Self { state_dir }
     }
 
+    /// Shared state root used for sandbox records and persistent ephemeral
+    /// key material. Callers use this instead of reconstructing paths from
+    /// configuration so systemd `PrivateTmp` namespaces cannot orphan keys.
+    pub fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
+    }
+
     fn store_dir(&self) -> PathBuf {
         self.state_dir.join("state")
     }
@@ -61,7 +68,8 @@ impl SandboxStore {
             .map_err(|e| map_io_err("failed to stat state dir", e))?
             .permissions();
         perms.set_mode(0o700);
-        fs::set_permissions(&store_dir, perms).map_err(|e| map_io_err("failed to chmod state dir", e))?;
+        fs::set_permissions(&store_dir, perms)
+            .map_err(|e| map_io_err("failed to chmod state dir", e))?;
 
         let dest_path = store_dir.join(format!("{}.json", record.id));
         let mut temp_file = NamedTempFile::new_in(&store_dir)
@@ -86,15 +94,16 @@ impl SandboxStore {
             .set_permissions(perms)
             .map_err(|e| map_io_err("failed to chmod temp file", e))?;
 
-        temp_file
-            .persist(&dest_path)
-            .map_err(|e| LsbxError::ContractViolated(format!("failed to atomically rename into place: {}", e)))?;
+        temp_file.persist(&dest_path).map_err(|e| {
+            LsbxError::ContractViolated(format!("failed to atomically rename into place: {}", e))
+        })?;
         Ok(())
     }
 
     pub fn load(&self, id: &str) -> Result<SandboxRecord, LsbxError> {
         let dest_path = self.record_path(id);
-        let file = fs::File::open(&dest_path).map_err(|e| map_io_err(&format!("failed to open sandbox record {}", id), e))?;
+        let file = fs::File::open(&dest_path)
+            .map_err(|e| map_io_err(&format!("failed to open sandbox record {}", id), e))?;
 
         let value: serde_json::Value = serde_json::from_reader(file)
             .map_err(|e| map_json_err("failed to parse sandbox record json", e))?;
@@ -118,7 +127,10 @@ impl SandboxStore {
         match fs::remove_file(&dest_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(map_io_err(&format!("failed to delete sandbox record {}", id), e)),
+            Err(e) => Err(map_io_err(
+                &format!("failed to delete sandbox record {}", id),
+                e,
+            )),
         }
     }
 
@@ -129,7 +141,9 @@ impl SandboxStore {
         }
 
         let mut records = Vec::new();
-        for entry in fs::read_dir(&store_dir).map_err(|e| map_io_err("failed to read state dir", e))? {
+        for entry in
+            fs::read_dir(&store_dir).map_err(|e| map_io_err("failed to read state dir", e))?
+        {
             let entry = entry.map_err(|e| map_io_err("failed to read state dir entry", e))?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {

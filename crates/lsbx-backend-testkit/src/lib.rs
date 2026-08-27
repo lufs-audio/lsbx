@@ -163,9 +163,12 @@ pub async fn run_conformance_suite<B: Backend>(
     let req = CreateFromGoldenRequest {
         golden: golden_ref,
         name: "lsbx-conformance-test-vm",
-        pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIConformanceTestKeyPlaceholder conformance@lsbx",
+        pubkey:
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFcFi7kjVO1u+zN87aUSxqktiGksMgqfNe/o5ICyMeSi conformance@lsbx",
         cpu: 1,
-        memory: "512M",
+        // exe.dev rejects values below 2 GiB; 2G remains valid for the
+        // demo and libvirt backends while keeping the shared suite portable.
+        memory: "2G",
     };
 
     let create_result = bounded(backend.create_from_golden(req)).await;
@@ -211,6 +214,7 @@ pub async fn run_conformance_suite<B: Backend>(
         &vm_tag,
         &["echo".to_string(), "lsbx-conformance-check".to_string()],
         Duration::from_secs(10),
+        None,
     ))
     .await;
     record_result(&mut checks, "run_on_live_vm_succeeds", &run_result);
@@ -248,6 +252,7 @@ pub async fn run_conformance_suite<B: Backend>(
         &vm_tag,
         &["echo".to_string(), "should-not-run".to_string()],
         Duration::from_secs(5),
+        None,
     ))
     .await;
     let run_after_destroy_ok = matches!(
@@ -286,6 +291,7 @@ async fn run_never_created_checks<B: Backend>(backend: &B, checks: &mut Vec<Conf
         "lsbx-conformance-never-created-vm",
         &["echo".to_string(), "should-not-run".to_string()],
         Duration::from_secs(5),
+        None,
     ))
     .await;
     let run_nonexistent_ok = matches!(

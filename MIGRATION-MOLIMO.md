@@ -30,6 +30,24 @@ You are replacing both with services from `lufs-audio/lsbx` (Rust):
 
 ---
 
+## 1.5 Changes from the Carnyx migration to incorporate (cite: shared `lsbx` codebase through PR #29, 2026-08-25/26)
+
+The Carnyx migration changed **shared** `lsbx` behavior. You get the code automatically by building the same branch, but it changes how you **configure** your units. Read this before §5–§9, and note which changes are automatic-in-code vs. host-specific:
+
+**Code changes you get for free (correct-and-shared; do not remove):**
+- **GitHub auth is two co-equal methods, not "primary + fallback."** `lsbx ci-broker run` selects by env only: App if both `LSBX_GITHUB_APP_ID` and `LSBX_GITHUB_APP_PRIVATE_KEY_PATH` are set; `gh` CLI otherwise. Molimo is App-based → unchanged, **but** there is now no "gh fallback as safety net"; a stale App path fails hard. Treat App misconfig as a hard stop (consistent with §7.4).
+- **Repo discovery is auth-aware.** `installation_repositories()` is App-installation-only (`gh` user gets `HTTP 403`). App mode (Molimo) still discovers from the installation; gh-CLI mode must set `LSBX_CI_REPOS` and never calls that endpoint.
+- **`resolve_images_path` honors `LSBX_IMAGES`.** The gateway/broker load their registry from `--images`, `LSBX_IMAGES_PATH`, `LSBX_IMAGES`, then `<state-dir>/images.json`. Keep `--images`/`LSBX_IMAGES` set to your `images.json` — an unset one silently empties the registry and breaks golden resolution (the `ci.qcow2`-missing bug Carnyx hit on dispatch).
+
+### Configuration changes to mirror on Molimo
+- **Serve reap TTL → `3h`** (was `3600h`). Carnyx chose a bounded 3-hour sweep; keep Molino's serve unit comparable (see §7.3).
+- **`LSBX_CI_REPOS`** only needed if you want the gh-CLI path to work; App mode doesn't need it.
+
+### Do NOT copy Carnyx-specific artifacts
+`images.carnyx.json` (Molino uses `images.json`); all `lsbx-backend-libvirt` fixes (cloud-init seed ISO, guest-IP caching, `UserKnownHostsFile=/dev/null`, `shell_quote` for `sh -c`, orphan create-rollback — irrelevant to the exedev backend); the `GH_TOKEN`-in-keyring workaround (App-based Molino doesn't need it). Leave those shared fixes in the code — build them, don't remove them.
+
+---
+
 ## 2. Architecture comparison
 
 | Aspect | Old (Python, currently running) | New (Rust, `lsbx`) |
@@ -45,7 +63,7 @@ You are replacing both with services from `lufs-audio/lsbx` (Rust):
 | GitHub auth (CI broker) | GitHub App JWT auth, **unconditionally live** (`GITHUB_APP_ID=4377007` uncommitted/active in the real env file) — Molimo has no working `gh` CLI fallback (its `gh auth` session was reported invalid at last audit) | same GitHub App (`LSBX_GITHUB_APP_ID`/`LSBX_GITHUB_APP_PRIVATE_KEY_PATH`/`LSBX_GITHUB_APP_OWNER`) — **this path is not optional for Molimo the way it is for Carnyx; confirm `gh auth status` before assuming a fallback exists as a safety net** |
 | Process supervision | systemd, `Restart=on-failure` | same. `--daemon` on the new `lsbx serve` does not fork/background — systemd remains solely responsible, identical to today |
 | Reaper | separate `--reap-interval`/`--reap-ttl` flags | internal background task, interval derived from `reap_ttl`, no separate flag |
-| `EXE_TOKEN` handling | Old gateway unit explicitly `UnsetEnvironment=EXE_TOKEN` to force the SSH control-plane path rather than risk an expired token blocking cloud provisioning | **verify whether the new `lsbx-backend-exedev` crate has an equivalent fallback-preference concept; if it always prefers `EXE_TOKEN` when present with no override, and your token is stale, this is a real functional regression risk specific to this host — check `crates/lsbx-backend-exedev`'s real source for a `fallback_ssh_key_path`/equivalent option before cutover, don't assume the old unit's workaround has a new-system equivalent by default** |
+| `EXE_TOKEN` handling | Old gateway unit explicitly `UnsetEnvironment=EXE_TOKEN` to force the SSH control-plane path rather than risk an expired token blocking cloud provisioning | `build_exedev()` selects `EXE_TOKEN` only when present; otherwise it uses the configured `LSBX_EXEDEV_SSH_ALIAS` (default `exe.dev`). Molimo's serve unit keeps `UnsetEnvironment=EXE_TOKEN`, preserving the SSH-alias path. |
 
 ---
 
@@ -72,9 +90,9 @@ Same guidance as the Carnyx document: decide and document whether to wait for na
 ### 3.3 Baseline verification-suite health check
 
 ```bash
-TOKEN=$(grep -oP '(?<=GATEWAY_TOKEN=).*' /home/exedev/repos/lufs-sandbox-server/.env 2>/dev/null || echo "")
+TOKEN=$(grep -oP '(?<=LUFSS_GATEWAY_TOKEN=).*' /home/exedev/repos/lufs-sandbox-server/.env 2>/dev/null || echo "")
 curl -sf -H "Authorization: Bearer $TOKEN" http://100.122.170.73:8244/health
-curl -sf https://molimo.exe.xyz:8243/health   # the public Caddy-proxied path — separate from the Carnyx-proxying ports 8246/8247, this one fronts Molimo's OWN gateway
+curl -sf http://molimo.exe.xyz:8243/health   # this host's Caddy listener is intentionally plain HTTP
 ```
 
 Record both as your **before** baseline.
@@ -246,7 +264,8 @@ User=exedev
 Group=exedev
 WorkingDirectory=/home/exedev/repos/lsbx
 EnvironmentFile=/home/exedev/lsbx-state/serve.env
-ExecStart=/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 100.122.170.73 --port 8244 --reap-ttl 3600h
+UnsetEnvironment=EXE_TOKEN
+ExecStart=/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 100.122.170.73 --port 8244 --max-sandboxes 8 --reap-ttl 3h --insecure
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -257,9 +276,13 @@ EOF
 ```
 
 Notes:
+- **`--reap-ttl 3h` (changed from an earlier `3600h` draft)**: revised during Carnyx's cutover — a bounded 3-hour sweep is the deliberate default; `3600h` effectively disabled reaping. Keep a bounded value here unless Molino has a specific reason to differ; document whichever you choose.
+- **`resolve_images_path` now honors `LSBX_IMAGES` (Carnyx fix).** The gateway/broker fall back to `<state-dir>/images.json` if neither `--images` nor `LSBX_IMAGES`/`LSBX_IMAGES_PATH` is set — on Carnyx an unset `LSBX_IMAGES` produced an empty registry and a silent "golden missing"-style dispatch failure. This unit passes `--images` explicitly, so it's consistent either way; keep that `--images` (or set `LSBX_IMAGES`) rather than relying on the default path.
+- **GitHub auth is two co-equal methods (Carnyx fix).** `ci-broker run` selects App auth iff both `LSBX_GITHUB_APP_ID` and `LSBX_GITHUB_APP_PRIVATE_KEY_PATH` are set; gh-CLI otherwise. Molimo is App-based so nothing changes here, but there is now **no** "gh fallback as safety net" — confirm your App creds are live (§4.2/§7.4), because a stale App path fails hard.
+- **Repo discovery is auth-aware.** gh-CLI mode needs `LSBX_CI_REPOS` and never calls the App-only `/installation/repositories` (that 403 is what Carnyx hit and fixed). Molino's App mode still discovers from the installation — no `LSBX_CI_REPOS` needed.
 - Hardening directives (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`, `ReadWritePaths`) are carried forward from the **old** `lsbx-gateway-exedev.service` — Carnyx's old gateway unit didn't have these, but Molimo's did; preserve that asymmetry deliberately rather than "fixing" it to match Carnyx, unless you have a specific reason to change Molimo's security posture as part of this migration (you almost certainly don't — flag it if you think otherwise, don't just harmonize the two hosts silently).
 - `ReadWritePaths` must include wherever `--state-dir` actually points, or the gateway will fail to write sandbox records under the `ProtectSystem=full` sandboxing — this is exactly the kind of thing that passes a naive smoke test run interactively (outside systemd's sandboxing) and then fails only once actually started via `systemctl start`, so **test via `systemctl start`, not by running the binary by hand**, before declaring this unit correct.
-- The `EXE_TOKEN`-avoidance workaround from the old unit (`UnsetEnvironment=EXE_TOKEN`) is **not** carried forward automatically here — resolve the §2 open question about whether the new exedev backend has an equivalent preference/override before deciding whether you need something similar in this new unit's `[Service]` section.
+- **The old-unit `EXE_TOKEN` workaround remains deliberate.** `UnsetEnvironment=EXE_TOKEN` keeps the serve process on the configured Rust backend/auth path rather than allowing an inherited legacy token to change behavior; retain it in the systemd unit.
 - Create `serve.env` with a real bearer token, mode 0600, owner `exedev:exedev`, same pattern as Carnyx's doc §7.3.
 
 ```bash
@@ -293,7 +316,7 @@ Preserve the local-first/cloud-fallback asymmetry: Molimo keeps the **60-second*
 ## 8. Parallel verification — before touching the old services
 
 ```bash
-/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 127.0.0.1 --port 18244 --token test-token-do-not-use-in-prod &
+/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state serve --host 127.0.0.1 --port 18244 --max-sandboxes 8 --token test-token-do-not-use-in-prod --reap-ttl 3h --insecure &
 SERVE_PID=$!
 sleep 2
 curl -sf -H "Authorization: Bearer test-token-do-not-use-in-prod" http://127.0.0.1:18244/health
@@ -302,11 +325,11 @@ curl -sf -H "Authorization: Bearer test-token-do-not-use-in-prod" http://127.0.0
 Full functional round trip:
 
 ```bash
-/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state up agent-base --lease 10m
+SBX=$(/usr/local/bin/lsbx --json --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state up agent-base --lease 10m | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["id"])')
 # note $SBX
-/usr/local/bin/lsbx --backend exedev --state-dir /home/exedev/lsbx-state exec $SBX -- echo hello-from-new-lsbx
-/usr/local/bin/lsbx --backend exedev --state-dir /home/exedev/lsbx-state info $SBX --json
-/usr/local/bin/lsbx --backend exedev --state-dir /home/exedev/lsbx-state down $SBX
+/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state exec $SBX -- echo hello-from-new-lsbx
+/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state info $SBX --json
+/usr/local/bin/lsbx --backend exedev --images /home/exedev/repos/lsbx/images.json --state-dir /home/exedev/lsbx-state down $SBX
 kill $SERVE_PID
 ```
 
@@ -362,20 +385,34 @@ If either new service fails to start or crash-loops, execute the rollback in §1
 ## 11. Post-cutover verification suite
 
 ```bash
-curl -sf -H "Authorization: Bearer $LSBX_GATEWAY_TOKEN" http://100.122.170.73:8244/health
-curl -sf https://molimo.exe.xyz:8243/health   # Molimo's own public Caddy-fronted path
+TOKEN=$(sed -n 's/^LSBX_GATEWAY_TOKEN=//p' /home/exedev/lsbx-state/serve.env)
+curl -sf -H "Authorization: Bearer $TOKEN" http://100.122.170.73:8244/health
+curl -sf http://molimo.exe.xyz:8243/health   # Molimo's own public Caddy-fronted path; this listener is plain HTTP
 ```
 
 Full functional round trip via the live gateway's REST API (not just direct CLI):
 
 ```bash
-curl -sf -H "Authorization: Bearer $LSBX_GATEWAY_TOKEN" -X POST http://100.122.170.73:8244/sandboxes -d '{"profile":"default"}' -H 'Content-Type: application/json'
+TOKEN=$(sed -n 's/^LSBX_GATEWAY_TOKEN=//p' /home/exedev/lsbx-state/serve.env)
+CREATE=$(curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -X POST http://100.122.170.73:8244/sandboxes \
+  -d '{"profile":"default","verify":true,"lease_secs":600}')
+SBX=$(printf '%s' "$CREATE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["id"])')
+curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -X POST "http://100.122.170.73:8244/sandboxes/$SBX/exec" \
+  -d '{"command":["echo","molimo-rust-live"]}'
+curl -sf -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "http://100.122.170.73:8244/sandboxes/$SBX"
 ```
 
 CI broker smoke test against the real chaos-test workflow, Molimo placement:
 
 ```bash
-gh workflow run ci-broker-failure-test.yml -f placement=lsbx-molimo --repo lufs-audio/lufs-sandbox-server
+# The legacy chaos workflow currently has no `placement` input; `-f placement=...`
+# is ignored and the workflow schedules both hosts. Do not dispatch it blindly.
+# Use a dedicated, placement-scoped workflow (or obtain explicit maintenance
+# approval before using the legacy workflow) and verify the run/job lifecycle
+# and final Molimo inventory as described below.
 ```
 
 Confirm a sandbox is created within `LSBX_CI_POLL_INTERVAL` seconds, a runner registers, picks up the intentionally-failing job, and the sandbox is torn down cleanly afterward.
@@ -383,7 +420,7 @@ Confirm a sandbox is created within `LSBX_CI_POLL_INTERVAL` seconds, a runner re
 **Also explicitly re-verify Carnyx's proxied reachability is unaffected**, since you didn't touch Carnyx but your host fronts its public exposure:
 
 ```bash
-curl -i https://molimo.exe.xyz:8246/health   # Carnyx's gateway, proxied through YOUR Caddy — should be completely unaffected by anything you did on Molimo today, confirm it actually is
+curl -i http://molimo.exe.xyz:8246/health   # Carnyx's gateway, proxied through YOUR Caddy
 ```
 
 If this last check fails, the regression is almost certainly unrelated to anything in this document (you didn't touch Caddy config) — but confirm that before ruling it out, since a coincidental network blip during your own maintenance window is exactly the kind of thing that gets wrongly blamed on or wrongly cleared of an unrelated change if you don't check explicitly.
@@ -434,3 +471,54 @@ Same minimum-one-week soak recommendation as the Carnyx document, including a re
 - **Keep for at least 30 days**, then re-evaluate: the old `/home/exedev/repos/lufs-sandbox-server` checkout, the old `/home/exedev/.lufs-sandbox/state` directory.
 - **May disable (not delete) once stable**: the old unit files.
 - **Never touch**: `lufs-runner@*.service` or anything under its own separate config — out of scope for this entire migration, start to finish (§1).
+## 15. Final cutover addendum — 2026-08-27
+
+The Rust gateway and CI broker are now the enabled production services on
+Molimo. The active units are `lsbx-serve.service` and
+`lsbx-ci-broker-exe.service`; the legacy Python units remain installed but are
+disabled for rollback. The Rust gateway preserves the old eight-sandbox cap via
+`--max-sandboxes 8`, and the stream sub-router's non-public routes are covered
+by the gateway auth middleware.
+
+The runner provisioner must invoke guest shell commands as `sh -c <command>`.
+Passing a complete shell command as one argv element causes exe.dev's shell to
+look for an executable containing spaces, which was found and fixed during the
+first live broker rehearsal. Cleanup treats an already-gone VM as successful,
+so a broker restart cannot strand a cleaning record after backend deletion.
+
+The current `lufs-sandbox-server` chaos workflow has no `placement` dispatch
+input and schedules both Carnyx and Molimo jobs. Do not use
+`-f placement=lsbx-molimo` with that workflow; use a placement-scoped workflow
+or an explicitly approved maintenance run instead.
+
+The latest repository CI run (`33105660060`, commit `319d229`) passed on
+GitHub-hosted infrastructure after installing the native `libvirt-dev` and
+`pkg-config` dependencies required to link the workspace's libvirt crate.
+
+The Molimo App credentials are shared with the existing `lufs-runner` fleet,
+but the Rust service does not need `gh` and must not read the root-only PEM
+directly:
+
+- `/etc/lufs-runner/runner.env` is `root:root`, mode `0600`, with App ID
+  `4377007`, organization scope, owner/org `lufs-audio`, runner group `exe`,
+  and two slots.
+- `/etc/lufs-runner/app-private-key.pem` is `root:root`, mode `0600`.
+- The PEM is byte-identical to the existing exedev-readable copy at
+  `/home/exedev/.lufs-sandbox/lufs-audio-ci-app.pem`, which the Rust broker
+  references as `LSBX_GITHUB_APP_PRIVATE_KEY_PATH`.
+- `APP_INSTALLATION_ID` is intentionally blank; both systems discover the
+  installation automatically.
+- `sudo /usr/local/bin/lufs-runner.sh check` confirmed the App can mint a
+  short-lived runner registration token without changing runner services.
+
+Do not change the `/etc/lufs-runner` PEM permissions merely to make it readable
+by the `User=exedev` Rust service; retain the existing exedev-owned copy and
+its 0600 permissions.
+
+The organization `exe` runner group currently disallows public repositories,
+while `lufs-audio/lsbx` is public. Therefore this repository's own project CI
+runs on GitHub-hosted infrastructure; Molimo's self-hosted broker is exercised
+by private repository jobs and its lifecycle is verified by the maintenance
+rehearsal. The broker's host environment explicitly polls the ten private
+installation repositories served by this placement and excludes public
+`lufs-audio/lsbx`; the `exe` group policy was not broadened.

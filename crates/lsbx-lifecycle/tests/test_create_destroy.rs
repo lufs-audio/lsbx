@@ -22,6 +22,11 @@ fn fixed_clock() -> FakeClock {
 fn default_request() -> CreateRequest<'static> {
     CreateRequest {
         profile: "demo-profile",
+        golden: None,
+        cpu: None,
+        memory: None,
+        flavor: None,
+        streaming: None,
         name: Some("test-sandbox"),
         task_id: Some("task-42"),
         lease: Duration::from_secs(3600),

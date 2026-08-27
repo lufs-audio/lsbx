@@ -94,6 +94,11 @@ fn non_interactive_create_request<'a>(
 ) -> lsbx_lifecycle::create::CreateRequest<'a> {
     lsbx_lifecycle::create::CreateRequest {
         profile,
+        golden: None,
+        cpu: None,
+        memory: None,
+        flavor: None,
+        streaming: None,
         name: None,
         task_id: None,
         lease,
@@ -141,7 +146,8 @@ async fn wizard_answers_produce_identical_lsbxops_create_result_to_non_interacti
     // instance (same FakeClock instant, so any clock-derived fields that
     // *should* match, do), receiving a request built the non-interactive
     // way.
-    let non_interactive_req = non_interactive_create_request("lsbx-default-v1", Duration::from_secs(3600 * 4));
+    let non_interactive_req =
+        non_interactive_create_request("lsbx-default-v1", Duration::from_secs(3600 * 4));
     let (ops_b, _dir_b) = build_ops(now);
     let result_b = ops_b
         .create(non_interactive_req)
@@ -162,10 +168,16 @@ async fn wizard_answers_produce_identical_lsbxops_create_result_to_non_interacti
     // divergence check) rather than mistakenly asserting equality for
     // fields that are only equal when an explicit `name` override makes
     // them independent of the random id — which neither call here used.
-    assert_eq!(result_a.profile, result_b.profile, "profile must match exactly");
+    assert_eq!(
+        result_a.profile, result_b.profile,
+        "profile must match exactly"
+    );
     assert_eq!(result_a.flavor, result_b.flavor);
     assert_eq!(result_a.streaming, result_b.streaming);
-    assert_eq!(result_a.task_id, result_b.task_id, "task_id must match (both None)");
+    assert_eq!(
+        result_a.task_id, result_b.task_id,
+        "task_id must match (both None)"
+    );
     assert_eq!(
         result_a.created_at, result_b.created_at,
         "created_at must match — both calls used the identical FakeClock instant"
@@ -182,7 +194,10 @@ async fn wizard_answers_produce_identical_lsbxops_create_result_to_non_interacti
     // `https_url`, so both must be `Some(...)`, though the *exact* URL
     // string embeds the per-call-random `host`, so only the `is_some()`
     // shape is asserted equal, not the literal string.
-    assert_eq!(result_a.console_url.is_some(), result_b.console_url.is_some());
+    assert_eq!(
+        result_a.console_url.is_some(),
+        result_b.console_url.is_some()
+    );
 
     // `id` is the one field genuinely expected to differ: `uuid_like_id`
     // mixes in a random u32 suffix specifically so two sandboxes created
@@ -216,7 +231,10 @@ async fn wizard_answers_produce_identical_lsbxops_create_result_to_non_interacti
     assert!(result_a.id.starts_with("sbx-"));
     assert!(result_b.id.starts_with("sbx-"));
     assert_eq!(result_a.name, result_a.id, "with name: None, PublicSandbox.name must equal the generated id — the real default create() applies");
-    assert_eq!(result_b.name, result_b.id, "same default applies on the non-interactive path");
+    assert_eq!(
+        result_b.name, result_b.id,
+        "same default applies on the non-interactive path"
+    );
 }
 
 /// Companion negative control: if the wizard's answers are mapped to a
@@ -237,9 +255,13 @@ async fn mismatched_profile_produces_a_genuinely_different_result() {
     };
     let wizard_req = answers_to_create_request(&answers);
     let (ops_a, _dir_a) = build_ops(now);
-    let result_a = ops_a.create(wizard_req).await.expect("create should succeed");
+    let result_a = ops_a
+        .create(wizard_req)
+        .await
+        .expect("create should succeed");
 
-    let non_interactive_req = non_interactive_create_request("a-completely-different-profile", Duration::from_secs(3600));
+    let non_interactive_req =
+        non_interactive_create_request("a-completely-different-profile", Duration::from_secs(3600));
     let (ops_b, _dir_b) = build_ops(now);
     let result_b = ops_b
         .create(non_interactive_req)

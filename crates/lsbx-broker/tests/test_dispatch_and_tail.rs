@@ -38,7 +38,9 @@ use lsbx_broker::github_client::GitHubClient;
 use lsbx_broker::poll::QueuedJob;
 use lsbx_broker::reconcile::{Reconciler, RUNNER_LOG_PATH};
 use lsbx_golden::registry::ImageRegistry;
-use lsbx_kernel::backend::{Backend, BackendCapabilities, CommandOutput, CreateFromGoldenRequest, CreatedVm};
+use lsbx_kernel::backend::{
+    Backend, BackendCapabilities, CommandOutput, CreateFromGoldenRequest, CreatedVm,
+};
 use lsbx_kernel::clock::SystemClock;
 use lsbx_kernel::error::LsbxError;
 use lsbx_ops::LsbxOps;
@@ -87,11 +89,20 @@ impl Backend for LogInjectingBackend {
         self.inner.capabilities()
     }
 
-    async fn create_from_golden(&self, req: CreateFromGoldenRequest<'_>) -> Result<CreatedVm, LsbxError> {
+    async fn create_from_golden(
+        &self,
+        req: CreateFromGoldenRequest<'_>,
+    ) -> Result<CreatedVm, LsbxError> {
         self.inner.create_from_golden(req).await
     }
 
-    async fn run(&self, vm_tag: &str, command: &[String], timeout: Duration) -> Result<CommandOutput, LsbxError> {
+    async fn run(
+        &self,
+        vm_tag: &str,
+        command: &[String],
+        timeout: Duration,
+        identity_file: Option<&std::path::Path>,
+    ) -> Result<CommandOutput, LsbxError> {
         if command == ["cat".to_string(), RUNNER_LOG_PATH.to_string()] {
             #[allow(clippy::unwrap_used)]
             let content = self.log_content.lock().unwrap().clone();
@@ -101,15 +112,33 @@ impl Backend for LogInjectingBackend {
                 stderr: vec![],
             });
         }
-        self.inner.run(vm_tag, command, timeout).await
+        self.inner
+            .run(vm_tag, command, timeout, identity_file)
+            .await
     }
 
-    async fn put_file(&self, vm_tag: &str, source: &std::path::Path, destination: &str) -> Result<(), LsbxError> {
-        self.inner.put_file(vm_tag, source, destination).await
+    async fn put_file(
+        &self,
+        vm_tag: &str,
+        source: &std::path::Path,
+        destination: &str,
+        identity_file: Option<&std::path::Path>,
+    ) -> Result<(), LsbxError> {
+        self.inner
+            .put_file(vm_tag, source, destination, identity_file)
+            .await
     }
 
-    async fn get_file(&self, vm_tag: &str, source: &str, destination: &std::path::Path) -> Result<(), LsbxError> {
-        self.inner.get_file(vm_tag, source, destination).await
+    async fn get_file(
+        &self,
+        vm_tag: &str,
+        source: &str,
+        destination: &std::path::Path,
+        identity_file: Option<&std::path::Path>,
+    ) -> Result<(), LsbxError> {
+        self.inner
+            .get_file(vm_tag, source, destination, identity_file)
+            .await
     }
 
     async fn destroy(&self, vm_tag: &str) -> Result<(), LsbxError> {
@@ -130,6 +159,7 @@ fn sample_job() -> QueuedJob {
         job_id: 424242,
         run_id: 999,
         repository: "lufs-audio/lsbx".to_string(),
+        name: None,
         labels: vec!["lsbx-default".to_string()],
         created_at: Some(chrono::Utc::now().to_rfc3339()),
     }
@@ -222,13 +252,19 @@ async fn tail_and_update_advances_phase_and_runner_name_from_lifecycle_markers()
         .await
         .expect("tail_and_update should succeed");
 
-    assert_eq!(record.runner_name, Some("lsbx-ci-runner-abc123".to_string()));
+    assert_eq!(
+        record.runner_name,
+        Some("lsbx-ci-runner-abc123".to_string())
+    );
     assert_eq!(record.phase, "listening");
 
     // Persisted after this meaningful transition — not only at the very end.
     let reloaded = job_store_for_reconciler.load(&record.job_id).expect("load");
     assert_eq!(reloaded.phase, "listening");
-    assert_eq!(reloaded.runner_name, Some("lsbx-ci-runner-abc123".to_string()));
+    assert_eq!(
+        reloaded.runner_name,
+        Some("lsbx-ci-runner-abc123".to_string())
+    );
 
     // Advance further: the runner picks up and completes a job.
     backend.set_log(

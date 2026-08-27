@@ -54,8 +54,11 @@ async fn golden_build_end_to_end_against_real_demo_backend() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script_path = dir.path().join("provision.sh");
-    std::fs::write(&script_path, "#!/bin/sh\napt-get install -y openssh-server\n")
-        .expect("write provisioning script");
+    std::fs::write(
+        &script_path,
+        "#!/bin/sh\napt-get install -y openssh-server\n",
+    )
+    .expect("write provisioning script");
 
     let flattened_path = dir.path().join("agent-base.qcow2");
     std::fs::write(&flattened_path, b"pretend flattened golden qcow2 bytes")
@@ -67,6 +70,7 @@ async fn golden_build_end_to_end_against_real_demo_backend() {
     let outcome = golden_build(
         &backend,
         GoldenBuildRequest {
+            key_path: None,
             name: "agent-base",
             from: "lsbx-default-v1",
             script: &script_path,
@@ -122,6 +126,7 @@ async fn golden_build_with_cleanup_false_leaves_a_real_demo_vm_alive() {
     let outcome = golden_build(
         &backend,
         GoldenBuildRequest {
+            key_path: None,
             name: "agent-base",
             from: "lsbx-default-v1",
             script: &script_path,
@@ -139,7 +144,9 @@ async fn golden_build_with_cleanup_false_leaves_a_real_demo_vm_alive() {
     .await
     .expect("golden_build should succeed");
 
-    let build_vm_tag = outcome.build_vm_tag.expect("cleanup=false should return the build VM tag");
+    let build_vm_tag = outcome
+        .build_vm_tag
+        .expect("cleanup=false should return the build VM tag");
     let remaining_vms = backend.list_vms().await.expect("list_vms should succeed");
     assert_eq!(remaining_vms, vec![build_vm_tag]);
 }
@@ -154,6 +161,7 @@ async fn golden_build_dry_run_never_calls_the_real_backend() {
     let outcome = golden_build(
         &backend,
         GoldenBuildRequest {
+            key_path: None,
             name: "agent-base",
             from: "lsbx-default-v1",
             script: &script_path,

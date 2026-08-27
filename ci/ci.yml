@@ -8,12 +8,13 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, "${{ vars.LSBX_CI_PLACEMENT || 'lufs' }}"]
-    # Cutover note: once lsbx's own broker is deployed and verified serving
-    # the `lsbx-default` label, set the repo variable LSBX_CI_PLACEMENT to
-    # "lsbx-default". No workflow file change required — see SPEC.md Deviation 15.
+    # The public lsbx repository cannot use Molimo's private-only `exe`
+    # runner group; project CI runs on GitHub-hosted infrastructure.
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Install native dependencies
+      run: sudo apt-get update && sudo apt-get install -y libvirt-dev pkg-config
     - name: cargo check
       run: cargo check --workspace --message-format=json
     - name: cargo clippy

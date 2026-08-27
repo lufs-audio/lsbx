@@ -24,9 +24,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use lsbx_backend_demo::{DemoBackend, FaultMode};
-use lsbx_golden::registry::{
-    GoldenConfig, GoldenFlavor, GoldenMode, ImageRegistry, StreamingMode,
-};
+use lsbx_golden::registry::{GoldenConfig, GoldenFlavor, GoldenMode, ImageRegistry, StreamingMode};
 use lsbx_kernel::clock::FakeClock;
 use lsbx_kernel::error::LsbxError;
 use lsbx_ops::LsbxOps;
@@ -104,9 +102,17 @@ fn sample_golden_config(key: &str) -> GoldenConfig {
     }
 }
 
-fn create_request<'a>(profile: &'a str, name: &'a str) -> lsbx_lifecycle::create::CreateRequest<'a> {
+fn create_request<'a>(
+    profile: &'a str,
+    name: &'a str,
+) -> lsbx_lifecycle::create::CreateRequest<'a> {
     lsbx_lifecycle::create::CreateRequest {
         profile,
+        golden: None,
+        cpu: None,
+        memory: None,
+        flavor: None,
+        streaming: None,
         name: Some(name),
         task_id: None,
         lease: Duration::from_secs(3600),
@@ -149,7 +155,9 @@ async fn destroy_valid_id_succeeds() {
         .create(create_request("lsbx-default-v1", "to-destroy"))
         .await
         .expect("create");
-    ops.destroy(&sandbox.id).await.expect("destroy should succeed");
+    ops.destroy(&sandbox.id)
+        .await
+        .expect("destroy should succeed");
     // Confirm it's actually gone from the store.
     let info_result = ops.info(&sandbox.id).await;
     assert!(matches!(info_result, Err(LsbxError::NotFound(_))));
@@ -334,7 +342,9 @@ async fn renew_valid_id_extends_lease() {
 #[tokio::test]
 async fn renew_unknown_id_returns_not_found() {
     let (ops, _dir) = build_ops(SystemTime::now());
-    let result = ops.renew("sbx-does-not-exist", Duration::from_secs(3600)).await;
+    let result = ops
+        .renew("sbx-does-not-exist", Duration::from_secs(3600))
+        .await;
     assert!(matches!(result, Err(LsbxError::NotFound(_))));
 }
 
@@ -437,6 +447,7 @@ async fn golden_build_dry_run_succeeds() {
 
     let outcome = ops
         .golden_build(lsbx_golden::build::GoldenBuildRequest {
+            key_path: None,
             name: "agent-base",
             from: "lsbx-default-v1",
             script: &script,
@@ -467,6 +478,7 @@ async fn golden_build_non_dry_run_without_flattener_fails_honestly() {
     // silently faked success.
     let result = ops
         .golden_build(lsbx_golden::build::GoldenBuildRequest {
+            key_path: None,
             name: "agent-base",
             from: "lsbx-default-v1",
             script: &script,
@@ -493,7 +505,12 @@ async fn golden_verify_valid_registered_golden_succeeds() {
         .expect("register");
 
     let results = ops
-        .golden_verify("agent-base", "verify-agent-base", "ssh-ed25519 AAAA fake")
+        .golden_verify(
+            "agent-base",
+            "verify-agent-base",
+            "ssh-ed25519 AAAA fake",
+            None,
+        )
         .await
         .expect("golden_verify should succeed");
     // sample_golden_config has no declared healthchecks.
@@ -504,7 +521,7 @@ async fn golden_verify_valid_registered_golden_succeeds() {
 async fn golden_verify_unknown_name_returns_not_found() {
     let (ops, _dir) = build_ops(SystemTime::now());
     let result = ops
-        .golden_verify("does-not-exist", "verify-x", "ssh-ed25519 AAAA fake")
+        .golden_verify("does-not-exist", "verify-x", "ssh-ed25519 AAAA fake", None)
         .await;
     assert!(matches!(result, Err(LsbxError::NotFound(_))));
 }
@@ -530,7 +547,9 @@ async fn golden_register_duplicate_key_returns_usage() {
         .await
         .expect("first register should succeed");
 
-    let result = ops.golden_register(sample_golden_config("dup-golden")).await;
+    let result = ops
+        .golden_register(sample_golden_config("dup-golden"))
+        .await;
     assert!(matches!(result, Err(LsbxError::Usage(_))));
 }
 

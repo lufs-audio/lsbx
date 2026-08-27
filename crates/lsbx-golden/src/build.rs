@@ -137,9 +137,11 @@ pub struct GoldenBuildRequest<'a> {
     pub cleanup: bool,
     pub dry_run: bool,
     /// Public half of an ephemeral keypair to hand `Backend::create_from_golden`.
-    /// See the module doc comment for why this is here even though it isn't
-    /// in the unit contract's literal struct listing.
     pub pubkey: &'a str,
+    /// Private half corresponding to `pubkey`, when the caller has one.
+    /// Exedev uses it for upload/run and key revocation; other backends may
+    /// ignore it.
+    pub key_path: Option<&'a Path>,
 }
 
 /// Result of a non-dry-run build: the registered `GoldenConfig`, plus the
@@ -209,7 +211,7 @@ pub async fn golden_build(
     // From this point on, any early return must still respect `req.cleanup`
     // for the VM we just created — a helper keeps that from being
     // duplicated (or forgotten) at every fallible step below.
-    let result = run_build_steps(backend, &vm_tag, req.script, flattener).await;
+    let result = run_build_steps(backend, &vm_tag, req.script, req.key_path, flattener).await;
 
     if req.cleanup {
         // Best-effort teardown: a destroy failure here must not mask the
@@ -225,7 +227,11 @@ pub async fn golden_build(
         // into the returned error only when the build itself otherwise
         // succeeded (never overwrite a real build failure with a cleanup
         // failure).
-        let destroy_result = backend.destroy(&vm_tag).await;
+        let destroy_result = if req.key_path.is_some() {
+            backend.destroy_with_key(&vm_tag, req.pubkey).await
+        } else {
+            backend.destroy(&vm_tag).await
+        };
         if let Err(destroy_err) = destroy_result {
             if result.is_ok() {
                 return Err(LsbxError::ContractViolated(format!(
@@ -274,11 +280,12 @@ async fn run_build_steps(
     backend: &dyn Backend,
     vm_tag: &str,
     script: &Path,
+    key_path: Option<&Path>,
     flattener: Option<&dyn GoldenFlattener>,
 ) -> Result<String, LsbxError> {
     // Step 2: copy the provisioning script onto the build VM.
     backend
-        .put_file(vm_tag, script, REMOTE_SCRIPT_PATH)
+        .put_file(vm_tag, script, REMOTE_SCRIPT_PATH, key_path)
         .await?;
 
     // Step 3: actually execute it on the guest. `run`'s `Ok` only means the
@@ -290,6 +297,7 @@ async fn run_build_steps(
             vm_tag,
             &["sh".to_string(), REMOTE_SCRIPT_PATH.to_string()],
             BUILD_SCRIPT_TIMEOUT,
+            key_path,
         )
         .await?;
 
@@ -342,6 +350,7 @@ mod tests {
         let outcome = golden_build(
             &backend,
             GoldenBuildRequest {
+                key_path: None,
                 name: "agent-base",
                 from: "lsbx-default-v1",
                 script: &script,
@@ -375,6 +384,7 @@ mod tests {
         let result = golden_build(
             &backend,
             GoldenBuildRequest {
+                key_path: None,
                 name: "agent-base",
                 from: "lsbx-default-v1",
                 script: &script,
@@ -406,6 +416,7 @@ mod tests {
         let result = golden_build(
             &backend,
             GoldenBuildRequest {
+                key_path: None,
                 name: "Not Valid!",
                 from: "lsbx-default-v1",
                 script: &script,
@@ -452,6 +463,7 @@ mod tests {
         let outcome = golden_build(
             &backend,
             GoldenBuildRequest {
+                key_path: None,
                 name: "agent-base",
                 from: "lsbx-default-v1",
                 script: &script,
@@ -493,6 +505,7 @@ mod tests {
         let outcome = golden_build(
             &backend,
             GoldenBuildRequest {
+                key_path: None,
                 name: "agent-base",
                 from: "lsbx-default-v1",
                 script: &script,
@@ -526,6 +539,7 @@ mod tests {
         let result = golden_build(
             &backend,
             GoldenBuildRequest {
+                key_path: None,
                 name: "agent-base",
                 from: "lsbx-default-v1",
                 script: &script,

@@ -66,24 +66,6 @@ fn systemd_unit_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(SYSTEMD_UNIT_DIR))
 }
 
-/// Builds the `ExecStart` line for a given backend flag value. Uses an
-/// explicit `--backend=<value>` flag on every invocation rather than
-/// relying on one service's default plus an env-var override for the
-/// other — consistent with the real, already-shipped `lsbx-cli`'s actual
-/// `--backend` surface (`--backend <libvirt|exedev|demo|auto>`, a
-/// `BackendChoice` value enum on `Cli`, confirmed against
-/// `feature-unit-11-cli-surface-and-output-formatting`'s `cli.rs`, PR
-/// #17) — every invocation should look the same shape as every other
-/// `lsbx` invocation this system generates or documents, not stand out as
-/// the one case relying on an implicit default.
-///
-/// See this module's top-level doc comment: `ci-broker run` is not yet a
-/// real subcommand. This line is generated as intended/designed, not
-/// because it is known to work today.
-fn exec_start_line(backend: &str) -> String {
-    format!("/usr/local/bin/lsbx ci-broker run --backend={backend}")
-}
-
 /// Generates the systemd unit specs for both broker services.
 ///
 /// Names preserved exactly, per the unit contract and the existing
@@ -94,27 +76,62 @@ fn exec_start_line(backend: &str) -> String {
 /// file-path-construction time means a caller wanting the bare name for
 /// `systemctl` never has to strip one back off).
 pub fn generate_broker_units(config: &BootstrapConfig) -> Vec<SystemdUnitSpec> {
-    let _ = config; // no per-config variation today; kept for future flag-driven templating (e.g. a custom binary path) without an interface break.
-
     vec![
         SystemdUnitSpec {
             name: "lsbx-ci-broker",
             content: render_unit(
+                config,
                 "lsbx CI broker (Carnyx / local+remote libvirt backend)",
-                &exec_start_line("libvirt"),
+                "libvirt",
             ),
         },
         SystemdUnitSpec {
             name: "lsbx-ci-broker-exe",
-            content: render_unit(
-                "lsbx CI broker (Molimo / exedev backend)",
-                &exec_start_line("exedev"),
-            ),
+            content: render_unit(config, "lsbx CI broker (Molimo / exedev backend)", "exedev"),
         },
     ]
 }
 
-fn render_unit(description: &str, exec_start: &str) -> String {
+fn service_user(base: &std::path::Path) -> String {
+    if let Ok(user) = std::env::var("LSBX_SERVICE_USER") {
+        if !user.is_empty() {
+            return user;
+        }
+    }
+
+    let mut components = base.components();
+    if components.next().is_some()
+        && components.next().and_then(|c| c.as_os_str().to_str()) == Some("home")
+    {
+        if let Some(user) = components.next().and_then(|c| c.as_os_str().to_str()) {
+            return user.to_string();
+        }
+    }
+    std::env::var("USER").unwrap_or_else(|_| "lsbx".to_string())
+}
+
+fn render_unit(config: &BootstrapConfig, description: &str, backend: &str) -> String {
+    let base = state_base(config.target.as_deref());
+    let base_display = base.display().to_string();
+    let user = service_user(&base);
+    let home = format!("/home/{user}");
+    let working_directory = std::env::var("LSBX_WORKING_DIRECTORY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("{home}/repos/lsbx"));
+    let binary = std::env::var("LSBX_BIN")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/usr/local/bin/lsbx".to_string());
+    let images = std::env::var("LSBX_IMAGES_PATH")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("{working_directory}/images.json"));
+    let environment_file = std::env::var("LSBX_BROKER_ENV_FILE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| base.join("broker.env").display().to_string());
+
     format!(
         "[Unit]\n\
          Description={description}\n\
@@ -123,9 +140,20 @@ fn render_unit(description: &str, exec_start: &str) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={exec_start}\n\
+         User={user}\n\
+         Group={user}\n\
+         WorkingDirectory={working_directory}\n\
+         Environment=HOME={home}\n\
+         Environment=PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin\n\
+         Environment=LSBX_STATE_DIR={base_display}\n\
+         EnvironmentFile=-{environment_file}\n\
+         ExecStart={binary} --images={images} --state-dir={base_display} ci-broker run --backend={backend}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
+         NoNewPrivileges=true\n\
+         PrivateTmp=true\n\
+         ProtectSystem=full\n\
+         ReadWritePaths={base_display}\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n"
@@ -238,7 +266,10 @@ pub async fn bootstrap(config: BootstrapConfig) -> Result<BootstrapReport, LsbxE
     // --- 2. Host verification (unless --no-verify) ----------------------
     if config.verify {
         if config.dry_run {
-            actions_would_take.push("verify host capability (libvirt socket, qemu-img, state dir permissions)".to_string());
+            actions_would_take.push(
+                "verify host capability (libvirt socket, qemu-img, state dir permissions)"
+                    .to_string(),
+            );
         } else {
             // Reuse verify_host()'s own permission check rather than a
             // second, separately-implemented comparison — see this
@@ -276,7 +307,10 @@ pub async fn bootstrap(config: BootstrapConfig) -> Result<BootstrapReport, LsbxE
 
             match std::fs::read_to_string(&file_path) {
                 Ok(existing) if existing == unit.content => {
-                    actions_taken.push(format!("unit file already exists (unchanged): {}", file_path.display()));
+                    actions_taken.push(format!(
+                        "unit file already exists (unchanged): {}",
+                        file_path.display()
+                    ));
                 }
                 Ok(_) => {
                     write_unit_file(&file_path, &unit.content)?;
@@ -334,7 +368,10 @@ fn write_unit_file(path: &std::path::Path, content: &str) -> Result<(), LsbxErro
         })?;
     }
     std::fs::write(path, content).map_err(|err| {
-        LsbxError::ContractViolated(format!("failed to write unit file {}: {err}", path.display()))
+        LsbxError::ContractViolated(format!(
+            "failed to write unit file {}: {err}",
+            path.display()
+        ))
     })
 }
 
@@ -377,17 +414,43 @@ mod tests {
         let config = default_config(None);
         let units = generate_broker_units(&config);
         let carnyx = units.iter().find(|u| u.name == "lsbx-ci-broker").unwrap();
-        assert!(carnyx.content.contains("ExecStart=/usr/local/bin/lsbx ci-broker run --backend=libvirt"));
+        assert!(carnyx
+            .content
+            .contains("ExecStart=/usr/local/bin/lsbx --images="));
+        assert!(carnyx.content.contains("ci-broker run --backend=libvirt"));
+        assert!(carnyx.content.contains("User="));
+        assert!(carnyx.content.contains("WorkingDirectory="));
     }
 
     #[test]
-    fn molimo_unit_uses_explicit_exedev_backend_flag() {
-        let config = default_config(None);
-        let units = generate_broker_units(&config);
-        let molimo = units
-            .iter()
-            .find(|u| u.name == "lsbx-ci-broker-exe")
+    fn molimo_unit_uses_targeted_deployment_paths_and_hardening() {
+        let config = BootstrapConfig {
+            target: Some("/home/exedev/lsbx-state".to_string()),
+            install_services: true,
+            verify: false,
+            force: false,
+            dry_run: true,
+        };
+        let molimo = generate_broker_units(&config)
+            .into_iter()
+            .find(|unit| unit.name == "lsbx-ci-broker-exe")
             .unwrap();
-        assert!(molimo.content.contains("ExecStart=/usr/local/bin/lsbx ci-broker run --backend=exedev"));
+        assert!(molimo.content.contains("User=exedev"));
+        assert!(molimo
+            .content
+            .contains("WorkingDirectory=/home/exedev/repos/lsbx"));
+        assert!(molimo
+            .content
+            .contains("--images=/home/exedev/repos/lsbx/images.json"));
+        assert!(molimo
+            .content
+            .contains("--state-dir=/home/exedev/lsbx-state"));
+        assert!(molimo
+            .content
+            .contains("EnvironmentFile=-/home/exedev/lsbx-state/broker.env"));
+        assert!(molimo.content.contains("ProtectSystem=full"));
+        assert!(molimo
+            .content
+            .contains("ReadWritePaths=/home/exedev/lsbx-state"));
     }
 }

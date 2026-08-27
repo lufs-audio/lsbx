@@ -73,12 +73,30 @@ const DEFAULT_FALLBACK_DELAY_SECS: u64 = 60;
 
 const POLL_INTERVAL_ENV: &str = "LSBX_CI_POLL_INTERVAL";
 const FALLBACK_DELAY_ENV: &str = "LSBX_CI_FALLBACK_DELAY";
+const REPOS_ENV: &str = "LSBX_CI_REPOS";
+const GITHUB_OWNER_ENV: &str = "GITHUB_OWNER";
+const GITHUB_REPO_ENV: &str = "GITHUB_REPO";
 
+/// Which repos this broker polls, and how that list is derived. gh-CLI and
+/// GitHub-App are **co-equal** first-class auth methods, each with its own
+/// natural repo source — gh-CLI deployments configure repos explicitly
+/// (they have no installation scope), App deployments typically discover
+/// them from the installation.
+///
+/// - `Some(list)`: a static, explicitly-configured repo list (from
+///   `LSBX_CI_REPOS`, or `GITHUB_OWNER`+`GITHUB_REPO`). The `Poller` uses
+///   it verbatim and never calls `installation_repositories` (the App-only
+///   endpoint) — this is the gh-CLI path.
+/// - `None`: discover repos via `GitHubClient::installation_repositories()`
+///   (the App-installation endpoint) — the App path.
 pub struct PollConfig {
     pub poll_interval: std::time::Duration,         // default 15s
     pub repo_refresh_interval: std::time::Duration, // default 300s
     pub fallback_delay: std::time::Duration,        // default 60s
     pub queue_labels: Vec<String>,
+    /// Explicit repo list (`owner/repo`). `None` means "discover via the
+    /// App installation endpoint."
+    pub repos: Option<Vec<String>>,
 }
 
 impl Default for PollConfig {
@@ -88,6 +106,7 @@ impl Default for PollConfig {
             repo_refresh_interval: Duration::from_secs(DEFAULT_REPO_REFRESH_INTERVAL_SECS),
             fallback_delay: Duration::from_secs(DEFAULT_FALLBACK_DELAY_SECS),
             queue_labels: vec![FALLBACK_QUEUE_LABEL.to_string()],
+            repos: None,
         }
     }
 }
@@ -97,6 +116,12 @@ impl PollConfig {
     /// placement labels, per the acceptance criterion) plus the documented
     /// env-var overrides (`LSBX_CI_POLL_INTERVAL`, `LSBX_CI_FALLBACK_DELAY`),
     /// falling back to their defaults when unset or unparseable.
+    ///
+    /// The repo list is read from `LSBX_CI_REPOS` (comma-separated
+    /// `owner/repo`). When that is unset, it falls back to
+    /// `GITHUB_OWNER`+`GITHUB_REPO` (the legacy single-repo env pair). When
+    /// neither is present, `repos` is `None`, which selects the App mode's
+    /// installation-endpoint discovery.
     pub fn from_queue_label_and_env(queue_label: &str) -> Self {
         let defaults = Self::default();
         let queue_labels = queue_label
@@ -106,21 +131,61 @@ impl PollConfig {
             .map(str::to_string)
             .collect::<Vec<_>>();
 
+        let repos = repos_from_env();
+
         Self {
-            poll_interval: duration_from_env_secs(POLL_INTERVAL_ENV).unwrap_or(defaults.poll_interval),
+            poll_interval: duration_from_env_secs(POLL_INTERVAL_ENV)
+                .unwrap_or(defaults.poll_interval),
             repo_refresh_interval: defaults.repo_refresh_interval,
-            fallback_delay: duration_from_env_secs(FALLBACK_DELAY_ENV).unwrap_or(defaults.fallback_delay),
+            fallback_delay: duration_from_env_secs(FALLBACK_DELAY_ENV)
+                .unwrap_or(defaults.fallback_delay),
             queue_labels: if queue_labels.is_empty() {
                 defaults.queue_labels
             } else {
                 queue_labels
             },
+            repos,
         }
     }
 }
 
+/// Derives the explicit repo list from the environment, or `None` if no
+/// explicit repos are configured (the App-discovery case).
+fn repos_from_env() -> Option<Vec<String>> {
+    if let Ok(raw) = std::env::var(REPOS_ENV) {
+        let list = parse_repo_csv(&raw);
+        if !list.is_empty() {
+            return Some(list);
+        }
+    }
+    // Legacy single-repo pair: `GITHUB_OWNER` + `GITHUB_REPO`.
+    let owner = std::env::var(GITHUB_OWNER_ENV).ok();
+    let repo = std::env::var(GITHUB_REPO_ENV).ok();
+    match (owner, repo) {
+        (Some(o), Some(r)) if !o.is_empty() && !r.is_empty() => Some(vec![format!("{o}/{r}")]),
+        _ => None,
+    }
+}
+
+/// Splits a comma-separated `owner/repo` env value into trimmed,
+/// non-empty `String`s. Pure — factored out so the parsing logic is
+/// unit-testable without mutating process-global env (which two tests in
+/// the same binary would race on).
+fn parse_repo_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn duration_from_env_secs(var: &str) -> Option<Duration> {
-    std::env::var(var).ok()?.trim().parse::<u64>().ok().map(Duration::from_secs)
+    std::env::var(var)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 pub struct QueuedJob {
@@ -128,6 +193,7 @@ pub struct QueuedJob {
     pub run_id: u64,
     pub repository: String,
     pub labels: Vec<String>,
+    pub name: Option<String>,
     pub created_at: Option<String>, // None if unparseable — fail-closed downstream
 }
 
@@ -141,7 +207,11 @@ const RUN_STATUSES: [&str; 2] = ["queued", "in_progress"];
 /// (`GET .../actions/runs?status=<status>`), then for each run lists its
 /// jobs (`GET .../actions/runs/{run_id}/jobs`), keeping only jobs whose
 /// `status == "queued"` and whose `labels` contain `label`.
-pub async fn queued_jobs(client: &GitHubClient, label: &str, repo: &str) -> Result<Vec<QueuedJob>, LsbxError> {
+pub async fn queued_jobs(
+    client: &GitHubClient,
+    label: &str,
+    repo: &str,
+) -> Result<Vec<QueuedJob>, LsbxError> {
     let mut jobs = Vec::new();
 
     for status in RUN_STATUSES {
@@ -157,6 +227,7 @@ pub async fn queued_jobs(client: &GitHubClient, label: &str, repo: &str) -> Resu
                         run_id: job.run_id,
                         repository: repo.to_string(),
                         labels: job.labels,
+                        name: job.name,
                         created_at: job.created_at,
                     });
                 }
@@ -179,8 +250,8 @@ pub struct Poller {
 impl Poller {
     pub fn new(config: PollConfig) -> Self {
         Self {
+            repos: config.repos.clone().unwrap_or_default(),
             config,
-            repos: Vec::new(),
             last_repo_refresh: None,
         }
     }
@@ -214,16 +285,25 @@ impl Poller {
     /// tick" cadence deterministically with a manually-advanced `now`,
     /// without needing a live or mocked `GitHubClient` at all.
     pub fn should_refresh_repos(&self, now: SystemTime) -> bool {
-        repo_refresh_due(self.last_repo_refresh, self.config.repo_refresh_interval, now)
+        repo_refresh_due(
+            self.last_repo_refresh,
+            self.config.repo_refresh_interval,
+            now,
+        )
     }
 
     /// Runs one poll step at time `now`:
     ///
-    /// 1. Refreshes the repo list via
-    ///    `client.installation_repositories()` if [`Self::should_refresh_repos`]
+    /// 1. If no explicit repo list was configured (`config.repos` is `None`
+    ///    — the App mode), refreshes the repo list via
+    ///    `client.installation_repositories()` when [`Self::should_refresh_repos`]
     ///    says a refresh is due — never on every tick otherwise, matching
-    ///    the acceptance criterion.
-    /// 2. For every discovered repo and every configured queue label, calls
+    ///    the acceptance criterion. If an explicit repo list *was*
+    ///    configured (`Some(..)` — the gh-CLI mode), it was populated at
+    ///    construction and is used verbatim; `installation_repositories` is
+    ///    never called (that endpoint is App-installation-scoped and would
+    ///    fail under normal `gh` user auth).
+    /// 2. For every repo and every configured queue label, calls
     ///    `queued_jobs`, then filters to jobs where `is_eligible(job, cfg,
     ///    now)` is true.
     ///
@@ -231,8 +311,15 @@ impl Poller {
     /// itself) so a test can drive multiple ticks with a manually-advanced
     /// clock and assert the refresh-cadence behavior deterministically,
     /// without a real `repo_refresh_interval`-length sleep.
-    pub async fn tick(&mut self, client: &GitHubClient, now: SystemTime) -> Result<Vec<QueuedJob>, LsbxError> {
-        if self.should_refresh_repos(now) {
+    pub async fn tick(
+        &mut self,
+        client: &GitHubClient,
+        now: SystemTime,
+    ) -> Result<Vec<QueuedJob>, LsbxError> {
+        // Static-repo (gh-CLI) mode: repos were populated at construction;
+        // never hit the App-only installation endpoint. Only the
+        // discovery mode (config.repos == None) refreshes via the client.
+        if self.config.repos.is_none() && self.should_refresh_repos(now) {
             self.repos = client.installation_repositories().await?;
             self.last_repo_refresh = Some(now);
         }
@@ -258,7 +345,11 @@ impl Poller {
 /// specifically so it's trivial to unit-test directly (see `poll::tests`
 /// below) with nothing but plain `SystemTime` values, no `Poller`
 /// construction or `GitHubClient` required.
-fn repo_refresh_due(last_refresh: Option<SystemTime>, repo_refresh_interval: Duration, now: SystemTime) -> bool {
+fn repo_refresh_due(
+    last_refresh: Option<SystemTime>,
+    repo_refresh_interval: Duration,
+    now: SystemTime,
+) -> bool {
     match last_refresh {
         None => true,
         Some(last) => match now.duration_since(last) {
@@ -287,6 +378,7 @@ mod tests {
             repo_refresh_interval: Duration::from_secs(300),
             fallback_delay: Duration::from_secs(60),
             queue_labels: vec![FALLBACK_QUEUE_LABEL.to_string()],
+            repos: None,
         };
         let poller = Poller::new(config);
 
@@ -311,11 +403,19 @@ mod tests {
         // At t+300s (exactly `repo_refresh_interval`), a refresh is due —
         // boundary is inclusive (`>=`).
         let now_at_boundary = t0 + Duration::from_secs(300);
-        assert!(repo_refresh_due(last_refresh, config_refresh_interval(), now_at_boundary));
+        assert!(repo_refresh_due(
+            last_refresh,
+            config_refresh_interval(),
+            now_at_boundary
+        ));
 
         // Comfortably past the boundary, still due.
         let now_past_boundary = t0 + Duration::from_secs(301);
-        assert!(repo_refresh_due(last_refresh, config_refresh_interval(), now_past_boundary));
+        assert!(repo_refresh_due(
+            last_refresh,
+            config_refresh_interval(),
+            now_past_boundary
+        ));
     }
 
     /// After `Poller::tick` performs a refresh, `last_repo_refresh` advances
@@ -332,6 +432,7 @@ mod tests {
             repo_refresh_interval: Duration::from_secs(300),
             fallback_delay: Duration::from_secs(60),
             queue_labels: vec![FALLBACK_QUEUE_LABEL.to_string()],
+            repos: None,
         };
         let mut poller = Poller::new(config);
         assert_eq!(poller.last_repo_refresh(), None);
@@ -356,5 +457,20 @@ mod tests {
 
     fn config_refresh_interval() -> Duration {
         Duration::from_secs(300)
+    }
+
+    /// The gh-CLI (co-equal) repo-source: `LSBX_CI_REPOS` comma-separated
+    /// `owner/repo` list is parsed into an explicit `PollConfig.repos`,
+    /// selecting static-repo mode. Tested pure (no process-global env) to
+    /// avoid the cross-test race that two env-reading tests in the same
+    /// binary would hit under parallel execution.
+    #[test]
+    fn parse_repo_csv_splits_trims_and_drops_empties() {
+        assert_eq!(
+            parse_repo_csv("a/b, c/d ,"),
+            vec!["a/b".to_string(), "c/d".to_string()]
+        );
+        assert_eq!(parse_repo_csv(""), Vec::<String>::new());
+        assert_eq!(parse_repo_csv(" , "), Vec::<String>::new());
     }
 }
