@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libvirt-dev pkg-config
       - name: cargo check
         run: cargo check --workspace --message-format=json
       - name: cargo clippy
