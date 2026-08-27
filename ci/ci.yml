@@ -8,10 +8,10 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, "${{ vars.LSBX_CI_PLACEMENT || 'lufs' }}"]
-    # Cutover note: once lsbx's own broker is deployed and verified serving
-    # the `lsbx-default` label, set the repo variable LSBX_CI_PLACEMENT to
-    # "lsbx-default". No workflow file change required — see SPEC.md Deviation 15.
+    runs-on: [self-hosted, "${{ vars.LSBX_CI_PLACEMENT || 'lsbx-molimo' }}"]
+    # Set LSBX_CI_PLACEMENT to lsbx-carnyx only when intentionally routing
+    # this repository's own CI to Carnyx. Broker jobs carry self-hosted plus
+    # exactly one placement label.
     steps:
     - uses: actions/checkout@v4
     - name: cargo check

@@ -11,10 +11,9 @@ permissions:
 
 jobs:
   build:
-    # Keep the repository's own CI on the legacy lufs placement until the
-    # Molimo broker has completed its production soak. Broker-managed jobs
-    # must use exactly one placement label.
-    runs-on: [self-hosted, "${{ vars.LSBX_CI_PLACEMENT || 'lufs' }}"]
+    # Molimo's Rust broker has completed its live lifecycle rehearsal; use
+    # the repository variable for an intentional alternate placement.
+    runs-on: [self-hosted, "${{ vars.LSBX_CI_PLACEMENT || 'lsbx-molimo' }}"]
     steps:
       - uses: actions/checkout@v4
       - name: cargo check
