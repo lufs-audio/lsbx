@@ -42,70 +42,34 @@ use std::time::Duration;
 pub mod http_fallback;
 pub mod ssh;
 
-use http_fallback::{HttpExecOutcome, HttpFallbackClient};
+use http_fallback::HttpFallbackClient;
 use ssh::SshSession;
 
-/// How this backend authenticates to exe.dev, and — for the two HTTP-based
-/// variants — where it should look for an SSH key if it needs to fall back
-/// from a 422 HTTPS response.
+/// How this backend authenticates to exe.dev.
 ///
-/// ## Why the fallback key path is explicit, not assumed
+/// The two token variants authenticate the HTTPS `/exec` path (bearer
+/// auth, no SSH key material involved — since the #31 wire-format fix,
+/// token auth is fully self-sufficient for every account-level verb and
+/// for short guest commands). The two SSH variants authenticate the SSH
+/// transport via `russh`, which remains the right door for interactive
+/// tooling, file transfer, and anything longer than the exec endpoint's
+/// ~30 s cap. `ExedevBackend::new` accepts an optional per-VM key map for
+/// SSH-side guest access regardless of the auth variant chosen.
 ///
-/// The unit contract's own interface contract shows this enum with three
-/// bare variants (`AccountToken(String)`, `VmScopedToken(String)`,
-/// `Ssh { key_path: PathBuf }`) and no fourth field anywhere for a fallback
-/// key. That leaves a real gap: when `run()` is using the HTTPS path and
-/// hits a 422, what SSH key does it use to retry?
-///
-/// The two tempting-but-wrong answers:
-/// - Guess at the *operator's own* personal key (e.g. `~/.ssh/id_ed25519`).
-///   Wrong because there's no reason to believe the account or VM-scoped
-///   token holder's personal workstation key is even registered with the
-///   specific VM being talked to — and reaching into an operator's personal
-///   SSH identity from an automated backend is exactly the kind of
-///   scope-widening this house's conventions push back on.
-/// - Silently do nothing and let every 422 be a hard failure when running
-///   under an HTTP-based auth mode. This satisfies "don't guess" but doesn't
-///   satisfy the unit's actual acceptance criterion, which requires the
-///   fallback to work transparently, not just "when the caller happens to
-///   also have configured `ExedevAuth::Ssh` some other way."
-///
-/// This backend does not receive an ephemeral keypair from anywhere today —
-/// `Backend::run()`'s signature (owned by Unit 01, unchanged here) takes no
-/// key material at all, and Unit 03's `EphemeralKeypair` is generated and
-/// owned by whatever calls into a `Backend`, not passed through the trait.
-/// The actually-correct long-term fix is Unit 09 (VM Lifecycle Orchestration)
-/// threading the same `EphemeralKeypair` it already generates for
-/// `create_from_golden`'s `pubkey` through to `ExedevBackend`'s
-/// construction, since that key's private half is guaranteed to be
-/// registered on the VM this backend is about to talk to. That's a
-/// `Backend` trait / call-site change outside this unit's boundary (Unit 07
-/// owns `src/lib.rs`, `src/ssh.rs`, `src/http_fallback.rs` — not the trait
-/// signature in `lsbx-kernel`, and not Unit 09's orchestration code) — see
-/// the crate-level flagged gap below.
-///
-/// What this unit *can* do within its own boundary: make the fallback key
-/// path an explicit, caller-supplied configuration value on the auth enum
-/// itself, so whoever constructs `ExedevBackend` (today: whoever wires up
-/// this backend by hand; later: Unit 09) decides where that key comes from,
-/// rather than this crate silently assuming a fixed path. When no fallback
-/// path is configured, a 422 under an HTTP-based auth mode is a clear,
-/// typed `BackendUnavailable` error naming exactly what's missing — not a
-/// silent guess and not a panic.
+/// Historical note: this enum once carried an optional
+/// `fallback_ssh_key_path` on both token variants, bridging a then-real
+/// 422-to-SSH retry. exe.dev's run-on-vm launch removed the 422 premise
+/// and the #31 follow-up removed the field; SSH access under token auth
+/// is deliberately NOT bridged by guessed key paths (the original
+/// scope-widening objection stands — an operator's personal key must
+/// never be silently adopted by an automated backend).
 pub enum ExedevAuth {
-    /// Account-wide `EXE_TOKEN`. `fallback_ssh_key_path` is the SSH private
-    /// key `run()` uses if an `/exec` call under this token hits a 422.
-    AccountToken {
-        token: String,
-        fallback_ssh_key_path: Option<PathBuf>,
-    },
+    /// Account-wide `EXE_TOKEN` (bearer auth for the HTTPS `/exec` path).
+    AccountToken { token: String },
     /// A VM-scoped token (`v0@VMNAME.exe.xyz`), per exe.dev's documented
     /// token model — narrows credential blast radius to one VM rather than
-    /// the whole account. Same fallback-key story as `AccountToken`.
-    VmScopedToken {
-        token: String,
-        fallback_ssh_key_path: Option<PathBuf>,
-    },
+    /// the whole account.
+    VmScopedToken { token: String },
     /// SSH-only with an explicit private key path.
     Ssh { key_path: PathBuf },
     /// SSH-only through the operator's configured OpenSSH alias. This is
@@ -117,25 +81,10 @@ pub enum ExedevAuth {
 
 impl ExedevAuth {
     /// Convenience constructor matching the plain `AccountToken(String)`
-    /// shape the unit's interface contract shows, for callers that don't
-    /// need a 422-fallback path (e.g. tests, or a deployment that only ever
-    /// expects account-level verbs that never 422).
+    /// shape the unit's interface contract shows.
     pub fn account_token(token: impl Into<String>) -> Self {
         Self::AccountToken {
             token: token.into(),
-            fallback_ssh_key_path: None,
-        }
-    }
-
-    /// As `account_token`, plus a fallback SSH key path for `run()`'s
-    /// 422-to-SSH retry.
-    pub fn account_token_with_fallback(
-        token: impl Into<String>,
-        fallback_ssh_key_path: PathBuf,
-    ) -> Self {
-        Self::AccountToken {
-            token: token.into(),
-            fallback_ssh_key_path: Some(fallback_ssh_key_path),
         }
     }
 
@@ -146,44 +95,16 @@ impl ExedevAuth {
     }
 
     /// Convenience constructor matching the plain `VmScopedToken(String)`
-    /// shape, no fallback path configured.
+    /// shape.
     pub fn vm_scoped_token(token: impl Into<String>) -> Self {
         Self::VmScopedToken {
             token: token.into(),
-            fallback_ssh_key_path: None,
-        }
-    }
-
-    /// As `vm_scoped_token`, plus a fallback SSH key path.
-    pub fn vm_scoped_token_with_fallback(
-        token: impl Into<String>,
-        fallback_ssh_key_path: PathBuf,
-    ) -> Self {
-        Self::VmScopedToken {
-            token: token.into(),
-            fallback_ssh_key_path: Some(fallback_ssh_key_path),
         }
     }
 
     fn http_token(&self) -> Option<&str> {
         match self {
-            Self::AccountToken { token, .. } | Self::VmScopedToken { token, .. } => {
-                Some(token.as_str())
-            }
-            Self::Ssh { .. } | Self::SshAlias { .. } => None,
-        }
-    }
-
-    fn fallback_ssh_key_path(&self) -> Option<&PathBuf> {
-        match self {
-            Self::AccountToken {
-                fallback_ssh_key_path,
-                ..
-            }
-            | Self::VmScopedToken {
-                fallback_ssh_key_path,
-                ..
-            } => fallback_ssh_key_path.as_ref(),
+            Self::AccountToken { token } | Self::VmScopedToken { token } => Some(token.as_str()),
             Self::Ssh { .. } | Self::SshAlias { .. } => None,
         }
     }
@@ -405,13 +326,15 @@ impl ExedevBackend {
     }
 
     fn guest_key_path(&self, vm_tag: &str) -> Option<PathBuf> {
-        self.vm_key_path(vm_tag).or_else(|| match &self.auth {
+        // Token auth modes carry no SSH key material at all — exe.dev's
+        // HTTPS path is the token carrier's remote-execution surface, and
+        // scp/interactive SSH need the explicit `Ssh`/`SshAlias` modes.
+        // (The old fallback_ssh_key_path bridge died with the 422-fallback
+        // premise; see lsbx#31's follow-up cleanup.)
+        match &self.auth {
             ExedevAuth::Ssh { key_path } => Some(key_path.clone()),
-            ExedevAuth::AccountToken { .. } | ExedevAuth::VmScopedToken { .. } => {
-                self.auth.fallback_ssh_key_path().cloned()
-            }
-            ExedevAuth::SshAlias { .. } => None,
-        })
+            _ => self.vm_key_path(vm_tag),
+        }
     }
 
     fn explicit_or_guest_key(
@@ -449,14 +372,8 @@ impl ExedevBackend {
         })?;
         let client = HttpFallbackClient::new(token.to_string(), None);
         // Control verbs carry their own `--json` and surface errors as HTTP
-        // statuses (mapped to exit 255 inside the client), so the live
-        // endpoint cannot produce the old UnprocessableFallbackToSsh shape.
-        match client.exec(cmd).await? {
-            HttpExecOutcome::Completed(out) => Ok(out),
-            HttpExecOutcome::UnprocessableFallbackToSsh => Err(LsbxError::BackendUnavailable(
-                "exe.dev returned an unexpected 422 for an account-level command; no SSH fallback target for a non-VM-scoped verb".to_string(),
-            )),
-        }
+        // statuses (mapped to exit 255 inside the client).
+        client.exec(cmd).await
     }
 
     fn require_not_vm_scoped(&self, verb: &str) -> Result<(), LsbxError> {
@@ -620,12 +537,12 @@ impl Backend for ExedevBackend {
         })
     }
 
-    /// Falls back from HTTPS to SSH transparently when exe.dev's documented
-    /// raw-VM-shell 422 is detected, rather than surfacing a bare 422 to the
-    /// caller (Unit 07 acceptance criteria) — but only when a fallback SSH
-    /// key path has been configured on this backend's `ExedevAuth`. See the
-    /// doc comment on `ExedevAuth` for why that path is explicit rather than
-    /// assumed to be the operator's personal key.
+    /// Runs a guest command on `vm_tag`. The transport follows the auth
+    /// variant: token modes go over HTTPS `/exec` (guest commands ride
+    /// `ssh <vm> <cmd>` with an in-band exit sentinel — see
+    /// `http_fallback::wrap_guest_command`); SSH modes go over `russh`
+    /// with the explicit, per-VM, or alias-configured key. `identity_file`
+    /// (when provided) overrides the key used by the SSH paths.
     async fn run(
         &self,
         vm_tag: &str,
@@ -657,17 +574,7 @@ impl Backend for ExedevBackend {
                 })?;
                 let client = HttpFallbackClient::new(token.to_string(), None);
                 let lobby_cmd = http_fallback::wrap_guest_command(vm_tag, &cmd);
-                return match client.exec_with_timeout(&lobby_cmd, timeout).await? {
-                    HttpExecOutcome::Completed(out) => Ok(out),
-                    HttpExecOutcome::UnprocessableFallbackToSsh => {
-                        // Unreachable against the live API (see http_fallback
-                        // module docs); kept so the match stays exhaustive.
-                        Err(LsbxError::BackendUnavailable(
-                            "exe.dev returned an unexpected 422 for vm_tag '{vm_tag}' over HTTPS"
-                                .to_string(),
-                        ))
-                    }
-                };
+                return client.exec_with_timeout(&lobby_cmd, timeout).await;
             }
             ExedevAuth::Ssh { key_path } => identity_file
                 .map(std::path::Path::to_path_buf)
@@ -946,7 +853,7 @@ async fn list_tagged_keys(
     let auth_token = backend.auth.http_token().map(str::to_string);
     let ssh_key_path = match &backend.auth {
         ExedevAuth::Ssh { key_path } => Some(key_path.clone()),
-        _ => backend.auth.fallback_ssh_key_path().cloned(),
+        _ => None,
     };
     let ssh_alias = match &backend.auth {
         ExedevAuth::SshAlias { alias } => Some(alias.clone()),
@@ -990,15 +897,7 @@ async fn list_tagged_keys(
                         let out = match (&auth_token, &ssh_key_path, &ssh_alias) {
                             (Some(token), _, _) => {
                                 let client = HttpFallbackClient::new(token.clone(), None);
-                                match client.exec(&revoke_cmd).await? {
-                                    HttpExecOutcome::Completed(out) => out,
-                                    HttpExecOutcome::UnprocessableFallbackToSsh => {
-                                        return Err(LsbxError::BackendUnavailable(
-                                            "exe.dev returned an unexpected 422 revoking a key over HTTPS"
-                                                .to_string(),
-                                        ))
-                                    }
-                                }
+                                client.exec(&revoke_cmd).await?
                             }
                             (None, Some(key_path), _) => {
                                 let mut session =
@@ -1069,49 +968,26 @@ pub async fn reconcile_exedev_keys(
 mod tests {
     use super::*;
 
-    /// The fallback-key-path judgment call, exercised directly: an
-    /// `AccountToken`/`VmScopedToken` auth mode with no
-    /// `fallback_ssh_key_path` configured must report `None`, never a
-    /// guessed default such as `~/.ssh/id_ed25519`. This is the single
-    /// most important assertion for the judgment call documented on
-    /// `ExedevAuth` above — it's what makes "no fallback path configured
-    /// means a named error, not a silent guess" a checked fact rather than
-    /// a claim in a doc comment.
+    /// Token auth modes expose their token to the HTTPS path and nothing
+    /// else — asserting both facts directly so a future refactor can't
+    /// quietly re-bridge token auth to guessed SSH identity (the
+    /// scope-widening `ExedevAuth`'s doc comment warns against).
     #[test]
-    fn no_fallback_path_configured_means_none_not_a_guessed_default() {
+    fn token_variants_expose_only_the_http_token() {
         let account = ExedevAuth::account_token("EXE_TOKEN_VALUE");
-        assert_eq!(account.fallback_ssh_key_path(), None);
+        assert_eq!(account.http_token(), Some("EXE_TOKEN_VALUE"));
 
         let vm_scoped = ExedevAuth::vm_scoped_token("v0@my-vm.exe.xyz");
-        assert_eq!(vm_scoped.fallback_ssh_key_path(), None);
+        assert_eq!(vm_scoped.http_token(), Some("v0@my-vm.exe.xyz"));
     }
 
-    /// The explicit-opt-in half of the same judgment call: when a caller
-    /// *does* configure a fallback path, it's threaded through exactly,
-    /// unmodified — proving the configuration actually reaches the field
-    /// `run()` reads from, not just that the constructor accepts an
-    /// argument.
+    /// `ExedevAuth::Ssh` has no HTTP token (there is no HTTPS path in this
+    /// mode).
     #[test]
-    fn configured_fallback_path_is_threaded_through_unmodified() {
-        let path = PathBuf::from("/var/lib/lsbx/keys/some-ephemeral-key");
-        let account = ExedevAuth::account_token_with_fallback("EXE_TOKEN_VALUE", path.clone());
-        assert_eq!(account.fallback_ssh_key_path(), Some(&path));
-
-        let vm_scoped = ExedevAuth::vm_scoped_token_with_fallback("v0@my-vm.exe.xyz", path.clone());
-        assert_eq!(vm_scoped.fallback_ssh_key_path(), Some(&path));
-    }
-
-    /// `ExedevAuth::Ssh` has no fallback-path concept at all (there is no
-    /// HTTP path to fall back *from* in this mode) — asserting `None` here
-    /// specifically distinguishes "no fallback configured" (the
-    /// HTTP-variant case above) from "fallback doesn't apply to this
-    /// variant" (this case), even though both currently read as `None`.
-    #[test]
-    fn ssh_variant_has_no_fallback_path_concept() {
+    fn ssh_variant_has_no_http_token() {
         let ssh = ExedevAuth::Ssh {
             key_path: PathBuf::from("/tmp/key"),
         };
-        assert_eq!(ssh.fallback_ssh_key_path(), None);
         assert_eq!(ssh.http_token(), None);
     }
 

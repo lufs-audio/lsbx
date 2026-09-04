@@ -9,7 +9,7 @@
 //! - Parses the request body **verbatim** as an exe.dev command string, no
 //!   matter the `Content-Type`. A JSON envelope like `{"command":"..."}` is
 //!   read as a literal command named `{...}` and answered with
-//!   `{"error":"unknown command"}` at HTTP 200. (The earlier
+//!   `{"error":"unknown command"}` at HTTP 200. (An earlier
 //!   JSON-envelope client in this file never worked against the live API.)
 //! - Returns the command's stdout and stderr **combined as plain text** in
 //!   the response body — there is no structured `{exit_code, stdout, stderr}`
@@ -27,9 +27,11 @@
 //!
 //! exe.dev command names gate on the *first* token, so a single URL serves
 //! both control verbs (`ls`, `cp`, `rm`, `ssh-key`, ...) and guest execution
-//! (`ssh <vm> <cmd>` — itself a first-class command now, not a 422 case as
-//! this file previously assumed; the old "raw VM shell over /exec → 422"
-//! behavior is gone from the platform).
+//! (`ssh <vm> <cmd>` — a first-class command since the run-on-vm launch;
+//! the old "raw VM shell over /exec → 422" behavior is gone from the
+//! platform, and with it this module's original reason for being named
+//! "fallback". The name is retained for diff stability across the #30
+//! cleanup; everything fallback-shaped in it is not.).
 //!
 //! - **Control verbs** are invoked by sending the exe.dev command verbatim.
 //!   Machine-readable invocations carry `--json` themselves (`ls --json`,
@@ -60,20 +62,6 @@ pub const EXEC_URL: &str = "https://exe.dev/exec";
 /// a spoofable tail.
 pub const EXIT_SENTINEL: &str = concat!("__LSBX_", "EXIT:");
 
-/// Result of one `/exec` call.
-pub enum HttpExecOutcome {
-    /// The command ran; output text and parsed exit code are attached.
-    Completed(CommandOutput),
-    /// Retained for source compatibility with the previous 422-fallback
-    /// behavior. The live API no longer 422s `ssh <vm> <cmd>` — remote
-    /// guest execution is a supported, first-class use of this endpoint —
-    /// so `exec` no longer produces this variant, and `run()`'s fallback
-    /// branch is dead code scheduled for removal. Kept so nothing else in
-    /// the workspace breaks while the call sites are updated.
-    #[allow(dead_code)]
-    UnprocessableFallbackToSsh,
-}
-
 pub struct HttpFallbackClient {
     client: Client,
     token: String,
@@ -91,7 +79,7 @@ impl HttpFallbackClient {
         }
     }
 
-    pub async fn exec(&self, command: &str) -> Result<HttpExecOutcome, LsbxError> {
+    pub async fn exec(&self, command: &str) -> Result<CommandOutput, LsbxError> {
         self.exec_with_timeout(command, Duration::from_secs(120))
             .await
     }
@@ -101,8 +89,8 @@ impl HttpFallbackClient {
     ///
     /// Exit-code policy:
     /// - Any non-2xx HTTP status becomes `exit_code = 255` (the conventional
-    ///   transport-failure code; `lib.rs` already normalizes SSH's 255 the
-    ///   same way) with the error body as stderr.
+    ///   transport-failure code; `lib.rs` normalizes SSH's 255 the same way)
+    ///   with the error body as stderr.
     /// - On HTTP 200, the exit code is parsed from the in-band
     ///   `__LSBX_EXIT:<n>` sentinel when present (guest-execution shape);
     ///   otherwise it is 0 (control-verb shape, where errors are HTTP
@@ -111,7 +99,7 @@ impl HttpFallbackClient {
         &self,
         command: &str,
         timeout: Duration,
-    ) -> Result<HttpExecOutcome, LsbxError> {
+    ) -> Result<CommandOutput, LsbxError> {
         let res = self
             .client
             .post(EXEC_URL)
@@ -126,11 +114,11 @@ impl HttpFallbackClient {
         if !res.status().is_success() {
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
-            return Ok(HttpExecOutcome::Completed(CommandOutput {
+            return Ok(CommandOutput {
                 exit_code: 255,
                 stdout: Vec::new(),
                 stderr: format!("http exec returned status {status}: {body}").into_bytes(),
-            }));
+            });
         }
 
         let body = res.text().await.map_err(|e| {
@@ -142,11 +130,11 @@ impl HttpFallbackClient {
             None => (body.as_str(), 0),
         };
 
-        Ok(HttpExecOutcome::Completed(CommandOutput {
+        Ok(CommandOutput {
             exit_code,
             stdout: output_text.as_bytes().to_vec(),
             stderr: Vec::new(),
-        }))
+        })
     }
 }
 
@@ -188,8 +176,9 @@ fn split_exit_sentinel(body: &str) -> Option<(&str, i32)> {
 ///
 /// The quoting is load-bearing and lives here so the two layers are visible
 /// in one place:
-/// - the caller's argv is joined and [`shell_quote`]d into a single VM-side
-///   shell string (the VM parses it like an `ssh` remote command);
+/// - the caller's argv is joined and quoted (single-quoted by the caller,
+///   see `shell_quote` in `lib.rs`) into a single VM-side shell string (the
+///   VM parses it like an `ssh` remote command);
 /// - that string is embedded in the lobby command **unquoted**: the lobby
 ///   shell-lexes the body, `ssh` and `<vm>` must remain bare tokens for it,
 ///   and the double quotes around the remote command survive as literal
@@ -211,8 +200,8 @@ mod tests {
 
     #[test]
     fn guest_wrapper_shapes_two_layer_quoting() {
-        // shell_quote produces single-quoted VM-side strings; the wrapper
-        // embeds them inside the lobby-level double quotes.
+        // The caller's shell_quote produces single-quoted VM-side strings;
+        // the wrapper embeds them inside the lobby-level double quotes.
         let wrapped = wrap_guest_command("my-vm", "'echo hi > /tmp/x'");
         assert_eq!(
             wrapped,

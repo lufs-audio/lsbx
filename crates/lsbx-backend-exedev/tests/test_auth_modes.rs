@@ -19,12 +19,11 @@ use std::path::PathBuf;
 /// and has no way to observe it directly from outside the crate (it's a
 /// private field on a `pub` struct) — this mirrors its own `new()` decision
 /// rule so the test can assert the *same* rule the real client uses,
-/// pinned against the crate's own doc comment on `HttpFallbackClient::new`.
-fn expected_exec_url(vm_tag: Option<&str>) -> String {
-    match vm_tag {
-        Some(tag) => format!("https://{}.exe.xyz/exec", tag),
-        None => "https://exe.dev/exec".to_string(),
-    }
+/// pinned against the crate's own doc comment on `HttpFallbackClient::new`:
+/// since the #31 fix, every exec call targets the single account-level
+/// endpoint regardless of vm_tag (`<vm>.exe.xyz/exec` is not an exec API).
+fn expected_exec_url(_vm_tag: Option<&str>) -> String {
+    "https://exe.dev/exec".to_string()
 }
 
 #[test]
@@ -36,14 +35,14 @@ fn account_token_targets_account_level_exec_url_with_no_vm_tag() {
 }
 
 #[test]
-fn vm_scoped_token_targets_vm_scoped_exec_url() {
-    // A VM-scoped token's `run()` calls always carry a vm_tag, so the URL
-    // targeted is the VM-scoped host, never the bare account-level one —
-    // this is the credential-blast-radius narrowing the unit's acceptance
-    // criteria call out as the reason to support this token type at all.
+fn vm_scoped_token_still_targets_the_account_level_exec_url() {
+    // Since the #31 fix, even a VM-scoped token's `run()` calls go to the
+    // bare account-level endpoint (the lobby's `ssh <vm>` does the
+    // scoping) — `<vm>.exe.xyz/exec` is not an exec API at all. Pinned so
+    // nobody reintroduces the per-VM URL on the old blast-radius rationale.
     assert_eq!(
         expected_exec_url(Some("my-conformance-vm")),
-        "https://my-conformance-vm.exe.xyz/exec"
+        "https://exe.dev/exec"
     );
 }
 
