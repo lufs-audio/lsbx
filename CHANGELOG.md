@@ -12,6 +12,36 @@ engine and zero-idle CI runner broker, as a 17-crate Cargo workspace. See
 `docs/specs/2026-08-24T0030Z_rust-lsbx-rewrite/SPEC.md` for the full spec and
 its 15 documented deviations from the original kickoff brief.
 
+### Fixed
+
+- **exe.dev backend HTTPS control path now matches the live API** (fixes
+  #30). exe.dev's "Run commands on VM" launch changed the `/exec` endpoint:
+  the request body is parsed **verbatim** as a command string (the previous
+  JSON-envelope client never worked — the lobby answered
+  `{"error":"unknown command"}`), responses are combined plain text (no
+  structured JSON), guest execution rides `ssh <vm> <cmd>` as a first-class
+  command (the old "422 means fall back to SSH" premise is obsolete), and
+  the `X-Exe-Exit` trailer is not reliably exposed through proxy chains, so
+  guest exit codes now arrive via an in-band `__LSBX_EXIT:$?` sentinel
+  expanded at the VM. One shared endpoint serves control verbs (errors are
+  HTTP statuses; `--json` keeps stdout machine-readable) and guest
+  execution alike — the VM-scoped `https://<vm>.exe.xyz/exec` URL was
+  removed (it fronts the VM's own HTTP services, not an exec API).
+- **TLS trust store**: the exec client now uses
+  `rustls-tls-native-roots` instead of webpki-compiled roots, so the
+  control plane is reachable through TLS-inspecting proxies (corporate
+  egress, CI middleboxes, sandboxed agent runtimes) that re-sign upstream
+  TLS with a host-store CA. Found live: webpki-root clients failed where
+  every system-store tool succeeded.
+
+### Added
+
+- Live HTTP smoke test (`tests/test_http_live.rs`, `--ignored`) proving the
+  fixed wire format end-to-end under a token scoped to only `ls` + `ssh`:
+  account-level `ls --json` parses over the verbatim format, and guest
+  `run` returns the true remote exit code (0 for `echo`, 1 for `false`)
+  with the sentinel stripped from output.
+
 ### Added
 
 - **Kernel & domain types** (`lsbx-kernel`): `SandboxRecord` /
