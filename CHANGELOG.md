@@ -12,6 +12,21 @@ engine and zero-idle CI runner broker, as a 17-crate Cargo workspace. See
 `docs/specs/2026-08-24T0030Z_rust-lsbx-rewrite/SPEC.md` for the full spec and
 its 15 documented deviations from the original kickoff brief.
 
+### Removed
+
+- **Dead 422-fallback machinery** (follow-up to #30/#31): the
+  `fallback_ssh_key_path` fields on both token auth variants, the
+  `account_token_with_fallback` / `vm_scoped_token_with_fallback`
+  constructors, the `ExedevAuth::fallback_ssh_key_path()` accessor, the
+  `HttpExecOutcome` enum (the client returns `CommandOutput` directly),
+  and the CLI's `LSBX_EXEDEV_SSH_KEY`-as-422-fallback branch (the env var
+  still configures standalone `Ssh` auth). All were unreachable after the
+  #31 wire-format fix: exe.dev's run-on-vm launch removed the 422 premise.
+  The auth-mode table in `README.md` documents the two co-equal transports.
+- Also fixed: `test_auth_modes`' URL-mirror helper still encoded the
+  pre-#31 VM-scoped `/exec` URL rule; it now pins the account-level-only
+  rule the live API actually follows.
+
 ### Fixed
 
 - **exe.dev backend HTTPS control path now matches the live API** (fixes
