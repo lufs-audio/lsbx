@@ -1,5 +1,5 @@
 //! Exedev SSH backend (Unit 07) — `Backend` against exe.dev's real SSH-first
-//! control plane, with its HTTPS `/exec` API as a fallback.
+//! control plane, with its HTTPS `/exec` API as a bearer-token alternative.
 //!
 //! ## Dual control path
 //! Every mutating verb (`new`, `run`, `rm`, `ls`) can go over either:
@@ -10,15 +10,26 @@
 //!   [`ExedevAuth::AccountToken`] or [`ExedevAuth::VmScopedToken`] is
 //!   configured.
 //!
-//! ## The 422-to-SSH fallback (`run()` only)
-//! `POST /exec` against a VM directly can return `422 Unprocessable Entity`
-//! for some shell invocations — a documented exe.dev API limitation where
-//! only a real SSH session reliably reaches a VM's shell. `run()` detects
-//! this and falls back to SSH transparently, rather than surfacing a bare
-//! 422 to the caller (Unit 07 acceptance criteria) — but *only* when this
-//! backend has been configured with somewhere to get an SSH key from for
-//! that fallback. See `ExedevAuth::fallback_ssh_key_path` below for why that
-//! configuration is explicit rather than assumed.
+//! ## The real `/exec` wire format (verified live 2026-09-04 — fixes lsbx#30)
+//! The lobby parses the POST body **verbatim** as an exe.dev command string
+//! (no JSON envelope) and returns stdout+stderr combined as plain text.
+//! Guest execution rides `ssh <vm> <cmd>` — a first-class lobby command
+//! since exe.dev's "Run commands on VM" launch — with an in-band
+//! `__LSBX_EXIT:$?` sentinel for exit codes (the `X-Exe-Exit` trailer is
+//! not reliably exposed through proxy chains). Control verbs carry their
+//! own `--json` and surface errors as HTTP statuses. See
+//! `http_fallback.rs` for the full contract and `wrap_guest_command` for
+//! the two-layer quoting.
+//!
+//! ## Historical note: the 422-to-SSH fallback is obsolete
+//! This backend originally treated 422 over `/exec` as a documented
+//! "raw VM shell needs a real SSH session" limitation and fell back to SSH
+//! transparently. exe.dev's run-on-vm launch removed that limitation:
+//! `ssh <vm> <cmd>` over `/exec` is now supported behavior, errors arrive
+//! as typed HTTP statuses, and the old 422 shape no longer occurs. The
+//! `fallback_ssh_key_path` fields and `HttpExecOutcome::UnprocessableFallbackToSsh`
+//! variant are retained for source compatibility but no longer participate
+//! in any live code path (scheduled for removal in a follow-up).
 use lsbx_kernel::backend::*;
 use lsbx_kernel::error::LsbxError;
 
@@ -437,10 +448,13 @@ impl ExedevBackend {
             LsbxError::BackendUnavailable("no HTTP token configured for this auth mode".to_string())
         })?;
         let client = HttpFallbackClient::new(token.to_string(), None);
+        // Control verbs carry their own `--json` and surface errors as HTTP
+        // statuses (mapped to exit 255 inside the client), so the live
+        // endpoint cannot produce the old UnprocessableFallbackToSsh shape.
         match client.exec(cmd).await? {
             HttpExecOutcome::Completed(out) => Ok(out),
             HttpExecOutcome::UnprocessableFallbackToSsh => Err(LsbxError::BackendUnavailable(
-                "exe.dev returned 422 for an account-level command; no SSH fallback target for a non-VM-scoped verb".to_string(),
+                "exe.dev returned an unexpected 422 for an account-level command; no SSH fallback target for a non-VM-scoped verb".to_string(),
             )),
         }
     }
@@ -628,20 +642,32 @@ impl Backend for ExedevBackend {
 
         let result = match &self.auth {
             ExedevAuth::AccountToken { .. } | ExedevAuth::VmScopedToken { .. } => {
+                // HTTPS guest execution over the shared account-level exec
+                // endpoint (fixes lsbx#30): guest commands ride `ssh <vm>`
+                // as a first-class lobby command with an in-band exit
+                // sentinel — no VM-scoped exec URL (that path serves the
+                // VM's own HTTP services, not an exec API) and no
+                // JSON-envelope wire format (the lobby parses the body
+                // verbatim). Both were the old client's premises; both are
+                // obsolete. The exec endpoint's ~30s server cap means this
+                // path serves short verification commands; longer work and
+                // full interactive tooling still want the SSH paths below.
                 let token = self.auth.http_token().ok_or_else(|| {
                     LsbxError::BackendUnavailable("no HTTP token configured".to_string())
                 })?;
-                let client = HttpFallbackClient::new(token.to_string(), Some(vm_tag));
-                match client.exec_with_timeout(&cmd, timeout).await? {
-                    HttpExecOutcome::Completed(out) => return Ok(out),
-                    HttpExecOutcome::UnprocessableFallbackToSsh => {}
-                }
-                self.explicit_or_guest_key(vm_tag, identity_file)
-                    .ok_or_else(|| {
-                        LsbxError::BackendUnavailable(format!(
-                            "exe.dev returned 422 for vm_tag '{vm_tag}' and no SSH key is available"
+                let client = HttpFallbackClient::new(token.to_string(), None);
+                let lobby_cmd = http_fallback::wrap_guest_command(vm_tag, &cmd);
+                return match client.exec_with_timeout(&lobby_cmd, timeout).await? {
+                    HttpExecOutcome::Completed(out) => Ok(out),
+                    HttpExecOutcome::UnprocessableFallbackToSsh => {
+                        // Unreachable against the live API (see http_fallback
+                        // module docs); kept so the match stays exhaustive.
+                        Err(LsbxError::BackendUnavailable(
+                            "exe.dev returned an unexpected 422 for vm_tag '{vm_tag}' over HTTPS"
+                                .to_string(),
                         ))
-                    })?
+                    }
+                };
             }
             ExedevAuth::Ssh { key_path } => identity_file
                 .map(std::path::Path::to_path_buf)
@@ -968,7 +994,7 @@ async fn list_tagged_keys(
                                     HttpExecOutcome::Completed(out) => out,
                                     HttpExecOutcome::UnprocessableFallbackToSsh => {
                                         return Err(LsbxError::BackendUnavailable(
-                                            "exe.dev returned 422 revoking a key over HTTPS"
+                                            "exe.dev returned an unexpected 422 revoking a key over HTTPS"
                                                 .to_string(),
                                         ))
                                     }

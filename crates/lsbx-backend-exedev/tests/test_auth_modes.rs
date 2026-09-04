@@ -132,15 +132,18 @@ async fn ssh_variant_attempts_a_real_connection_and_fails_cleanly_offline() {
 
 #[tokio::test]
 async fn account_token_run_fails_cleanly_with_no_reachable_endpoint() {
-    // This test cannot reach a real exe.dev endpoint (no credentials, no
-    // network access expected in CI), so `run()`'s HTTP attempt itself will
-    // fail with BackendUnavailable before ever reaching the 422-detection
-    // branch. The fallback-key-path judgment call itself (does a missing
-    // `fallback_ssh_key_path` ever silently default to a guessed path?) is
-    // covered by `src/lib.rs`'s own `#[cfg(test)] mod tests` — specifically
-    // `no_fallback_path_configured_means_none_not_a_guessed_default` —
-    // since that decision lives on a private method (`ExedevAuth::fallback_ssh_key_path`)
-    // this integration test file has no visibility into.
+    // Contract under test: `run()` with a bogus token must ALWAYS produce a
+    // typed outcome and never panic, whatever the network environment:
+    // - True offline / unresolvable endpoint: the HTTP attempt fails at the
+    //   transport layer -> `Err(LsbxError::BackendUnavailable)`.
+    // - Reachable endpoint (including TLS-inspecting proxies, which re-sign
+    //   upstream TLS with a CA the client trusts via the system store — see
+    //   the `rustls-tls-native-roots` note in Cargo.toml): the lobby itself
+    //   rejects the bogus token with HTTP 200 and an error body
+    //   ({"error":"invalid token format: ..."}, verified live 2026-09-04),
+    //   which per the lsbx#30 wire contract surfaces as
+    //   `Ok(CommandOutput)` carrying that rejection text as data.
+    // Either branch is a correct, typed result; a panic is the only failure.
     let backend = ExedevBackend::new(ExedevAuth::account_token("fake-token-for-offline-test"));
     let result = backend
         .run(
@@ -150,22 +153,32 @@ async fn account_token_run_fails_cleanly_with_no_reachable_endpoint() {
             None,
         )
         .await;
-    // Whatever the exact failure (DNS resolution failure, connection
-    // refused, or a genuine timeout), it must come back as a typed
-    // LsbxError and never panic — this is the offline-safe half of the
-    // assertion; reaching an actual 422 needs a real exe.dev endpoint and
-    // is covered by the `#[ignore]`d conformance test instead. `CommandOutput`
-    // (the `Ok` half) deliberately has no `Debug` impl, so the failure
-    // message names the error directly rather than `{:?}`-formatting the
-    // whole `Result`.
     match result {
-        Err(e) => {
-            // Just confirming it's a real, displayable LsbxError — exercised
-            // via `Display`, not `Debug`, since only `LsbxError` (not
-            // `CommandOutput`) implements the latter... and `Display` is all
-            // this assertion actually needs.
-            let _ = e.to_string();
+        Err(error) => {
+            // Offline-shape: transport failure must be a typed error.
+            assert!(
+                matches!(error, LsbxError::BackendUnavailable(_)),
+                "expected a typed BackendUnavailable, got: {error:?}"
+            );
         }
-        Ok(_) => panic!("expected run() to fail with no real network access, but it succeeded"),
+        Ok(output) => {
+            // Reachable-shape: the lobby rejects the bogus token with a
+            // 401 and an error body, which the #30 client maps to
+            // exit 255 with the rejection text in stderr (stdout stays
+            // empty — data-vs-error discipline from the wire contract).
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                combined.contains("error") || combined.contains("invalid token"),
+                "expected the lobby's token-rejection text in the combined output, got: {combined}"
+            );
+            assert_eq!(
+                output.exit_code, 255,
+                "a 401 token rejection must map to the transport-failure exit code"
+            );
+        }
     }
 }
