@@ -77,6 +77,32 @@ its 15 documented deviations from the original kickoff brief.
   claim of verified bit-for-bit output parity for every code path that
   produces `SandboxRecord` JSON, which remains an ongoing verification
   target as more units land.
+- **Win11 browser-desktop golden phase** (see
+  `docs/specs/2026-08-27T1854Z_win11-browser-desktop-golden/`): registered the
+  `win11-desktop` golden on Carnyx (Windows 11 25H2, desktop flavor,
+  `streaming: novnc`, TightVNC loopback + noVNC `resize=scale` console baked
+  into the image), and made Windows goldens first-class across the toolchain:
+  - `CreateFromGoldenRequest` / `CreateRequest` / `DomainXmlParams` carry
+    `os`; the libvirt backend renders a dedicated Windows domain shape
+    (UEFI/SecureBoot q35, per-VM OVMF `_VARS.fd`, `hyperv` + `smm`, swtpm
+    2.0, localtime + hypervclock, qxl, VNC) and skips cloud-init seed-ISO
+    injection for `os == "windows"`.
+  - Windows healthchecks run under the guest's `cmd.exe` session — the
+    guest-SSH transport reconstructs `cmd /c …` argv with cmd.exe quoting
+    (POSIX single-quote tokens are literal for Windows OpenSSH), and the
+    ops/golden healthcheck wrappers pick `cmd /c` over `sh -c` by `os`.
+  - Guest-IP resolution filters loopback and transient APIPA (169.254/16)
+    addresses Windows reports while booting, so create/verify don't SSH to
+    a dead end.
+  - `lsbx up`/`verify` for Windows use the golden's baked guest identity
+    (no ephemeral keypair, no cloud-init `authorized_keys` injection).
+  - `ImageRegistry` is now `Serialize`; `golden register`/`delete` and
+    `golden build --register` persist registry mutations straight back to
+    the loaded manifest via the CLI's `build_deps`. `golden register`
+    gained `--os`/`--cpu`/`--memory`/`--disk`/`--mode`/`--repo`.
+  - Verified live on Carnyx: `lsbx golden verify win11-desktop` passes both
+    Windows healthchecks and `lsbx up win11-desktop` provisions a ready
+    UEFI/TPM SecureBoot VM with its noVNC console reachable in a browser.
 
 ### Notes
 
