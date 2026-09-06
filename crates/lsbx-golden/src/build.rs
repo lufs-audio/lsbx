@@ -204,6 +204,10 @@ pub async fn golden_build(
             pubkey: req.pubkey,
             cpu: req.cpu,
             memory: req.memory,
+            // Golden builds are a Linux-only workflow today (the build
+            // script is a POSIX provisioning script); a Windows golden is
+            // produced by direct provisioning, not `golden build`.
+            os: "linux",
         })
         .await?;
     let vm_tag = created.vm_tag;

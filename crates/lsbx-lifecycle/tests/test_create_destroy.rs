@@ -33,6 +33,7 @@ fn default_request() -> CreateRequest<'static> {
         ready_timeout: Duration::from_secs(5),
         verify: true,
         healthchecks: Vec::new(),
+        os: None,
     }
 }
 

@@ -211,12 +211,31 @@ pub enum GoldenCommand {
         base: String,
         #[arg(long)]
         flavor: String,
+        /// Guest operating system recorded in the registry; default `linux`.
+        /// `windows` opts the libvirt backend into a UEFI/TPM/SecureBoot
+        /// domain and baked-identity SSH auth (no cloud-init injection).
+        #[arg(long, default_value = "linux")]
+        os: String,
         #[arg(long)]
         streaming: Option<String>,
         #[arg(long)]
         capabilities: Vec<String>,
         #[arg(long)]
         healthcheck: Vec<String>,
+        /// Registry CPU count / memory string for sandboxes created from
+        /// this golden (defaults match the historical hardcoded values).
+        #[arg(long, default_value_t = 1)]
+        cpu: u32,
+        #[arg(long, default_value = "1G")]
+        memory: String,
+        #[arg(long)]
+        disk: Option<String>,
+        /// Disk materialization policy: `copy` (COW overlay, default) or
+        /// `new` (independent emit).
+        #[arg(long, default_value = "copy")]
+        mode: String,
+        #[arg(long)]
+        repo: Option<String>,
         #[arg(long)]
         content_hash: Option<String>,
         #[arg(long)]

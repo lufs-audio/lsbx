@@ -101,6 +101,7 @@ pub async fn golden_verify(
             pubkey,
             cpu: golden.cpu,
             memory: &golden.memory,
+            os: &golden.os,
         })
         .await?;
     let vm_tag = created.vm_tag;
@@ -117,13 +118,16 @@ pub async fn golden_verify(
     let mut run_error: Option<LsbxError> = None;
 
     for command in &golden.healthcheck {
+        // Windows guests have no POSIX `sh`, so healthchecks there run
+        // under the cmd.exe default shell that Windows OpenSSH provides
+        // (`cmd /c`); everything else keeps the POSIX wrapper.
+        let argv: Vec<String> = if golden.os == "windows" {
+            vec!["cmd".to_string(), "/c".to_string(), command.clone()]
+        } else {
+            vec!["sh".to_string(), "-c".to_string(), command.clone()]
+        };
         match backend
-            .run(
-                &vm_tag,
-                &["sh".to_string(), "-c".to_string(), command.clone()],
-                HEALTHCHECK_TIMEOUT,
-                key_path,
-            )
+            .run(&vm_tag, &argv, HEALTHCHECK_TIMEOUT, key_path)
             .await
         {
             Ok(output) => {

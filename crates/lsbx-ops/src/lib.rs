@@ -74,8 +74,8 @@
 //! | `reap` | Delegates to `lsbx_lifecycle::reap::reap(backend, sandbox_store, clock, &allowed_goldens, ttl, dry_run)`, where `allowed_goldens` comes from `ImageRegistry::allowed_goldens()`. |
 //! | `golden_build` | Delegates to `lsbx_golden::build::golden_build(backend, req, flattener)`. `flattener` is `None` (Unit 19 has not landed — see the "reconciling `golden_build`" note below); the real function's `Ok` type is `GoldenBuildOutcome { config, build_vm_tag }`, not a bare `GoldenConfig`. |
 //! | `golden_verify` | Delegates to `lsbx_golden::verify::golden_verify(backend, golden, verify_name, pubkey)` after resolving `name` to a `GoldenConfig` via `ImageRegistry::find_golden`. |
-//! | `golden_register` | **Implemented directly**: appends to the in-memory `ImageRegistry.goldens` `Vec`. See the "no persistence" note below — `ImageRegistry` has no `save`/`store` method, so this mutates the loaded, in-process registry only. |
-//! | `golden_delete` | **Implemented directly**: removes a matching entry from the in-memory `ImageRegistry.goldens` `Vec`. Same no-persistence caveat as `golden_register`. `keep_snapshot` is accepted (interface-contract parity) but is a documented no-op here — snapshot management is out of this crate's (and any landed crate's) scope today; see the note below. |
+//! | `golden_register` | **Implemented directly**: appends to the `ImageRegistry.goldens` `Vec`; also persists the registry when a manifest path is configured (`with_images_path`). Without a path it stays in-memory-only (see `persist_registry`). |
+//! | `golden_delete` | **Implemented directly**: removes a matching entry from the `ImageRegistry.goldens` `Vec`, persisting when a manifest path is configured. `keep_snapshot` is accepted (interface-contract parity) but is a documented no-op here — snapshot management is out of this crate's (and any landed crate's) scope today; see the note below. |
 //! | `golden_list` | **Implemented directly**: clones `ImageRegistry.goldens`. |
 //! | `config_show` | **Implemented directly**: serializes a small, honest summary of the registry's current shape (image/golden/profile counts and keys) as `serde_json::Value` — see the note below for why this crate does not invent a config schema that does not exist in any merged crate. |
 //! | `logs_query` | **Implemented directly**, but honestly: no crate anywhere in the merged workspace owns a log store yet (no `tracing` subscriber sink, no log file, no queryable log backend has landed). Rather than fabricate output, this returns `Err(LsbxError::ContractViolated)` naming the gap, mirroring `lsbx-golden::build::NoFlatten`'s own precedent for "the honest failure when a real implementation has not landed yet" (see the note below). |
@@ -200,7 +200,7 @@ use lsbx_kernel::error::LsbxError;
 use lsbx_kernel::types::PublicSandbox;
 use lsbx_store::ci_job_store::CiJobStore;
 use lsbx_store::sandbox_store::SandboxStore;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
@@ -238,6 +238,11 @@ pub struct LsbxOps {
     // Held for door crates (Units 16-18's CI broker) that need direct access; unused by this crate's own operations today.
     ci_job_store: CiJobStore,
     registry: RwLock<ImageRegistry>,
+    /// Where the registry was loaded from / should be written back to. When
+    /// unset (e.g. tests that build `LsbxOps::new` with an empty in-process
+    /// registry), `golden_register`/`golden_delete`/`golden_build --register`
+    /// stay in-memory-only, exactly as before this crate gained persistence.
+    images_path: Option<PathBuf>,
     clock: Box<dyn Clock>,
 }
 
@@ -260,8 +265,20 @@ impl LsbxOps {
             sandbox_store,
             ci_job_store,
             registry: RwLock::new(registry),
+            images_path: None,
             clock,
         }
+    }
+
+    /// Sets the golden manifest path this façade persists `golden register`
+    /// / `golden delete` / `golden build --register` mutations to. Builder-
+    /// style so existing `LsbxOps::new(...)` call sites (tests included)
+    /// are untouched; only a door that actually loaded the registry from
+    /// disk threads the path through, making persistence opt-in rather than
+    /// a behavior change for in-memory registries.
+    pub fn with_images_path(mut self, images_path: PathBuf) -> Self {
+        self.images_path = Some(images_path);
+        self
     }
 
     /// Resolves a sandbox `id` to its persisted `vm_tag`, mapping "the
@@ -280,10 +297,10 @@ impl LsbxOps {
         // lifecycle code receives the actual backend base plus the golden's
         // resource/readiness metadata, while the persisted record retains the
         // original profile name for API compatibility.
-        let (golden, cpu, memory, flavor, streaming, registry_healthchecks) = {
+        let (golden, cpu, memory, flavor, streaming, registry_healthchecks, os) = {
             let registry = self.registry.read().await;
             if registry.profiles.is_empty() && registry.goldens.is_empty() {
-                (None, None, None, None, None, None)
+                (None, None, None, None, None, None, None)
             } else {
                 let config = registry.resolve_golden(req.profile)?;
                 (
@@ -293,6 +310,7 @@ impl LsbxOps {
                     Some(format_golden_flavor(&config.flavor)),
                     Some(format_streaming_mode(&config.streaming)),
                     Some(config.healthcheck.clone()),
+                    Some(config.os.clone()),
                 )
             }
         };
@@ -300,9 +318,20 @@ impl LsbxOps {
         let healthchecks = if req.healthchecks.is_empty() {
             registry_healthchecks
                 .map(|checks| {
+                    let os_is_windows = os.as_deref() == Some("windows");
                     checks
                         .into_iter()
-                        .map(|command| vec!["sh".to_string(), "-c".to_string(), command])
+                        .map(|command| {
+                            if os_is_windows {
+                                // Windows guests have no POSIX `sh`;
+                                // healthchecks run under the cmd.exe
+                                // default shell that Windows OpenSSH
+                                // provides.
+                                vec!["cmd".to_string(), "/c".to_string(), command]
+                            } else {
+                                vec!["sh".to_string(), "-c".to_string(), command]
+                            }
+                        })
                         .collect()
                 })
                 .unwrap_or_default()
@@ -322,6 +351,7 @@ impl LsbxOps {
             flavor: flavor.as_deref(),
             streaming: streaming.as_deref(),
             healthchecks,
+            os: os.as_deref(),
         };
 
         lsbx_lifecycle::create::create(
@@ -489,8 +519,11 @@ impl LsbxOps {
         let outcome = lsbx_golden::build::golden_build(self.backend.as_ref(), req, None).await?;
 
         if register {
-            let mut registry = self.registry.write().await;
-            registry.goldens.push(clone_golden_config(&outcome.config));
+            {
+                let mut registry = self.registry.write().await;
+                registry.goldens.push(clone_golden_config(&outcome.config));
+            }
+            self.persist_registry().await?;
         }
 
         Ok(outcome)
@@ -503,6 +536,14 @@ impl LsbxOps {
     /// `lsbx_golden`'s own `golden_verify` already checks the `GoldenConfig`
     /// it's handed against the key regex), it simply does not exist in this
     /// registry.
+    ///
+    /// For `os == "windows"`, the caller-supplied `pubkey`/`key_path` are
+    /// **overridden** with the baked-identity model: the sampled instance
+    /// gets a placeholder pubkey and `key_path = None`, so every
+    /// `Backend::run` authenticates with the backend's baked guest identity
+    /// (`~/.ssh/lsbx_guest_key`) exactly like a Windows `up` does. Callers
+    /// may still hand an ephemeral keypair over (the CLI does) without
+    /// breaking Windows verification — it is simply not used.
     pub async fn golden_verify(
         &self,
         name: &str,
@@ -519,6 +560,11 @@ impl LsbxOps {
                     LsbxError::NotFound(format!("no golden registered under key '{name}'"))
                 })?
         };
+        let (pubkey, key_path) = if golden.os == "windows" {
+            (WINDOWS_VERIFY_PUBKEY, None)
+        } else {
+            (pubkey, key_path)
+        };
         lsbx_golden::verify::golden_verify(
             self.backend.as_ref(),
             &golden,
@@ -531,36 +577,43 @@ impl LsbxOps {
 
     // ---- Implemented directly against the in-process ImageRegistry ----
 
-    /// **Implemented directly.** `ImageRegistry` has no persistence method
-    /// (see the module-level note) — this appends to the in-process
-    /// registry only. Rejects a `config.key` that collides with an
-    /// existing entry as `LsbxError::Usage` (re-registering under a key
-    /// that already resolves is malformed input, not an internal fault).
+    /// Appends to the in-process registry and, when a manifest path is
+    /// configured (see [`LsbxOps::with_images_path`]), persists it — so a
+    /// one-shot `lsbx golden register` survives the process exiting. Rejects
+    /// a `config.key` that collides with an existing entry as
+    /// `LsbxError::Usage` (re-registering under a key that already resolves
+    /// is malformed input, not an internal fault).
     pub async fn golden_register(&self, config: GoldenConfig) -> Result<(), LsbxError> {
-        let mut registry = self.registry.write().await;
-        if registry.find_golden(&config.key).is_some() {
-            return Err(LsbxError::Usage(format!(
-                "a golden is already registered under key '{}'",
-                config.key
-            )));
+        {
+            let mut registry = self.registry.write().await;
+            if registry.find_golden(&config.key).is_some() {
+                return Err(LsbxError::Usage(format!(
+                    "a golden is already registered under key '{}'",
+                    config.key
+                )));
+            }
+            registry.goldens.push(config);
         }
-        registry.goldens.push(config);
-        Ok(())
+        self.persist_registry().await
     }
 
-    /// **Implemented directly.** Same no-persistence caveat as
-    /// `golden_register`. `keep_snapshot` is accepted for interface-contract
-    /// parity but is a documented no-op — see the module-level note.
+    /// Removes a matching entry from the in-process registry and, when a
+    /// manifest path is configured, persists it. `keep_snapshot` is accepted
+    /// for interface-contract parity but is a documented no-op — snapshot
+    /// management is out of this crate's (and any landed crate's) scope
+    /// today (see the module-level note).
     pub async fn golden_delete(&self, name: &str, _keep_snapshot: bool) -> Result<(), LsbxError> {
-        let mut registry = self.registry.write().await;
-        let before = registry.goldens.len();
-        registry.goldens.retain(|g| g.key != name);
-        if registry.goldens.len() == before {
-            return Err(LsbxError::NotFound(format!(
-                "no golden registered under key '{name}'"
-            )));
+        {
+            let mut registry = self.registry.write().await;
+            let before = registry.goldens.len();
+            registry.goldens.retain(|g| g.key != name);
+            if registry.goldens.len() == before {
+                return Err(LsbxError::NotFound(format!(
+                    "no golden registered under key '{name}'"
+                )));
+            }
         }
-        Ok(())
+        self.persist_registry().await
     }
 
     /// **Implemented directly.** Clones the current in-process
@@ -623,6 +676,28 @@ fn format_streaming_mode(streaming: &lsbx_golden::registry::StreamingMode) -> St
         lsbx_golden::registry::StreamingMode::Novnc => "novnc",
     }
     .to_string()
+}
+
+/// Placeholder pubkey handed to `golden verify` for Windows goldens — see
+/// `golden_verify`'s own doc comment for why the caller-supplied
+/// key material is overridden there. Same value family as
+/// `lsbx-lifecycle`'s baked-identity placeholder.
+const WINDOWS_VERIFY_PUBKEY: &str = "ssh-ed25519 AAAA lsbx-baked-guest-identity";
+
+impl LsbxOps {
+    /// Writes the current in-process registry back to `self.images_path`
+    /// (when a path is configured), for the in-memory-mutating
+    /// `golden_register`/`golden_delete`/`golden_build --register`
+    /// operations. A no-op when no path was wired (tests, absent-mandate
+    /// doors like the gateway's empty registry) — matching those paths'
+    /// historical in-memory-only behavior.
+    async fn persist_registry(&self) -> Result<(), LsbxError> {
+        let Some(path) = self.images_path.as_deref() else {
+            return Ok(());
+        };
+        let registry = self.registry.read().await;
+        registry.save(path)
+    }
 }
 
 /// merged `registry.rs`), so a manual field-by-field clone is needed

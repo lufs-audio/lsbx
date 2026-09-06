@@ -169,6 +169,7 @@ pub async fn run_conformance_suite<B: Backend>(
         // exe.dev rejects values below 2 GiB; 2G remains valid for the
         // demo and libvirt backends while keeping the shared suite portable.
         memory: "2G",
+    os: "linux",
     };
 
     let create_result = bounded(backend.create_from_golden(req)).await;

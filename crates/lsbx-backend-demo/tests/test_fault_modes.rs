@@ -24,6 +24,7 @@ async fn test_fault_unavailable() {
         pubkey: "ssh-rsa AAA...",
         cpu: 2,
         memory: "2G",
+    os: "linux",
     };
 
     let res = backend.create_from_golden(req).await;
@@ -44,6 +45,7 @@ async fn test_fault_hang_on_run() {
         pubkey: "ssh-rsa AAA...",
         cpu: 2,
         memory: "2G",
+    os: "linux",
     };
 
     let vm = backend.create_from_golden(req).await.unwrap();
@@ -84,6 +86,7 @@ async fn test_fault_partial_destroy() {
         pubkey: "ssh-rsa AAA...",
         cpu: 2,
         memory: "2G",
+    os: "linux",
     };
 
     let vm = backend.create_from_golden(req).await.unwrap();
@@ -112,6 +115,7 @@ async fn test_fault_partial_destroy() {
             pubkey: "ssh-rsa AAA...",
             cpu: 2,
             memory: "2G",
+        os: "linux",
         })
         .await
         .unwrap();
@@ -139,6 +143,7 @@ async fn test_fault_partial_destroy_is_retryable_in_place() {
             pubkey: "ssh-rsa AAA...",
             cpu: 2,
             memory: "2G",
+        os: "linux",
         })
         .await
         .unwrap();

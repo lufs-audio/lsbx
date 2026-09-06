@@ -482,6 +482,7 @@ pub fn answers_to_create_request(
         ready_timeout: Duration::from_secs(30),
         verify: true,
         healthchecks: Vec::new(),
+        os: None,
     }
 }
 

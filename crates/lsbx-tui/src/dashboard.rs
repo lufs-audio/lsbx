@@ -595,6 +595,7 @@ mod tests {
                 ready_timeout: std::time::Duration::from_millis(200),
                 verify: false,
                 healthchecks: vec![],
+                os: None,
             })
             .await
             .expect("create should succeed");
@@ -648,6 +649,7 @@ mod tests {
                 ready_timeout: std::time::Duration::from_millis(200),
                 verify: false,
                 healthchecks: vec![],
+                os: None,
             })
             .await
             .expect("create should succeed");
@@ -704,6 +706,7 @@ mod tests {
                 ready_timeout: std::time::Duration::from_millis(200),
                 verify: false,
                 healthchecks: vec![],
+                os: None,
             })
             .await
             .expect("create should succeed");

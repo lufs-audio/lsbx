@@ -449,6 +449,7 @@ impl LsbxMcpServer {
                 ready_timeout: duration_from_secs(p.ready_timeout_secs),
                 verify: p.verify,
                 healthchecks: p.healthchecks,
+                os: None,
             })
             .await;
         envelope_result(result)

@@ -94,6 +94,7 @@ async fn reap_destroys_expired_and_leaves_live_sandboxes() {
             pubkey: "ssh-ed25519 AAAA test",
             cpu: 1,
             memory: "512M",
+        os: "linux",
         })
         .await
         .unwrap();
@@ -104,6 +105,7 @@ async fn reap_destroys_expired_and_leaves_live_sandboxes() {
             pubkey: "ssh-ed25519 AAAA test",
             cpu: 1,
             memory: "512M",
+        os: "linux",
         })
         .await
         .unwrap();
@@ -145,6 +147,7 @@ async fn reap_dry_run_reports_without_destroying() {
             pubkey: "ssh-ed25519 AAAA test",
             cpu: 1,
             memory: "512M",
+        os: "linux",
         })
         .await
         .unwrap();
@@ -195,6 +198,7 @@ async fn reap_retains_record_on_partial_destroy_failure_and_succeeds_on_retry() 
             pubkey: "ssh-ed25519 AAAA test",
             cpu: 1,
             memory: "512M",
+        os: "linux",
         })
         .await
         .unwrap();
@@ -252,6 +256,7 @@ async fn reap_retains_record_on_partial_destroy_failure_and_succeeds_on_retry() 
             pubkey: "ssh-ed25519 AAAA test",
             cpu: 1,
             memory: "512M",
+        os: "linux",
         })
         .await
         .unwrap();
@@ -299,6 +304,7 @@ async fn reap_continues_sweeping_other_sandboxes_after_one_destroy_failure() {
                 pubkey: "ssh-ed25519 AAAA test",
                 cpu: 1,
                 memory: "512M",
+            os: "linux",
             })
             .await
             .unwrap();
@@ -344,6 +350,7 @@ async fn reap_still_sweeps_expired_sandbox_whose_golden_is_not_in_allowed_set() 
             pubkey: "ssh-ed25519 AAAA test",
             cpu: 1,
             memory: "512M",
+        os: "linux",
         })
         .await
         .unwrap();

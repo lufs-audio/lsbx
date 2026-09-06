@@ -62,7 +62,7 @@ fn xml_escape(input: &str) -> String {
 
 /// Parameters needed to render a domain XML, gathered from
 /// `CreateFromGoldenRequest` plus the disk path this crate resolved
-/// separately (see `crate::golden_disk`).
+/// separately (see `crate::golden_disk`) and the golden's `os` string.
 pub struct DomainXmlParams<'a> {
     pub name: &'a str,
     pub cpu: u32,
@@ -72,6 +72,12 @@ pub struct DomainXmlParams<'a> {
     /// is added to the domain XML so the guest can read cloud-init
     /// `user-data`/`meta-data` at boot (SSH key injection, hostname, etc.).
     pub seed_iso: Option<&'a std::path::Path>,
+    /// The golden's declared `os`. `"windows"` renders a UEFI-hosted,
+    /// SecureBoot-enabled q35 domain with a virtual TPM (mirroring the
+    /// `provision-win11` reference domain) — a plain BIOS `pc` machine
+    /// cannot boot a Windows 11 guest; every other value renders the
+    /// Linux-style BIOS domain below.
+    pub os: &'a str,
 }
 
 /// Renders a KVM/QEMU domain XML matching the Python reference
@@ -84,11 +90,28 @@ pub struct DomainXmlParams<'a> {
 /// - QEMU guest agent channel (`org.qemu.guest_agent.0`) — required for
 ///   `virsh domifaddr --source agent` IP resolution
 /// - VNC graphics (autoport) for noVNC/WebSocket proxy access
+///
+/// For `os == "windows"` the Linux template is replaced wholesale with a
+/// Windows-shaped domain: q35 (`pc-q35-11.0`, matching this host's
+/// provisioned Windows reference — see `provision-win11`), `firmware='efi'`
+/// with the OVMF SecureBoot code image and a per-VM `_VARS.fd` nvram cut
+/// from the OVMF vars template, the `<hyperv>`/`<smm>` feature block,
+/// localtime clock with the hyperv clock timer, and a swtpm 2.0 TPM device.
+/// Windows guests do not run cloud-init, so on this path the seed ISO is
+/// never attached (callers must pass `seed_iso: None`) and the injected
+/// pubkey lives only in `<metadata>` (it must already be baked into the
+/// golden's `authorized_keys` for SSH to work at all).
 pub fn render_domain_xml(params: &DomainXmlParams<'_>, pubkey: &str) -> Result<String, LsbxError> {
     let memory_kib = parse_memory_to_kib(params.memory)?;
     let name = xml_escape(params.name);
     let disk_path = xml_escape(&params.disk_path.to_string_lossy());
     let pubkey_escaped = xml_escape(pubkey);
+
+    if params.os == "windows" {
+        return Ok(render_windows_domain_xml(
+            &name, memory_kib, params.cpu, &disk_path, &pubkey_escaped,
+        ));
+    }
 
     // Cloud-init seed ISO cdrom device (IDE bus, matching Python)
     let seed_disk = match params.seed_iso {
@@ -150,6 +173,105 @@ pub fn render_domain_xml(params: &DomainXmlParams<'_>, pubkey: &str) -> Result<S
         disk_path = disk_path,
         seed_disk = seed_disk,
     ))
+}
+
+/// Renders the Windows-shaped domain (see [`render_domain_xml`]'s doc
+/// comment). `name`/`disk_path`/`pubkey_escaped` arrive XML-escaped.
+fn render_windows_domain_xml(
+    name: &str,
+    memory_kib: u64,
+    cpu: u32,
+    disk_path: &str,
+    pubkey_escaped: &str,
+) -> String {
+    format!(
+        r#"<domain type='kvm'>
+  <name>{name}</name>
+  <memory unit='KiB'>{memory_kib}</memory>
+  <currentMemory unit='KiB'>{memory_kib}</currentMemory>
+  <vcpu placement='static'>{cpu}</vcpu>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='pc-q35-11.0'>hvm</type>
+    <firmware>
+      <feature enabled='no' name='enrolled-keys'/>
+      <feature enabled='yes' name='secure-boot'/>
+    </firmware>
+    <loader readonly='yes' secure='yes' type='pflash' format='raw'>/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd</loader>
+    <nvram template='/usr/share/edk2/x64/OVMF_VARS.4m.fd' templateFormat='raw' format='raw'>/var/lib/libvirt/qemu/nvram/{name}_VARS.fd</nvram>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+      <vpindex state='on'/>
+      <runtime state='on'/>
+      <synic state='on'/>
+      <stimer state='on'/>
+      <frequencies state='on'/>
+      <tlbflush state='on'/>
+      <ipi state='on'/>
+      <evmcs state='on'/>
+      <avic state='on'/>
+    </hyperv>
+    <vmport state='off'/>
+    <smm state='on'/>
+  </features>
+  <cpu mode='host-passthrough' check='none' migratable='on'/>
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='hypervclock' present='yes'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <metadata>
+    <lsbx:pubkey xmlns:lsbx="https://lufs.org/lsbx/domain-metadata">{pubkey_escaped}</lsbx:pubkey>
+  </metadata>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='{disk_path}'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <interface type='network'>
+      <source network='default'/>
+      <model type='virtio'/>
+    </interface>
+    <serial type='pty'/>
+    <console type='pty'/>
+    <channel type='unix'>
+      <source mode='bind'/>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <input type='tablet' bus='usb'/>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <tpm model='tpm-tis'>
+      <backend type='emulator' version='2.0'/>
+    </tpm>
+    <graphics type='vnc' port='-1' autoport='yes'/>
+    <video>
+      <model type='qxl' ram='65536' vram='65536' vgamem='16384' heads='1' primary='yes'/>
+    </video>
+  </devices>
+</domain>"#,
+        name = name,
+        memory_kib = memory_kib,
+        cpu = cpu,
+        disk_path = disk_path,
+        pubkey_escaped = pubkey_escaped,
+    )
 }
 
 #[cfg(test)]
@@ -215,6 +337,7 @@ mod tests {
             memory: "1G",
             disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-test-vm.qcow2"),
             seed_iso: None,
+            os: "linux",
         };
         let xml = render_domain_xml(&params, "ssh-ed25519 AAAA... lsbx:test").unwrap();
         assert!(xml.contains("<name>lsbx-test-vm</name>"));
@@ -235,6 +358,7 @@ mod tests {
             memory: "512M",
             disk_path: std::path::Path::new("/tmp/x.qcow2"),
             seed_iso: None,
+            os: "linux",
         };
         let xml = render_domain_xml(&params, "ssh-ed25519 AAAA\"quote lsbx:test").unwrap();
         assert!(!xml.contains("<name>lsbx-<injected></name>"));
@@ -250,6 +374,7 @@ mod tests {
             memory: "1G",
             disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-test-vm.qcow2"),
             seed_iso: Some(std::path::Path::new("/var/lib/lsbx/vms/lsbx-test-vm-cidata.iso")),
+            os: "linux",
         };
         let xml = render_domain_xml(&params, "ssh-ed25519 AAAA... test").unwrap();
         assert!(xml.contains("<target dev='hda' bus='ide'/>"));
@@ -265,7 +390,74 @@ mod tests {
             memory: "not-a-number",
             disk_path: std::path::Path::new("/tmp/x.qcow2"),
             seed_iso: None,
+            os: "linux",
         };
         assert!(render_domain_xml(&params, "irrelevant").is_err());
+    }
+
+    #[test]
+    fn windows_domain_uses_uefi_ovmf_secureboot_tpm_and_q35() {
+        let params = DomainXmlParams {
+            name: "lsbx-win-probe",
+            cpu: 4,
+            memory: "8GB",
+            disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-win-probe.qcow2"),
+            seed_iso: Some(std::path::Path::new("/var/lib/lsbx/vms/lsbx-win-probe-cidata.iso")),
+            os: "windows",
+        };
+        let xml = render_domain_xml(&params, "ssh-ed25519 AAAA... lsbx:win").unwrap();
+        assert!(xml.contains("machine='pc-q35-11.0'"));
+        assert!(xml.contains("firmware='efi'"));
+        assert!(xml.contains("/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd"));
+        assert!(xml.contains("/var/lib/libvirt/qemu/nvram/lsbx-win-probe_VARS.fd"));
+        assert!(xml.contains("<feature enabled='yes' name='secure-boot'/>"));
+        assert!(xml.contains("<hyperv mode='custom'>"));
+        assert!(xml.contains("<smm state='on'/>"));
+        assert!(xml.contains("<tpm model='tpm-tis'>"));
+        assert!(xml.contains("<backend type='emulator' version='2.0'/>"));
+        assert!(xml.contains("<clock offset='localtime'>"));
+        assert!(xml.contains("<timer name='hypervclock' present='yes'/>"));
+        assert!(xml.contains("<model type='qxl'"));
+        assert!(xml.contains("<graphics type='vnc' port='-1' autoport='yes'/>"));
+        // No cloud-init cdrom even when a seed ISO path is given — Windows
+        // never reads it, and attaching it on the IDE bus would waste a
+        // boot-order slot.
+        assert!(!xml.contains("device='cdrom'"));
+        assert!(!xml.contains("<target dev='hda'"));
+
+        // BIOS pc machine must not leak into the Windows shape.
+        assert!(!xml.contains("machine='pc'>"));
+    }
+
+    #[test]
+    fn windows_domain_keeps_memory_and_cpu() {
+        let params = DomainXmlParams {
+            name: "lsbx-win-mem",
+            cpu: 4,
+            memory: "8GB",
+            disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-win-mem.qcow2"),
+            seed_iso: None,
+            os: "windows",
+        };
+        let xml = render_domain_xml(&params, "irrelevant").unwrap();
+        assert!(xml.contains("<memory unit='KiB'>8388608</memory>"));
+        assert!(xml.contains("<currentMemory unit='KiB'>8388608</currentMemory>"));
+        assert!(xml.contains("vcpu placement='static'>4<"));
+    }
+
+    #[test]
+    fn non_windows_os_renders_bios_guest() {
+        let params = DomainXmlParams {
+            name: "lsbx-freebsd-probe",
+            cpu: 2,
+            memory: "1G",
+            disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-freebsd-probe.qcow2"),
+            seed_iso: None,
+            os: "freebsd",
+        };
+        let xml = render_domain_xml(&params, "ignored").unwrap();
+        assert!(xml.contains("machine='pc'>"));
+        assert!(!xml.contains("firmware='efi'"));
+        assert!(!xml.contains("<tpm"));
     }
 }

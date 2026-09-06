@@ -25,6 +25,12 @@ pub struct CreateFromGoldenRequest<'a> {
     pub pubkey: &'a str,
     pub cpu: u32,
     pub memory: &'a str,
+    /// The golden's declared `os` string (manifest `GoldenConfig.os`). The
+    /// backend uses it to render guest-appropriate domain XML (e.g.
+    /// `"windows"` — UEFI/TPM/SecureBoot instead of BIOS, and no cloud-init
+    /// seed ISO since Windows guests don't run cloud-init); every other
+    /// value is treated as a Linux-style BIOS guest.
+    pub os: &'a str,
 }
 
 #[async_trait::async_trait]

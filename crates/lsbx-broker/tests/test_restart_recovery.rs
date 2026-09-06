@@ -119,6 +119,7 @@ async fn reconcile_on_startup_resumes_tailing_for_a_running_record_not_just_list
             pubkey: "ssh-ed25519 AAAA fake",
             cpu: 1,
             memory: "1G",
+        os: "linux",
         })
         .await
         .expect("seed VM should provision");

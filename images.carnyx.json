@@ -95,7 +95,7 @@
       ],
       "healthcheck": [
         "echo lsbx-windows-ok",
-        "curl -fsS http://127.0.0.1:8000/vnc.html -o /dev/null"
+        "curl -fsS http://127.0.0.1:8000/vnc.html -o NUL"
       ],
       "description": "Windows 11 desktop golden (OpenSSH key-only; vnc server loopback :5900; websockify :8000), used via browser noVNC (carnyx)"
     }
