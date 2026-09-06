@@ -24,7 +24,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `rustls-tls-native-roots` (not webpki-compiled roots): the control-plane
+# client must honor the host's trust store so it works behind TLS-inspecting
+# proxies — corporate egress, CI middleboxes, and sandboxed agent runtimes
+# all re-sign upstream TLS with their own CA (found live 2026-09-04 fixing
+# lsbx#30: webpki roots failed where every system-store tool succeeded).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 # Pure-Rust, Tokio-native SSH — see SPEC.md §9 for why this is preferred over
 # shelling out to `ssh`. Pinned to the 0.44 line (not the newer 0.6x major
 # available on crates.io at implementation time) because 0.44's API is the

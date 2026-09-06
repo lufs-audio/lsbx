@@ -308,11 +308,9 @@ async fn connect_libvirt(state_dir: &std::path::Path) -> Result<LibvirtBackend, 
 /// environment. No door in this workspace has landed a real exedev
 /// configuration convention yet, so this reads the same shape of
 /// environment variables the existing Python system's exedev integration
-/// documents (`EXE_TOKEN` for the account-wide token) plus an explicit
-/// fallback SSH key path (`LSBX_EXEDEV_SSH_KEY`) for the documented
-/// 422-to-SSH retry (see `ExedevAuth`'s own doc comment for why that path
-/// must be explicit rather than guessed). Falls back to SSH-only auth via
-/// `LSBX_EXEDEV_SSH_KEY` alone when no token is set. Never itself fails —
+/// documents (`EXE_TOKEN` for the account-wide token — sufficient on its
+/// own since the #31 HTTPS fix). Falls back to SSH-only auth via
+/// `LSBX_EXEDEV_SSH_KEY` when no token is set. Never itself fails —
 /// construction of `ExedevAuth`/`ExedevBackend` is not fallible — so
 /// callers that need to know whether this backend can actually do
 /// anything must still call [`probe_backend`].
@@ -329,10 +327,7 @@ fn build_exedev() -> Result<ExedevBackend, LsbxError> {
         .unwrap_or_else(|_| "exe.dev".to_string());
 
     let auth = if let Some(token) = token {
-        match ssh_key {
-            Some(key) => ExedevAuth::account_token_with_fallback(token, key),
-            None => ExedevAuth::account_token(token),
-        }
+        ExedevAuth::account_token(token)
     } else if let Some(key) = ssh_key {
         ExedevAuth::Ssh { key_path: key }
     } else {

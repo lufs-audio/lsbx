@@ -52,6 +52,32 @@ broker is verified live). Use a matrix only when intentionally running a job
 once per host; otherwise select one placement through the repository CI
 variable or workflow input.
 
+## exe.dev auth (backend configuration)
+
+The exedev backend authenticates one of four ways, resolved by `lsbx`'s
+constructor from environment variables — HTTPS token auth and SSH auth are
+co-equal, and token auth is fully self-sufficient (control verbs AND guest
+command execution):
+
+- `EXE_TOKEN` (or `LSBX_EXEDEV_TOKEN_ENV` naming a different var) —
+  account-wide bearer token for `POST https://exe.dev/exec`. Every
+  account-level verb and short guest commands (`ssh <vm> <cmd>` with an
+  in-band exit sentinel) work over this alone. ~30 s server cap; stderr is
+  merged into the response body.
+- `LSBX_EXEDEV_SSH_KEY` — standalone SSH auth (private key path) when no
+  token is set.
+- `LSBX_EXEDEV_SSH_ALIAS` (default `exe.dev`) — SSH-alias auth, the
+  Molimo services' mode: token vars deliberately unset, key/agent supplied
+  by the host's SSH config.
+- VM-scoped tokens (`v0@VM.exe.xyz`) are constructible in code; the CLI
+  does not read them from env.
+
+Cloud agents with no SSH key use the token path; local agents on hosts with
+`ssh exe.dev` configured keep the alias path. `X-Exe-Exit` trailer note:
+exe.dev documents it, but it is not exposed through proxy chains — exit
+codes from guest exec arrive in-band (the client handles this; raw curl
+users should append `; echo EXIT:$?` and parse the tail).
+
 ## Broker operations
 
 - Molimo service: `lsbx-ci-broker-exe`
