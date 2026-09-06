@@ -105,6 +105,7 @@ fn non_interactive_create_request<'a>(
         ready_timeout: Duration::from_secs(30),
         verify: true,
         healthchecks: Vec::new(),
+        os: None,
     }
 }
 

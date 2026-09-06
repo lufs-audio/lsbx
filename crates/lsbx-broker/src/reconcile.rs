@@ -195,6 +195,7 @@ impl<'a> Reconciler<'a> {
                 ready_timeout: Duration::from_secs(120),
                 verify: true,
                 healthchecks: vec![],
+                os: None,
             })
             .await?;
 

@@ -123,6 +123,7 @@ fn create_request<'a>(
         // that backend detail.
         verify: false,
         healthchecks: vec![],
+        os: None,
     }
 }
 

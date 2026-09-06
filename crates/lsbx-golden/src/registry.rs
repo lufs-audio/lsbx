@@ -96,7 +96,7 @@ pub struct ImageRegistry {
 }
 
 /// Raw on-disk shape of `images.json` / `images.carnyx.json`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RawImageRegistry {
     #[serde(default)]
     images: Vec<ImageConfig>,
@@ -153,6 +153,39 @@ impl ImageRegistry {
             images: raw.images,
             goldens: raw.goldens,
             profiles: raw.profiles,
+        })
+    }
+
+    /// Serializes this registry back to the manifest schema and writes it
+    /// to `path` (creating/overwriting the file). The in-memory
+    /// `images`/`goldens`/`profiles` sections are round-tripped — a
+    /// registry loaded via [`load`](Self::load) writes back with the same
+    /// shape it was read with, plus any `golden register`/`golden delete`
+    /// mutations made in between.
+    ///
+    /// I/O failures (unwritable path, disk error) map to
+    /// `LsbxError::BackendUnavailable`, treating "could not persist the
+    /// registry this process mutated" as an infrastructure fault rather
+    /// than an input problem.
+    pub fn save(&self, path: &Path) -> Result<(), LsbxError> {
+        let raw = RawImageRegistry {
+            images: self.images.clone(),
+            goldens: self.goldens.clone(),
+            profiles: self.profiles.clone(),
+        };
+        let contents = serde_json::to_string_pretty(&raw).map_err(|e| {
+            LsbxError::ContractViolated(format!(
+                "failed to serialize golden image manifest for {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        std::fs::write(path, format!("{contents}\n")).map_err(|e| {
+            LsbxError::BackendUnavailable(format!(
+                "failed to write golden image manifest at {}: {}",
+                path.display(),
+                e
+            ))
         })
     }
 
@@ -337,5 +370,52 @@ mod tests {
         assert_eq!(allowed.len(), 2);
         assert!(allowed.contains("base-one"));
         assert!(allowed.contains("base-two"));
+    }
+
+    #[test]
+    fn save_round_trips_goldens_images_and_profiles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("images.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "images": [
+                    {"key": "win11-iso", "os": "windows", "arch": "x86_64", "iso_path": "isos/win11.iso", "description": "install iso"}
+                ],
+                "goldens": [
+                    {"key": "win11-desktop", "flavor": "desktop", "os": "windows", "base": "win11-desktop", "mode": "copy", "cpu": 4, "memory": "8GB", "disk": "goldens/win11-desktop.qcow2", "streaming": "novnc", "capabilities": ["desktop"], "healthcheck": ["echo lsbx-windows-ok"], "repo": null, "content_hash": "sha256:abcd", "description": "windows golden"}
+                ],
+                "profiles": {}
+            }"#,
+        )
+        .expect("write");
+        let registry = ImageRegistry::load(&path).expect("load");
+
+        let out_path = dir.path().join("images.out.json");
+        registry.save(&out_path).expect("save");
+
+        let reloaded = ImageRegistry::load(&out_path).expect("reload");
+        assert_eq!(reloaded.images.len(), 1);
+        assert_eq!(reloaded.goldens.len(), 1);
+        let golden = &reloaded.goldens[0];
+        assert_eq!(golden.key, "win11-desktop");
+        assert_eq!(golden.os, "windows");
+        assert_eq!(golden.cpu, 4);
+        assert_eq!(golden.memory, "8GB");
+        assert_eq!(golden.disk.as_deref(), Some("goldens/win11-desktop.qcow2"));
+        assert_eq!(golden.healthcheck, vec!["echo lsbx-windows-ok"]);
+        assert_eq!(golden.content_hash.as_deref(), Some("sha256:abcd"));
+    }
+
+    #[test]
+    fn save_failure_maps_to_backend_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = ImageRegistry {
+            images: vec![],
+            goldens: vec![],
+            profiles: HashMap::new(),
+        };
+        let result = registry.save(&dir.path().join("no-such-dir").join("images.json"));
+        assert!(matches!(result, Err(LsbxError::BackendUnavailable(_))));
     }
 }

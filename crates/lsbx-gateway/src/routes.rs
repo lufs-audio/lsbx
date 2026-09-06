@@ -641,6 +641,7 @@ async fn create_sandbox(
         ready_timeout: Duration::from_secs(body.ready_timeout_secs),
         verify: body.verify,
         healthchecks: body.healthchecks,
+        os: None,
     };
 
     match state.ops.create(req).await {

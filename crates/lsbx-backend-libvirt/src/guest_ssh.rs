@@ -151,6 +151,46 @@ fn shell_quote_join(command: &[String]) -> String {
         .join(" ")
 }
 
+/// True when `command` targets a Windows guest session: it has sshd
+/// execute `cmd /c` (Windows OpenSSH's default session shell), and a
+/// `cmd /c` prefix is the marker the host-side healthcheck wrappers (see
+/// `lsbx-ops`/`lsbx-golden`'s `os == "windows"` branches) use to say so.
+fn is_cmd_session(command: &[String]) -> bool {
+    command.len() >= 2 && command[0] == "cmd" && command[1] == "/c"
+}
+
+/// Quotes a single argument for a cmd.exe command line. cmd.exe strips
+/// double quotes around a token and has no concept of POSIX quoting — a
+/// POSIX `'echo hello'` arrives as the literal token `'echo`, so this
+/// reconstruction only adds quotes where cmd.exe needs them (embedded
+/// whitespace or the metacharacters `&|<>^()`), doubling any embedded
+/// quote the way cmd.exe's quoting rules expect.
+fn cmd_quote(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    let needs_quotes = arg
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '&' | '|' | '<' | '>' | '^' | '(' | ')'));
+    if needs_quotes {
+        format!("\"{}\"", arg.replace('"', "\"\""))
+    } else {
+        arg.to_string()
+    }
+}
+
+/// Rebuilds a [`crate::guest_ssh::run_command`]-style argv for the
+/// Windows `cmd /c …` session shape: `cmd /c` followed by the remaining
+/// elements joined with spaces and quoted with [`cmd_quote`]'s cmd.exe
+/// rules. (The caller passes the whole command line as a single element, so
+/// the common result is the canonical `cmd /c "…"` usage — cmd.exe runs
+/// everything after `/c` as one line.)
+fn shell_quote_join_cmd(command: &[String]) -> String {
+    debug_assert!(is_cmd_session(command));
+    let remainder = command[2..].join(" ");
+    format!("cmd /c {}", cmd_quote(&remainder))
+}
+
 /// Runs `command` inside the guest over batch-mode SSH, with stdin
 /// isolated from `/dev/null` — the acceptance criterion this module exists
 /// to satisfy. `command` is an argv array; because OpenSSH's client only
@@ -164,6 +204,13 @@ fn shell_quote_join(command: &[String]) -> String {
 /// `--version` in `$0` — `git` printing usage and exiting 1 — exactly the
 /// argv-collapse hazard the Python reference avoids by accepting its
 /// command as a single pre-joined string.
+///
+/// Windows guest sessions are the deliberate exception: their `cmd /c …`
+/// argv ([`is_cmd_session`]) targets cmd.exe, which has no POSIX shell to
+/// strip single quotes, so it is reconstructed with
+/// [`shell_quote_join_cmd`]'s cmd.exe-quoting rules instead (otherwise a
+/// `["cmd", "/c", "echo hello"]` wrapper would ship as `cmd /c 'echo
+/// hello'` and cmd.exe would try to run the literal token `'echo`).
 pub async fn run_command(
     target: &GuestSshTarget<'_>,
     command: &[String],
@@ -171,7 +218,13 @@ pub async fn run_command(
 ) -> Result<lsbx_kernel::backend::CommandOutput, LsbxError> {
     let mut args = base_ssh_args(target);
     args.push(format!("{}@{}", target.username, target.host).into());
-    args.push(shell_quote_join(command).into());
+
+    let remote_command = if is_cmd_session(command) {
+        shell_quote_join_cmd(command)
+    } else {
+        shell_quote_join(command)
+    };
+    args.push(remote_command.into());
 
     let child = Command::new("ssh")
         .args(&args)
@@ -340,6 +393,54 @@ mod tests {
             "sh -c 'git --version'"
         );
         assert_eq!(shell_quote_join(&["true".to_string()]), "true");
+    }
+
+    #[test]
+    fn cmd_session_reconstruction_wraps_command_line_for_cmd_exe() {
+        // Windows healthchecks arrive as `["cmd", "/c", "<cmd line>"]`; the
+        // transport must rebuild a cmd.exe command line (double-quoted unit
+        // after `/c`), NOT a POSIX-quoted one that cmd.exe would read as
+        // literal single-quote tokens.
+        assert_eq!(
+            shell_quote_join_cmd(&[
+                "cmd".to_string(),
+                "/c".to_string(),
+                "echo lsbx-windows-ok".to_string(),
+            ]),
+            "cmd /c \"echo lsbx-windows-ok\""
+        );
+        assert_eq!(
+            shell_quote_join_cmd(&[
+                "cmd".to_string(),
+                "/c".to_string(),
+                "curl -fsS http://127.0.0.1:8000/vnc.html -o NUL".to_string(),
+            ]),
+            "cmd /c \"curl -fsS http://127.0.0.1:8000/vnc.html -o NUL\""
+        );
+    }
+
+    #[test]
+    fn cmd_session_detection_triggers_on_cmd_c_prefix_only() {
+        assert!(is_cmd_session(&[
+            "cmd".to_string(),
+            "/c".to_string(),
+            "echo hi".to_string(),
+        ]));
+        assert!(!is_cmd_session(&[
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo hi".to_string(),
+        ]));
+        assert!(!is_cmd_session(&["true".to_string()]));
+    }
+
+    #[test]
+    fn cmd_quote_only_quotes_when_needed() {
+        assert_eq!(cmd_quote("curl"), "curl");
+        assert_eq!(cmd_quote("NUL"), "NUL");
+        assert_eq!(cmd_quote("echo hi"), "\"echo hi\"");
+        assert_eq!(cmd_quote(""), "\"\"");
+        assert_eq!(cmd_quote("a&b"), "\"a&b\"");
     }
 
     /// The named acceptance scenario from the unit contract: a remote

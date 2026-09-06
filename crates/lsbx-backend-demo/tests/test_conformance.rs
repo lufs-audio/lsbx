@@ -39,6 +39,7 @@ async fn deterministic_vm_tag() {
         pubkey: "ssh-rsa AAA...",
         cpu: 2,
         memory: "2G",
+    os: "linux",
     };
 
     let req2 = CreateFromGoldenRequest {
@@ -47,6 +48,7 @@ async fn deterministic_vm_tag() {
         pubkey: "ssh-rsa AAA...",
         cpu: 2,
         memory: "2G",
+    os: "linux",
     };
 
     let vm1 = backend1.create_from_golden(req1).await.unwrap();

@@ -426,6 +426,7 @@ struct OpsDeps {
     registry: ImageRegistry,
     clock: Box<dyn Clock>,
     state_dir: PathBuf,
+    images_path: PathBuf,
 }
 
 impl OpsDeps {
@@ -438,6 +439,10 @@ impl OpsDeps {
             self.registry,
             self.clock,
         )
+        // Registry mutations (`golden register`/`golden delete`/`golden
+        // build --register`) persist back to the manifest this CLI loaded,
+        // so a one-shot command survives the process exiting.
+        .with_images_path(self.images_path)
     }
 }
 
@@ -518,6 +523,7 @@ async fn build_deps(
         registry,
         clock: Box::new(SystemClock),
         state_dir,
+        images_path,
     })
 }
 
@@ -660,6 +666,7 @@ async fn dispatch(
                     ready_timeout: ready_timeout_duration,
                     verify: !no_verify,
                     healthchecks: Vec::new(),
+                    os: None,
                 };
 
                 let result = ops.create(req).await;
@@ -969,14 +976,21 @@ async fn dispatch_golden(
             profile: _,
             base,
             flavor,
+            os,
             streaming,
             capabilities,
             healthcheck,
+            cpu,
+            memory,
+            disk,
+            mode,
+            repo,
             content_hash,
             replace,
         } => {
             let flavor = parse_flavor(flavor)?;
             let streaming_mode = parse_streaming(streaming.as_deref());
+            let mode = parse_mode(mode)?;
 
             if *replace {
                 // Best-effort: a golden that doesn't exist yet is fine to
@@ -991,16 +1005,16 @@ async fn dispatch_golden(
             let config = GoldenConfig {
                 key: name.clone(),
                 flavor,
-                os: "linux".to_string(),
+                os: os.clone(),
                 base: base.clone(),
-                mode: GoldenMode::Copy,
-                cpu: 1,
-                memory: "1G".to_string(),
-                disk: None,
+                mode,
+                cpu: *cpu,
+                memory: memory.clone(),
+                disk: disk.clone(),
                 streaming: streaming_mode,
                 capabilities: capabilities.clone(),
                 healthcheck: healthcheck.clone(),
-                repo: None,
+                repo: repo.clone(),
                 content_hash: content_hash.clone(),
                 description: format!("Registered via lsbx golden register ({base})"),
             };
@@ -1632,6 +1646,16 @@ fn parse_streaming(input: Option<&str>) -> StreamingMode {
     match input.map(str::to_lowercase).as_deref() {
         Some("novnc") => StreamingMode::Novnc,
         _ => StreamingMode::None,
+    }
+}
+
+fn parse_mode(input: &str) -> Result<GoldenMode, LsbxError> {
+    match input.to_lowercase().as_str() {
+        "copy" => Ok(GoldenMode::Copy),
+        "new" => Ok(GoldenMode::New),
+        other => Err(LsbxError::Usage(format!(
+            "invalid --mode '{other}' (expected copy or new)"
+        ))),
     }
 }
 

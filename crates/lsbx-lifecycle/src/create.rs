@@ -45,12 +45,30 @@ pub struct CreateRequest<'a> {
     /// `lsbx-golden` (Unit 08), which is where a real golden's declared
     /// healthchecks actually live.
     pub healthchecks: Vec<Vec<String>>,
+    /// The golden's declared `os`, resolved by the caller (typically
+    /// `lsbx-ops` from the golden config). `Some("windows")` switches this
+    /// crate's identity handling: Windows goldens cannot consume an
+    /// ephemeral pubkey (no cloud-init to inject it — see the libvirt
+    /// backend's seed-ISO skip), so no ephemeral keypair is generated and
+    /// every subsequent `Backend::run` auths with the deployment's baked
+    /// guest identity (the backend's `None`-identity fallback, i.e.
+    /// `~/.ssh/lsbx_guest_key`). Any other value (or `None`) keeps today's
+    /// ephemeral-keypair path.
+    pub os: Option<&'a str>,
 }
 
 /// How long to sleep between readiness polls. Short enough that
 /// `ready_timeout`s used in tests (milliseconds) still get at least one
 /// retry; not so short that a real poll loop busy-spins.
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Placeholder public-key line recorded for Windows-golden sandboxes, where
+/// no ephemeral keypair is generated (see `CreateRequest::os`). Never
+/// injected into the guest — it is carried through `CreateFromGoldenRequest`
+/// only so the backend has a `<metadata>` pubkey to record and the
+/// `SandboxRecord` has a non-empty `pubkey` field for `destroy_with_key`
+/// parity.
+const BAKED_GUEST_IDENTITY_PUBKEY: &str = "ssh-ed25519 AAAA lsbx-baked-guest-identity";
 
 fn golden_key_for_profile(req: &CreateRequest<'_>) -> GoldenKey {
     GoldenKey::new_unchecked(req.golden.unwrap_or(req.profile).to_string())
@@ -213,36 +231,64 @@ pub async fn create(
     let id = uuid_like_id(clock);
     let name = req.name.unwrap_or(id.as_str()).to_string();
 
-    let keypair =
-        lsbx_keys::keygen::generate_ephemeral_keypair_in(&store.state_dir().join("keys"), &id)?;
+    // Windows goldens cannot consume an ephemeral injected pubkey (no
+    // cloud-init in the guest, so the backend skips the seed ISO), meaning
+    // the per-sandbox ephemeral keypair this function normally derives is
+    // useless for them — SSH auth must fall back to the baked identity the
+    // backend uses for a `None` identity file (`~/.ssh/lsbx_guest_key`).
+    // Branch here so the record stores no key material and every `run`
+    // call (readiness, exec) resolves to that baked identity.
+    let windows = req.os == Some("windows");
+    let keypair = if windows {
+        None
+    } else {
+        Some(lsbx_keys::keygen::generate_ephemeral_keypair_in(
+            &store.state_dir().join("keys"),
+            &id,
+        )?)
+    };
+    let pubkey = keypair
+        .as_ref()
+        .map(|kp| kp.public_key_line.clone())
+        // Informational only for windows — never injected, never read back
+        // by the guest; it lands in the domain XML `<metadata>` so an
+        // operator can see which placement baked the identity in use.
+        .unwrap_or_else(|| BAKED_GUEST_IDENTITY_PUBKEY.to_string());
+    let identity_path = keypair.as_ref().map(|kp| kp.private_key_path.as_path());
 
     let golden = golden_key_for_profile(&req);
     let create_result = backend
         .create_from_golden(CreateFromGoldenRequest {
             golden: &golden,
             name: &name,
-            pubkey: &keypair.public_key_line,
+            pubkey: &pubkey,
             cpu: req.cpu.unwrap_or(1),
             memory: req.memory.unwrap_or("1G"),
+            os: req.os.unwrap_or("linux"),
         })
         .await;
 
     let created_vm = match create_result {
         Ok(vm) => vm,
         Err(e) => {
-            // Nothing was persisted yet — only the keypair needs cleanup.
-            let _ = lsbx_keys::keygen::cleanup_keypair(&keypair);
+            // Nothing was persisted yet — only the keypair (if any) needs
+            // cleanup.
+            if let Some(kp) = &keypair {
+                let _ = lsbx_keys::keygen::cleanup_keypair(kp);
+            }
             return Err(e);
         }
     };
 
-    if let Err(error) = backend
-        .register_vm_key(&created_vm.vm_tag, &keypair.private_key_path)
-        .await
-    {
-        let _ = backend.destroy(&created_vm.vm_tag).await;
-        let _ = lsbx_keys::keygen::cleanup_keypair(&keypair);
-        return Err(error);
+    if let Some(kp) = &keypair {
+        if let Err(error) = backend
+            .register_vm_key(&created_vm.vm_tag, &kp.private_key_path)
+            .await
+        {
+            let _ = backend.destroy(&created_vm.vm_tag).await;
+            let _ = lsbx_keys::keygen::cleanup_keypair(kp);
+            return Err(error);
+        }
     }
 
     let created_at = rfc3339_now(clock);
@@ -262,13 +308,17 @@ pub async fn create(
             }
         }),
         username: None,
-        key_name: Some(keypair.label.clone()),
-        key_path: Some(keypair.private_key_path.to_string_lossy().into_owned()),
+        key_name: keypair.as_ref().map(|kp| kp.label.clone()),
+        key_path: keypair
+            .as_ref()
+            .map(|kp| kp.private_key_path.to_string_lossy().into_owned()),
         key_dir: keypair
-            .private_key_path
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned()),
-        pubkey: Some(keypair.public_key_line.clone()),
+            .as_ref()
+            .and_then(|kp| kp.private_key_path.parent().map(|p| p.to_string_lossy().into_owned())),
+        pubkey: keypair
+            .as_ref()
+            .map(|kp| kp.public_key_line.clone())
+            .or(Some(pubkey.clone())),
         task_id: req.task_id.map(str::to_string),
         created_at: Some(created_at),
         lease_expires_at: Some(lease_expires_at),
@@ -290,7 +340,7 @@ pub async fn create(
             &created_vm.vm_tag,
             &req.healthchecks,
             req.ready_timeout,
-            Some(&keypair.private_key_path),
+            identity_path,
         )
         .await?;
     }

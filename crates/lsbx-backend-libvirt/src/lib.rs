@@ -223,7 +223,24 @@ impl LibvirtBackend {
                 let output = self.run_virsh(&["domifaddr", vm_tag, "--source", source]).await;
                 if let Ok(out) = output {
                     if let Some(caps) = ipv4_re.captures(&out) {
-                        return Ok(caps[1].to_string());
+                        let ip = &caps[1];
+                        // Windows guests transiently report auto-configured
+                        // addresses while booting that are never reachable
+                        // from the host — loopback (127/8) always, and
+                        // APIPA link-local (169.254/16) until DHCP
+                        // completes — so keep polling until a routable IPv4
+                        // appears rather than returning a dead end.
+                        if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                            let non_routeable = match addr {
+                                std::net::IpAddr::V4(v4) => {
+                                    v4.is_loopback() || v4.is_link_local()
+                                }
+                                std::net::IpAddr::V6(v6) => v6.is_loopback(),
+                            };
+                            if !non_routeable {
+                                return Ok(ip.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -403,7 +420,14 @@ impl Backend for LibvirtBackend {
         // Create cloud-init seed ISO (matching Python's `_seed_iso` path).
         // Uses xorriso in mkisofs mode to produce a FAT9660 cidata ISO
         // containing user-data (SSH pubkey + user config) and meta-data.
-        let seed_iso_path = self.create_seed_iso(req.name, req.pubkey).await?;
+        // Windows guests never run cloud-init, so no seed ISO is produced
+        // for them — the pubkey they need must already be baked into the
+        // golden's `authorized_keys` (see `domain_xml`'s doc comment).
+        let seed_iso_path = if req.os == "windows" {
+            None
+        } else {
+            Some(self.create_seed_iso(req.name, req.pubkey).await?)
+        };
 
         let xml = domain_xml::render_domain_xml(
             &domain_xml::DomainXmlParams {
@@ -411,7 +435,8 @@ impl Backend for LibvirtBackend {
                 cpu: req.cpu,
                 memory: req.memory,
                 disk_path: &vm_disk_path,
-                seed_iso: Some(&seed_iso_path),
+                seed_iso: seed_iso_path.as_deref(),
+                os: req.os,
             },
             req.pubkey,
         )?;
