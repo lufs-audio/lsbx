@@ -11,11 +11,10 @@ permissions:
 
 jobs:
   build:
-    # lufs-audio/lsbx is public, while the organization `exe` runner group
-    # intentionally disallows public repositories. Keep project CI on a
-    # GitHub-hosted runner; Molimo's self-hosted broker is exercised by the
-    # private-repository runner workflows and maintenance rehearsal.
-    runs-on: ubuntu-latest
+    # Runs on the Molimo zero-idle broker (`lsbx ci-broker run`), whose
+    # provisioned ephemeral VM runners register with the `lsbx-default` label
+    # in the org's public-repo-enabled `lsbx-default` runner group.
+    runs-on: [self-hosted, lsbx-default]
     steps:
       - uses: actions/checkout@v4
       - name: Install native dependencies

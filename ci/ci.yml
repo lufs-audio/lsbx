@@ -8,9 +8,10 @@ on:
 
 jobs:
   build:
-    # The public lsbx repository cannot use Molimo's private-only `exe`
-    # runner group; project CI runs on GitHub-hosted infrastructure.
-    runs-on: ubuntu-latest
+    # Runs on the Molimo zero-idle broker (`lsbx ci-broker run`), whose
+    # provisioned ephemeral VM runners register with the `lsbx-default` label
+    # in the org's public-repo-enabled `lsbx-default` runner group.
+    runs-on: [self-hosted, lsbx-default]
     steps:
     - uses: actions/checkout@v4
     - name: Install native dependencies
