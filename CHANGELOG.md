@@ -12,6 +12,40 @@ engine and zero-idle CI runner broker, as a 17-crate Cargo workspace. See
 `docs/specs/2026-08-24T0030Z_rust-lsbx-rewrite/SPEC.md` for the full spec and
 its 15 documented deviations from the original kickoff brief.
 
+### Added
+
+- **`lsbx golden reconcile`** — cross-references the manifest's goldens
+  against the backend's **live** VM inventory (`Backend::list_vms`): each
+  manifest golden reports `present` (its base VM is currently live) or
+  `missing`, and golden-shaped VMs (`lsbx-*-v*` naming convention) with no
+  manifest entry are listed under `unregistered_vms` as candidates for
+  `golden register`. Available through every door: the CLI subcommand
+  (`lsbx golden reconcile`, `--json` envelope + human KEY/BASE/STATUS
+  table), the MCP tool (`golden_reconcile` — `LsbxOps` now exposes 19
+  public methods, parity assertions updated), and
+  `LsbxOps::golden_reconcile` itself. A control-plane failure propagates
+  verbatim — a dead backend never masquerades as an empty inventory.
+  Closes the 2026-09-15 exedev-golden-discovery gap: `golden list` is
+  registry-only by design, so goldens that existed only as tagged VMs on a
+  live exe.dev account were invisible to every door.
+
+### Fixed
+
+- **A missing default image manifest is no longer silently treated as an
+  empty registry.** The CLI still proceeds (correct behavior — a fresh
+  host has no manifest yet), but now prints a stderr note naming the
+  default path it looked at and the remedy (`--images` / `LSBX_IMAGES` /
+  `LSBX_IMAGES_PATH`). An explicitly passed `--images` path that is absent
+  stays silent, since the caller chose that path. This cost real debugging
+  time on kora (2026-09-15): `-b exedev` was live and authenticated, but
+  the empty default view read as "the backend has no goldens" rather than
+  "no manifest was ever installed at `<state_dir>/images.json`".
+- Also fixed: `lsbx-mcp` migrated off the `rmcp::model::ServerInfo`
+  deprecated alias to `ServerConfig` (rmcp 3.4.0 in the current lockfile
+  resolution), restoring a clean
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  gate.
+
 ### Removed
 
 - **Dead 422-fallback machinery** (follow-up to #30/#31): the
