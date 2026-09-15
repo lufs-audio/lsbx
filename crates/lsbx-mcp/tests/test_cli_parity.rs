@@ -29,10 +29,10 @@
 //!
 //! Rust has no runtime reflection over `impl` blocks, so this list is a
 //! hardcoded transcription — cross-checked directly against
-//! `crates/lsbx-ops/src/lib.rs`'s real `impl LsbxOps` block at the same
-//! commit named above, not against this unit's own contract text's
-//! older, superseded literal operation listing. Counted directly: 18
-//! `pub async fn` methods on `LsbxOps`.
+//! `crates/lsbx-ops/src/lib.rs`'s real `impl LsbxOps` block, not against
+//! this unit's own contract text's older, superseded literal operation
+//! listing. Counted directly: 19 `pub async fn` methods on `LsbxOps`
+//! (`golden_reconcile` added 2026-09-15).
 
 const LSBX_OPS_PUBLIC_METHODS: &[&str] = &[
     "create",
@@ -51,6 +51,7 @@ const LSBX_OPS_PUBLIC_METHODS: &[&str] = &[
     "golden_register",
     "golden_delete",
     "golden_list",
+    "golden_reconcile",
     "config_show",
     "logs_query",
 ];
@@ -86,9 +87,9 @@ fn registered_tool_names_matches_lsbx_ops_public_methods_exactly() {
     );
     assert_eq!(
         registered.len(),
-        18,
-        "expected exactly 18 registered tools (LsbxOps's real public method count as of \
-         commit 86506e28d0b4448527379e4487e7cab03341180d); if this fails because LsbxOps \
+        19,
+        "expected exactly 19 registered tools (LsbxOps's real public method count; \
+         golden_reconcile added 2026-09-15); if this fails because LsbxOps \
          gained or lost a method, update LSBX_OPS_PUBLIC_METHODS above to match the real, \
          current crates/lsbx-ops/src/lib.rs before touching this assertion"
     );

@@ -41,7 +41,7 @@ use lsbx_kernel::envelope::Envelope;
 use lsbx_kernel::error::LsbxError;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -383,6 +383,9 @@ pub struct GoldenDeleteParams {
 pub struct GoldenListParams {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GoldenReconcileParams {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ConfigShowParams {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -689,6 +692,33 @@ impl LsbxMcpServer {
         envelope_result(result)
     }
 
+    #[tool(
+        description = "Cross-reference the manifest's goldens against the backend's live VM inventory (present/missing per golden, plus unregistered golden-shaped VMs)"
+    )]
+    pub async fn golden_reconcile(
+        &self,
+        Parameters(_p): Parameters<GoldenReconcileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Same inline-JSON mapping the `status` tool uses: the ops façade's
+        // response type is a plain struct (the StatusReport convention), so
+        // this door owns the wire shape.
+        let result = self.ops.golden_reconcile().await.map(|report| {
+            serde_json::json!({
+                "items": report
+                    .items
+                    .into_iter()
+                    .map(|item| serde_json::json!({
+                        "key": item.key,
+                        "base": item.base,
+                        "status": item.status,
+                    }))
+                    .collect::<Vec<_>>(),
+                "unregistered_vms": report.unregistered_vms,
+            })
+        });
+        envelope_result(result)
+    }
+
     #[tool(description = "Summarize the running registry's image/golden/profile counts and keys")]
     pub async fn config_show(
         &self,
@@ -712,11 +742,12 @@ impl LsbxMcpServer {
 
 #[tool_handler]
 impl ServerHandler for LsbxMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "lsbx MCP door: one tool per LsbxOps operation (create, destroy, renew, reap, \
                  list, info, console_url, exec, put, get, status, golden_build, golden_verify, \
-                 golden_register, golden_delete, golden_list, config_show, logs_query). Every \
+                 golden_register, golden_delete, golden_list, golden_reconcile, config_show, \
+                 logs_query). Every \
                  tool response is the same Envelope<T> shape lsbx --json and the HTTP gateway \
                  produce."
                 .to_string(),
