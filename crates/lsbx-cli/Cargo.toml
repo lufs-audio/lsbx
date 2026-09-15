@@ -44,6 +44,13 @@ axum = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The golden-reconcile integration test drives a purpose-built backend stub
+# that implements the real `Backend` trait (async_trait like every backend
+# crate), so the CLI path is exercised end-to-end against a settable VM
+# inventory rather than only the demo backend's hashed names.
+async-trait = { workspace = true }
+lsbx-kernel = { workspace = true, features = ["testing"] }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

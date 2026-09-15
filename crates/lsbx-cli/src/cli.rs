@@ -175,6 +175,10 @@ pub enum Command {
 #[derive(Subcommand)]
 pub enum GoldenCommand {
     List,
+    /// Cross-reference the manifest's goldens against the backend's live VM
+    /// inventory: each golden reports `present`/`missing`, and golden-shaped
+    /// VMs with no manifest entry are listed as `unregistered`.
+    Reconcile,
     Build {
         name: String,
         #[arg(long)]
