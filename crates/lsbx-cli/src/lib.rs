@@ -503,11 +503,29 @@ async fn build_deps(
         // No populated catalog yet is not this CLI's problem to fail on —
         // see `resolve_images_path`'s doc comment. A malformed (but
         // present) file is a real problem and still propagates.
-        Err(LsbxError::NotFound(_)) => ImageRegistry {
-            images: Vec::new(),
-            goldens: Vec::new(),
-            profiles: std::collections::HashMap::new(),
-        },
+        Err(LsbxError::NotFound(_)) => {
+            // The empty registry is still the correct, non-failing
+            // behavior, but it must not be *silent*: an empty golden/image
+            // view that is actually "the manifest was never found at the
+            // default path" reads exactly like "this backend genuinely
+            // has no goldens", which cost real debugging time
+            // (2026-09-15's exedev-golden-discovery gap). Only warn for
+            // the implicit defaults — an explicit `--images` path that is
+            // absent is the caller's own error.
+            if args.images.is_none() {
+                eprintln!(
+                    "lsbx: note: no image manifest found at the default path '{}' \
+                     — proceeding with an empty image registry (pass `--images` \
+                     explicitly, or set LSBX_IMAGES/LSBX_IMAGES_PATH)",
+                    images_path.display()
+                );
+            }
+            ImageRegistry {
+                images: Vec::new(),
+                goldens: Vec::new(),
+                profiles: std::collections::HashMap::new(),
+            }
+        }
         Err(e) => return Err(e),
     };
 
@@ -883,6 +901,14 @@ async fn dispatch_golden(
         GoldenCommand::List => {
             let goldens = ops.golden_list().await?;
             println!("{}", format::render(&GoldenList(goldens), as_json));
+            Ok(0)
+        }
+        GoldenCommand::Reconcile => {
+            let report = ops.golden_reconcile().await?;
+            println!(
+                "{}",
+                format::render(&GoldenReconcileDto::from(report), as_json)
+            );
             Ok(0)
         }
         GoldenCommand::Build {
@@ -1894,6 +1920,66 @@ impl Formattable for GoldenList {
             })
             .collect();
         format::row_table(&["KEY", "BASE", "CONTENT_HASH", "DESCRIPTION"], &rows)
+    }
+}
+
+/// Door-level DTO for `golden reconcile` — mirrors
+/// `lsbx_ops::GoldenReconcileReport` with `Serialize` added (the
+/// `StatusReport`/`StatusReportDto` convention: the ops façade holds plain
+/// structs, doors own the wire format).
+#[derive(Serialize)]
+struct GoldenReconcileDto {
+    items: Vec<GoldenReconcileItemDto>,
+    unregistered_vms: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GoldenReconcileItemDto {
+    key: String,
+    base: String,
+    status: String,
+}
+
+impl From<lsbx_ops::GoldenReconcileReport> for GoldenReconcileDto {
+    fn from(report: lsbx_ops::GoldenReconcileReport) -> Self {
+        Self {
+            items: report
+                .items
+                .into_iter()
+                .map(|item| GoldenReconcileItemDto {
+                    key: item.key,
+                    base: item.base,
+                    status: item.status,
+                })
+                .collect(),
+            unregistered_vms: report.unregistered_vms,
+        }
+    }
+}
+
+impl Formattable for GoldenReconcileDto {
+    fn to_human_table(&self) -> String {
+        let mut lines = Vec::new();
+        if !self.items.is_empty() {
+            let rows: Vec<Vec<String>> = self
+                .items
+                .iter()
+                .map(|item| vec![item.key.clone(), item.base.clone(), item.status.clone()])
+                .collect();
+            lines.push(format::row_table(&["KEY", "BASE", "STATUS"], &rows));
+        }
+        if !self.unregistered_vms.is_empty() {
+            lines.push(
+                "unregistered golden-shaped VMs (candidates for `golden register`):".to_string(),
+            );
+            for vm in &self.unregistered_vms {
+                lines.push(format!("  {vm}"));
+            }
+        }
+        if lines.is_empty() {
+            lines.push("(no goldens in the manifest and no golden-shaped VMs on the backend)".to_string());
+        }
+        lines.join("\n")
     }
 }
 
