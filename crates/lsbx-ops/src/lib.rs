@@ -217,6 +217,35 @@ pub struct StatusReport {
     pub sandbox_count: usize,
 }
 
+/// One manifest golden's reconciliation outcome against the backend's live
+/// VM inventory (see [`LsbxOps::golden_reconcile`]). A plain struct —
+/// doors define their own `Serialize` DTOs (the `StatusReport` /
+/// `StatusReportDto` convention).
+#[derive(Debug, Clone)]
+pub struct GoldenReconcileItem {
+    pub key: String,
+    pub base: String,
+    /// `present` (base VM is live on the backend), `missing` (manifest
+    /// golden whose base VM is not currently live), or — in
+    /// `unregistered_vms` — the inverse direction, a live golden-shaped VM
+    /// with no manifest entry.
+    pub status: String,
+}
+
+/// The result of cross-referencing the manifest's goldens against the
+/// backend's live VM inventory (see [`LsbxOps::golden_reconcile`]). A
+/// plain struct — doors define their own `Serialize` DTOs (the
+/// `StatusReport` / `StatusReportDto` convention).
+#[derive(Debug, Clone)]
+pub struct GoldenReconcileReport {
+    /// One entry per manifest golden, in manifest order.
+    pub items: Vec<GoldenReconcileItem>,
+    /// Live VMs that look like golden base images (the `lsbx-*-v*` naming
+    /// convention) but have no manifest entry — candidates for
+    /// `golden register`.
+    pub unregistered_vms: Vec<String>,
+}
+
 /// The one place operational state lives for a running `lsbx` process.
 ///
 /// Constructed once and held by every door (CLI, HTTP, WS stream, MCP) via
@@ -621,6 +650,74 @@ impl LsbxOps {
     pub async fn golden_list(&self) -> Result<Vec<GoldenConfig>, LsbxError> {
         let registry = self.registry.read().await;
         Ok(registry.goldens.iter().map(clone_golden_config).collect())
+    }
+
+    /// **Implemented directly.** Cross-references the manifest's goldens
+    /// against the backend's **live** VM inventory (`Backend::list_vms`)
+    /// and classifies each golden as `present` / `missing` / `unregistered`.
+    ///
+    /// Background (2026-09-15): the exedev backend is fully capable —
+    /// `-b exedev status` reports `backend_available: true` over plain
+    /// SSH-alias auth — yet `golden list` against a live exe.dev account
+    /// reported zero goldens. Two causes stacked:
+    ///
+    /// 1. `golden list` is registry-only by design: it clones
+    ///    `ImageRegistry.goldens` and never queries the backend, so goldens
+    ///    that exist only as tagged VMs on the account are invisible.
+    /// 2. The manifest path silently defaults to
+    ///    `<state_dir>/images.json` and a missing file is treated as an
+    ///    empty registry, so on hosts where no manifest was ever installed
+    ///    the default view is empty even though the data is one
+    ///    `--images` flag away.
+    ///
+    /// This method addresses (1): a golden whose `base` names a VM that is
+    /// currently live on the backend is `present`; a manifest golden whose
+    /// base VM is not live is `missing`; a live VM tagged as a golden base
+    /// (`lsbx-*-v*` naming convention, cf. the baked `images.json` on the
+    /// exe.dev account) with no manifest entry is `unregistered`. The
+    /// classification is a point-in-time observation, not a command: a
+    /// `missing` golden may still be usable (the backend creates from the
+    /// base name lazily), and `unregistered` VMs are reported so an
+    /// operator can `golden register` them rather than the CLI guessing.
+    ///
+    /// The backend's `list_vms` error is returned verbatim — a reconcile
+    /// against a dead control plane must not masquerade as an empty one.
+    pub async fn golden_reconcile(&self) -> Result<GoldenReconcileReport, LsbxError> {
+        let live_vms = self.backend.list_vms().await?;
+        let registry = self.registry.read().await;
+
+        let items = registry
+            .goldens
+            .iter()
+            .map(|golden| {
+                let live = live_vms.iter().any(|vm| vm == &golden.base);
+                GoldenReconcileItem {
+                    key: golden.key.clone(),
+                    base: golden.base.clone(),
+                    status: if live { "present" } else { "missing" }.to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Live VMs that look like golden base images (the `lsbx-*-v1`
+        // naming convention every golden base follows today) but have no
+        // manifest entry — surfaced so an operator can register them.
+        let registered_bases: std::collections::HashSet<&str> =
+            registry.goldens.iter().map(|g| g.base.as_str()).collect();
+        let unregistered = live_vms
+            .iter()
+            .filter(|vm| {
+                vm.starts_with("lsbx-")
+                    && vm.contains("-v")
+                    && !registered_bases.contains(vm.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        Ok(GoldenReconcileReport {
+            items,
+            unregistered_vms: unregistered,
+        })
     }
 
     // ---- config_show / logs_query: implemented directly, honestly ----

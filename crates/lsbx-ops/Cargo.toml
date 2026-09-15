@@ -22,6 +22,10 @@ serde_json = { workspace = true }
 # otherwise).
 lsbx-backend-demo = { workspace = true }
 tempfile = { workspace = true }
+# test_golden_reconcile.rs drives a purpose-built Backend stub whose VM
+# inventory is settable per test (DemoBackend's list_vms only returns tags
+# of VMs it created itself, so it cannot impersonate golden base VMs).
+async-trait = { workspace = true }
 # `FakeClock` is gated behind `#[cfg(any(test, feature = "testing"))]` in
 # lsbx-kernel — invisible to a downstream crate's own tests unless that
 # crate also turns the feature on for its dev-dependency edge (same reason
