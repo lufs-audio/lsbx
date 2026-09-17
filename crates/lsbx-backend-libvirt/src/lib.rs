@@ -151,7 +151,7 @@ impl LibvirtBackend {
                 work_dir: std::path::PathBuf::from("/var/lib/lsbx/vms"),
             },
             disk_mode: DiskMode::default(),
-            guest_username: "exedev".to_string(),
+            guest_username: "lsbx".to_string(),
             ip_cache: tokio::sync::RwLock::new(HashMap::new()),
         })
     }
@@ -187,7 +187,7 @@ impl LibvirtBackend {
     }
 
     /// Sets the guest OS username used for `run`/`put_file`/`get_file`
-    /// (default `"exedev"`, matching the Python reference's convention).
+    /// (default `"lsbx"`, matching the lsbx convention).
     #[must_use]
     pub fn with_guest_username(mut self, username: impl Into<String>) -> Self {
         self.guest_username = username.into();
@@ -308,17 +308,36 @@ impl LibvirtBackend {
         pubkey: &str,
     ) -> Result<std::path::PathBuf, LsbxError> {
         let seed_iso_path = self.vm_disks.work_dir.join(format!("{vm_name}-cidata.iso"));
+        let extra_user = if self.guest_username != "exedev" {
+            format!(
+                "  - name: exedev\n\
+                 \x20   sudo: ALL=(ALL) NOPASSWD:ALL\n\
+                 \x20   groups: [ sudo, docker ]\n\
+                 \x20   shell: /bin/bash\n\
+                 \x20   ssh_authorized_keys:\n\
+                 \x20     - {pubkey}\n",
+                pubkey = pubkey.trim(),
+            )
+        } else {
+            String::new()
+        };
         let user_data = format!(
             "#cloud-config\n\
+             bootcmd:\n\
+             \x20 - ip link set dev ens3 mtu 1280 2>/dev/null || true\n\
+             \x20 - ip link set dev eth0 mtu 1280 2>/dev/null || true\n\
              users:\n\
              \x20 - name: {username}\n\
              \x20 \x20 sudo: ALL=(ALL) NOPASSWD:ALL\n\
+             \x20 \x20 groups: [ sudo, docker ]\n\
              \x20 \x20 shell: /bin/bash\n\
              \x20 \x20 ssh_authorized_keys:\n\
              \x20 \x20 \x20 - {pubkey}\n\
+             {extra_user}\
              ssh_pwauth: false\n",
             username = self.guest_username,
             pubkey = pubkey.trim(),
+            extra_user = extra_user,
         );
         let meta_data = format!(
             "instance-id: {vm_name}\n\

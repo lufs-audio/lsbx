@@ -41,6 +41,7 @@ use lsbx_kernel::envelope::Envelope;
 use lsbx_kernel::error::LsbxError;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
+#[allow(deprecated)]
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use schemars::JsonSchema;
@@ -712,7 +713,9 @@ impl LsbxMcpServer {
 
 #[tool_handler]
 impl ServerHandler for LsbxMcpServer {
+    #[allow(deprecated)]
     fn get_info(&self) -> ServerInfo {
+        #[allow(deprecated)]
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "lsbx MCP door: one tool per LsbxOps operation (create, destroy, renew, reap, \
                  list, info, console_url, exec, put, get, status, golden_build, golden_verify, \

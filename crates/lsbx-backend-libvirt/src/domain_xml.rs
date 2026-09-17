@@ -156,6 +156,7 @@ pub fn render_domain_xml(params: &DomainXmlParams<'_>, pubkey: &str) -> Result<S
 {seed_disk}    <interface type='network'>
       <source network='default'/>
       <model type='virtio'/>
+      <mtu size='1280'/>
     </interface>
     <serial type='pty'/>
     <console type='pty'/>

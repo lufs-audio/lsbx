@@ -212,7 +212,7 @@ fn backend_auto_falls_through_to_demo_when_nothing_else_is_available() {
     let output = Command::new(env!("CARGO_BIN_EXE_lsbx"))
         .env_remove("EXE_TOKEN")
         .env("LSBX_EXEDEV_SSH_ALIAS", "lsbx-test-no-such-alias")
-        .env_remove("LSBX_LIBVIRT_URI")
+        .env("LSBX_LIBVIRT_URI", "qemu+unix:///nonexistent?socket=/nonexistent")
         .args([
             "--state-dir",
             state_dir

@@ -47,7 +47,7 @@
       "streaming": "none",
       "healthcheck": [
         "python3 --version",
-        "python3 -m venv /tmp/lsbx-venv-check",
+        "python3 -m venv --without-pip /tmp/lsbx-venv-check",
         "/tmp/lsbx-venv-check/bin/python --version",
         "rm -rf /tmp/lsbx-venv-check",
         "node --version",
@@ -98,6 +98,27 @@
         "curl -fsS http://127.0.0.1:8000/vnc.html -o NUL"
       ],
       "description": "Windows 11 desktop golden (OpenSSH key-only; vnc server loopback :5900; websockify :8000), used via browser noVNC (carnyx)"
+    },
+    {
+      "key": "kali",
+      "flavor": "agent",
+      "os": "linux",
+      "base": "lsbx-kali-v1",
+      "mode": "copy",
+      "cpu": 2,
+      "memory": "4GB",
+      "streaming": "none",
+      "capabilities": [
+        "security",
+        "tor"
+      ],
+      "healthcheck": [
+        "curl --version",
+        "nmap --version",
+        "systemctl is-active tor",
+        "curl -fsS --retry 6 --retry-delay 3 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip"
+      ],
+      "description": "Kali Linux + Tor"
     }
   ],
   "profiles": {
@@ -116,6 +137,9 @@
     "win11": {
       "iso": "win11",
       "flavor": "desktop"
+    },
+    "kali": {
+      "golden": "kali"
     }
   }
 }
