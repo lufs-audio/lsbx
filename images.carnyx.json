@@ -47,7 +47,7 @@
       "streaming": "none",
       "healthcheck": [
         "python3 --version",
-        "python3 -m venv /tmp/lsbx-venv-check",
+        "python3 -m venv --without-pip /tmp/lsbx-venv-check",
         "/tmp/lsbx-venv-check/bin/python --version",
         "rm -rf /tmp/lsbx-venv-check",
         "node --version",
