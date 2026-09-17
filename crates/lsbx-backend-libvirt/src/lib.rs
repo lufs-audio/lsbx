@@ -151,7 +151,7 @@ impl LibvirtBackend {
                 work_dir: std::path::PathBuf::from("/var/lib/lsbx/vms"),
             },
             disk_mode: DiskMode::default(),
-            guest_username: "exedev".to_string(),
+            guest_username: "lsbx".to_string(),
             ip_cache: tokio::sync::RwLock::new(HashMap::new()),
         })
     }
@@ -187,7 +187,7 @@ impl LibvirtBackend {
     }
 
     /// Sets the guest OS username used for `run`/`put_file`/`get_file`
-    /// (default `"exedev"`, matching the Python reference's convention).
+    /// (default `"lsbx"`, matching the lsbx convention).
     #[must_use]
     pub fn with_guest_username(mut self, username: impl Into<String>) -> Self {
         self.guest_username = username.into();

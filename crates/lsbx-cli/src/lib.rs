@@ -294,7 +294,7 @@ async fn connect_libvirt(state_dir: &std::path::Path) -> Result<LibvirtBackend, 
 
     let username = std::env::var("LSBX_LIBVIRT_USER")
         .or_else(|_| std::env::var("LUFSS_LIBVIRT_USER"))
-        .unwrap_or_else(|_| "exedev".to_string());
+        .unwrap_or_else(|_| "lsbx".to_string());
 
     let backend = LibvirtBackend::connect(transport)
         .await?
