@@ -29,6 +29,43 @@ its 15 documented deviations from the original kickoff brief.
 
 ### Fixed
 
+- **The CI broker's installation token is now re-minted as it nears expiry,
+  instead of captured once at process start** (fixes #43). `GitHubClient`
+  held a single `Octocrab` built from a token minted exactly once in
+  `from_app_auth`; `GitHubAppAuth`'s own cache and 300 s refresh margin were
+  correct but unreachable afterwards. GitHub App installation tokens live 60
+  minutes, so a long-lived broker spent most of every cycle sending a dead
+  token: every `actions/runs` call returned `401 Bad credentials`,
+  `map_octocrab_error` classified that as `AuthFailed`, and `AuthFailed` is
+  fatal by design — so the process exited, systemd restarted it, and the loop
+  repeated (1116 restarts and zero dispatches on molimo). `Backing::App` now
+  holds the auth *handle* (`Arc<GitHubAppAuth>`) and asks it for a token on
+  every call, rebuilding the client only when the token string actually
+  changes; `Backing::Static` remains for the `test-util` seam. `from_app_auth`
+  takes `Arc<GitHubAppAuth>` — its one call site in `lsbx-cli` is updated.
+  New tests assert the invariant at the `GitHubClient` boundary (where the
+  defect lived, not one layer down in `auth.rs`, whose caching test passed
+  throughout) on **both** the exchange-endpoint hit count and the
+  `Authorization` header of the request that follows; both fail against the
+  pre-fix behaviour.
+- **Auth failures now name the failing repo, the token's age, and the token's
+  scope** (fixes #44). The old message carried only the route, so a
+  `403 Resource not accessible by integration` said nothing about which token
+  had failed or what that token could see — the two facts that separate the
+  competing explanations. `AuthFailed` messages are now enriched with `repo=`,
+  `token_age=` and `token_sees=`, the scope being recorded from the last
+  successful `installation_repositories()` call made with the *same* token and
+  cleared whenever a new token is minted (a scope observation from an older
+  token would be actively misleading). Only `AuthFailed` is rewritten: a
+  rate-limited 403 stays the retryable `BackendUnavailable` that `error_map`
+  deliberately maps it to.
+- **`GitHubClient` now builds its per-call clients against the same host its
+  `GitHubAppAuth` is configured for.** `GitHubAppAuth::base_uri_override()` is
+  new and threaded into `installation_token_client_with_base_uri`. Previously
+  an App-auth client always pointed at `api.github.com` regardless of where
+  its auth pointed, which left the token-refresh path with no seam a test
+  could intercept — the structural reason the #43 defect outlived a green
+  suite.
 - **exe.dev backend HTTPS control path now matches the live API** (fixes
   #30). exe.dev's "Run commands on VM" launch changed the `/exec` endpoint:
   the request body is parsed **verbatim** as a command string (the previous
@@ -48,6 +85,29 @@ its 15 documented deviations from the original kickoff brief.
   egress, CI middleboxes, sandboxed agent runtimes) that re-sign upstream
   TLS with a host-store CA. Found live: webpki-root clients failed where
   every system-store tool succeeded.
+
+### Added
+
+- **Decision spec for calimbra sandbox hosting**
+  (`docs/specs/2026-11-01T2354Z_calimbra-incus-backend/SPEC.md`, #45). Records
+  decisions D1–D8 with the rejected options and the reason for each rejection:
+  calimbra is a *services + broker* host rather than a sandbox host (3.8 GiB
+  total against goldens of 4–8 GB, **and** every existing golden's
+  `healthcheck` is VM-shaped — `systemctl`, `docker image inspect`, `cmd /c` —
+  so Incus system containers cannot satisfy them at any size); Incus VMs are
+  rejected as a general sandbox answer at a measured ~697 s boot-to-IP; the
+  `Backend` contract keeps its SSH shape via option C, with the `exec`
+  primitive (option B) deferred as an additive refactor; and goldens are built
+  on carnyx, never on calimbra, because a 4 GB golden cannot be built on a
+  3.8 GiB host.
+- `crates/lsbx-broker/tests/test_client_token_refresh.rs` — regression tests
+  for #43 (healthy token reused without rebuild; token crossing the 300 s
+  margin re-minted **and** the rebuilt client authenticating with the new
+  token).
+- `crates/lsbx-broker/tests/test_auth_error_diagnostics.rs` — tests for #44
+  (an `AuthFailed` names repo/age/scope; a rate-limited 403 stays retryable and
+  is not enriched).
+- `GitHubAppAuth::base_uri_override()` — see the `Fixed` entry above.
 
 ### Added
 
@@ -151,6 +211,17 @@ its 15 documented deviations from the original kickoff brief.
 
 ### Notes
 
+- `AGENTS.md`'s "CI authoring" section is reconciled with deployment reality
+  (#35): `lsbx-default` is documented as the label this repo's own workspace CI
+  actually runs on (`.github/workflows/ci.yml`, `ci/ci.yml`), and the legacy
+  `lufs` label reservation is retired now that its own stated condition —
+  "until this repo's own broker is verified live" — is met. `SPEC.md`
+  Deviation 15 is deliberately left as written: it is a dated record of the
+  original chicken-and-egg decision, not a statement of current practice.
+- `cargo fmt --all --check` is **not** clean on this repo at rustfmt 1.99 and
+  is not a CI gate (`ci.yml` runs `check`, `clippy -D warnings`, `test`). The
+  files added/changed by this entry are rustfmt-clean; pre-existing formatting
+  drift elsewhere is left untouched rather than swept into a focused change.
 - This entry documents Unit 20's scope only: the workspace-level CI workflow,
   repo meta files, and the four `tests/fixtures/*.json` files it owns. Wiring
   every crate into the workspace root `Cargo.toml`'s `members` list, and

@@ -179,7 +179,14 @@ pub struct GitHubAppAuth {
     installation_id: Mutex<Option<u64>>,
 }
 
-fn now_unix() -> Result<u64, LsbxError> {
+/// Current unix time in seconds.
+///
+/// `pub(crate)` because `github_client`'s [`AppBacking`](crate::github_client)
+/// derives an installation token's age from it for auth diagnostics (#44): the
+/// token's age is what distinguishes a stale-token 401 from a genuine
+/// insufficient-scope 403. Kept here rather than duplicated so there is one
+/// definition of "now" for every auth decision in this crate.
+pub(crate) fn now_unix() -> Result<u64, LsbxError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -405,6 +412,18 @@ impl GitHubAppAuth {
         });
 
         Ok(token_object.token)
+    }
+
+    /// The base URI this auth is configured against, when overridden.
+    ///
+    /// Exposed so a [`GitHubClient`](crate::github_client::GitHubClient) builds
+    /// its per-call clients against the **same host the token was minted
+    /// from**. Those two must never diverge: a token minted from one GitHub
+    /// host is not valid on another, so a client that ignored this would
+    /// authenticate against `api.github.com` with a token from somewhere else
+    /// (a GitHub Enterprise Server, or a mock in tests).
+    pub fn base_uri_override(&self) -> Option<&str> {
+        self.base_uri_override.as_deref()
     }
 
     /// The GitHub App's numeric id, for constructing a [`GitHubClient`](crate::github_client::GitHubClient).

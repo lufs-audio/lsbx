@@ -1492,10 +1492,17 @@ const DEFAULT_CI_BROKER_LEASE: Duration = Duration::from_secs(3600);
 /// when present or left `None` for `GitHubAppAuth` to discover on first use
 /// — its own real, already-implemented behavior, confirmed against
 /// `crates/lsbx-broker/src/auth.rs`), and calls
-/// `GitHubClient::from_app_auth(&auth, owner)`, where `owner` comes from
-/// the also-new `LSBX_GITHUB_APP_OWNER` (required whenever the App-credential
-/// path is used at all, since `from_app_auth`'s real signature needs an
-/// `owner: &str` to scope the installation-token exchange to).
+/// `GitHubClient::from_app_auth(Arc::new(auth), owner)`, where `owner` comes
+/// from the also-new `LSBX_GITHUB_APP_OWNER` (required whenever the
+/// App-credential path is used at all, since `from_app_auth`'s real signature
+/// needs an `owner: &str` to scope the installation-token exchange to).
+///
+/// The `GitHubAppAuth` is moved into the client rather than borrowed for the
+/// duration of the call, because the client re-mints the installation token
+/// from it for as long as the broker runs (see `lsbx-broker`'s
+/// `github_client` module doc: an installation token lives 60 minutes, and a
+/// broker that captured one at startup spent most of every cycle holding a
+/// dead token).
 ///
 /// When either `LSBX_GITHUB_APP_ID` or `LSBX_GITHUB_APP_PRIVATE_KEY_PATH`
 /// is unset, this falls back to `GitHubClient::from_gh_cli_fallback()` —
@@ -1625,7 +1632,14 @@ async fn build_github_client() -> Result<lsbx_broker::github_client::GitHubClien
                 private_key_pem,
                 installation_id,
             })?;
-            lsbx_broker::github_client::GitHubClient::from_app_auth(&auth, &owner).await
+            // The auth handle is moved into the client so it can re-mint the
+            // installation token across its 60-minute lifetime — see this
+            // function's own doc comment.
+            lsbx_broker::github_client::GitHubClient::from_app_auth(
+                std::sync::Arc::new(auth),
+                &owner,
+            )
+            .await
         }
         _ => Ok(lsbx_broker::github_client::GitHubClient::from_gh_cli_fallback()),
     }
