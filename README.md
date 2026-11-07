@@ -158,6 +158,14 @@ Carnyx's host config is the working reference: goldens in
 `/home/carnyx/ISOs/images/goldens/`, VM disks in `.../work/`, manifest
 `LSBX_IMAGES=/home/carnyx/repos/lsbx/images.carnyx.json`.
 
+## Networking
+
+Guest NICs are pinned to **MTU 1280** (domain XML, the libvirt bridge, and
+cloud-init all set it) so guests stay correct on any path that may cross a
+tailnet. Read [`docs/networking.md`](docs/networking.md) before changing any of
+those three values — it records the measured facts, the failure mode a
+"harmless" bump to 1500 causes, and the benchmark sequence to run first.
+
 ## Specs
 
 - [`docs/specs/2026-08-24T0030Z_rust-lsbx-rewrite/`](docs/specs/2026-08-24T0030Z_rust-lsbx-rewrite/)
