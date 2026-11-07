@@ -25,6 +25,7 @@ tracing = { workspace = true }
 # construct a `FakeClock` from outside lsbx-kernel, hence this.
 lsbx-kernel = { workspace = true, features = ["testing"] }
 lsbx-backend-demo = { workspace = true }
+async-trait = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

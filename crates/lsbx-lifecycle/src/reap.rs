@@ -147,6 +147,27 @@ pub async fn reap(
 
         match crate::create::destroy(backend, store, &record.id).await {
             Ok(()) => destroyed.push(record.id.clone()),
+            // The VM is already gone.
+            //
+            // `destroy` starts with a backend lookup and maps "no such
+            // domain" onto `LsbxError::NotFound` (see
+            // `lsbx-backend-libvirt::map_virt_err`). That is *terminal*
+            // success for a reaper, not a retryable failure: there is
+            // nothing left to destroy, and the record describing it is the
+            // only thing still asserting the sandbox exists. Retaining it
+            // (the `Err(_)` arm below) makes the sweep non-convergent — every
+            // later pass repeats the same lookup, fails the same way, and
+            // `lsbx list` keeps reporting sandboxes that are long gone.
+            //
+            // `create::destroy` itself stays strict on purpose: `lsbx down
+            // <id>` must keep reporting NotFound for a typo'd or
+            // already-removed id. Only the reaper treats absence as done.
+            Err(LsbxError::NotFound(_)) => match store.delete(&record.id) {
+                Ok(()) => destroyed.push(record.id.clone()),
+                // Could not retire the record (I/O, lock contention). Leave
+                // it for the next sweep rather than failing the whole pass.
+                Err(_) => continue,
+            },
             // Matches this crate's own `destroy` ordering guarantee: on
             // failure the record is untouched, so it remains in the store
             // to be retried on the next sweep. Never surfaced as a hard
