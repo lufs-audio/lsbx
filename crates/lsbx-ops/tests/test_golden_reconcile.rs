@@ -264,3 +264,125 @@ async fn reconcile_propagates_backend_unavailable_verbatim() {
         "reconcile against a dead control plane must fail as BackendUnavailable, got: {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Backend-specific golden storage models
+// ---------------------------------------------------------------------------
+
+/// A backend where a golden is a **disk image**, not a VM (libvirt). Its VM
+/// inventory is deliberately empty and unrelated to its goldens, which is the
+/// real shape on carnyx: the only domains are VMs built *from* goldens, and
+/// the goldens themselves are qcow2 files.
+struct DiskImageInventoryBackend {
+    artifacts: Vec<String>,
+}
+
+#[async_trait]
+impl Backend for DiskImageInventoryBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
+
+    async fn create_from_golden(
+        &self,
+        _req: CreateFromGoldenRequest<'_>,
+    ) -> Result<CreatedVm, LsbxError> {
+        Err(LsbxError::ContractViolated("stub".to_string()))
+    }
+
+    async fn run(
+        &self,
+        _vm_tag: &str,
+        _command: &[String],
+        _timeout: Duration,
+        _identity_file: Option<&std::path::Path>,
+    ) -> Result<CommandOutput, LsbxError> {
+        Err(LsbxError::ContractViolated("stub".to_string()))
+    }
+
+    async fn put_file(
+        &self,
+        _vm_tag: &str,
+        _source: &std::path::Path,
+        _destination: &str,
+        _identity_file: Option<&std::path::Path>,
+    ) -> Result<(), LsbxError> {
+        Err(LsbxError::ContractViolated("stub".to_string()))
+    }
+
+    async fn get_file(
+        &self,
+        _vm_tag: &str,
+        _source: &str,
+        _destination: &std::path::Path,
+        _identity_file: Option<&std::path::Path>,
+    ) -> Result<(), LsbxError> {
+        Err(LsbxError::ContractViolated("stub".to_string()))
+    }
+
+    async fn destroy(&self, _vm_tag: &str) -> Result<(), LsbxError> {
+        Err(LsbxError::ContractViolated("stub".to_string()))
+    }
+
+    /// No domains at all — a golden check that used this would call every
+    /// manifest golden missing. That is exactly the bug this test guards.
+    async fn list_vms(&self) -> Result<Vec<String>, LsbxError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_golden_artifacts(&self) -> Result<Vec<String>, LsbxError> {
+        Ok(self.artifacts.clone())
+    }
+
+    async fn rename_vm(&self, _old_tag: &str, _new_tag: &str) -> Result<(), LsbxError> {
+        Err(LsbxError::ContractViolated("stub".to_string()))
+    }
+}
+
+/// A disk-image backend must be reconciled against its *images*, and an
+/// artifact with no manifest entry must be reported even when it does not
+/// follow the `lsbx-` naming convention (`win11-desktop` is a real carnyx
+/// golden). The naming heuristic belongs to the backend that needs it, not to
+/// the reconcile caller.
+#[tokio::test]
+async fn reconcile_uses_backend_golden_artifacts_not_the_vm_inventory() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = DiskImageInventoryBackend {
+        artifacts: vec![
+            "lsbx-agent-v1".to_string(),
+            "win11-desktop".to_string(),
+            "lsbx-kali-v1".to_string(),
+        ],
+    };
+    let registry = ImageRegistry {
+        images: vec![],
+        goldens: vec![
+            golden("agent-base", "lsbx-agent-v1"),
+            golden("win11", "win11-desktop"),
+            golden("kali", "lsbx-kali-v1"),
+        ],
+        profiles: HashMap::new(),
+    };
+    let ops = LsbxOps::new(
+        Box::new(backend),
+        "stub".to_string(),
+        SandboxStore::new(dir.path().to_path_buf()),
+        CiJobStore::new(dir.path().to_path_buf()),
+        registry,
+        Box::new(FakeClock {
+            now: SystemTime::now(),
+        }),
+    );
+
+    let report = ops.golden_reconcile().await.unwrap();
+    assert!(
+        report.items.iter().all(|item| item.status == "present"),
+        "disk-image goldens must reconcile as present: {:?}",
+        report
+            .items
+            .iter()
+            .map(|i| (i.base.as_str(), i.status.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(report.unregistered_vms.is_empty());
+}

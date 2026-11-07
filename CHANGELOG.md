@@ -15,11 +15,19 @@ its 15 documented deviations from the original kickoff brief.
 ### Added
 
 - **`lsbx golden reconcile`** — cross-references the manifest's goldens
-  against the backend's **live** VM inventory (`Backend::list_vms`): each
-  manifest golden reports `present` (its base VM is currently live) or
-  `missing`, and golden-shaped VMs (`lsbx-*-v*` naming convention) with no
-  manifest entry are listed under `unregistered_vms` as candidates for
-  `golden register`. Available through every door: the CLI subcommand
+  against what the backend says it actually has, via the new
+  `Backend::list_golden_artifacts`: each manifest golden reports `present`
+  or `missing`, and artifacts with no manifest entry are listed under
+  `unregistered_vms` as candidates for `golden register`. **Where a golden
+  lives is backend-specific, and the trait now says so**: on exedev a golden
+  is a long-lived VM (the default implementation filters `list_vms` to the
+  `lsbx-*-v*` naming convention), while on libvirt a golden is a qcow2 disk
+  image and `list_vms` reports *domains* — reconciling against the VM
+  inventory there would have marked every manifest golden missing, since the
+  only domains are VMs built from those images. `LibvirtBackend` overrides
+  the hook with the image directory's contents, deduplicated by canonical
+  target so a `agent-base.qcow2 -> lsbx-agent-v1.qcow2` convenience symlink
+  is one artifact, not two. Available through every door: the CLI subcommand
   (`lsbx golden reconcile`, `--json` envelope + human KEY/BASE/STATUS
   table), the MCP tool (`golden_reconcile` — `LsbxOps` now exposes 19
   public methods, parity assertions updated), and

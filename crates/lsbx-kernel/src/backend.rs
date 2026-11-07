@@ -72,6 +72,33 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
     async fn list_vms(&self) -> Result<Vec<String>, crate::error::LsbxError>;
+    /// The golden artifacts this backend can actually see right now, as the
+    /// keys `list_golden_artifacts`'s caller compares against a manifest's
+    /// `base` field.
+    ///
+    /// "Where a golden lives" is backend-specific and the trait has to say so
+    /// once rather than leave every caller to assume one model:
+    ///
+    /// - Backends where a golden **is a long-lived VM** (exedev) contribute
+    ///   their VM inventory, filtered to the golden-base naming convention
+    ///   (`lsbx-<name>-v<n>`) so per-job sandboxes don't look like goldens —
+    ///   that is this default implementation.
+    /// - Backends where a golden **is a disk image** (libvirt) override this
+    ///   with the image directory's contents; their `list_vms` returns
+    ///   *domains*, which says nothing about which goldens still exist.
+    ///
+    /// Getting this wrong is not subtle in the output: a caller that used
+    /// `list_vms` on a libvirt host would report every manifest golden as
+    /// missing, because golden images are qcow2 files and the only domains
+    /// are the VMs built from them.
+    async fn list_golden_artifacts(&self) -> Result<Vec<String>, crate::error::LsbxError> {
+        Ok(self
+            .list_vms()
+            .await?
+            .into_iter()
+            .filter(|vm| vm.starts_with("lsbx-"))
+            .collect())
+    }
     /// Reconcile backend-specific ephemeral credentials left by interrupted
     /// lifecycle operations. Backends without account-level key state are a
     /// no-op; the lifecycle reaper still invokes this uniformly.

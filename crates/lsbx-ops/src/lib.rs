@@ -680,17 +680,23 @@ impl LsbxOps {
     /// base name lazily), and `unregistered` VMs are reported so an
     /// operator can `golden register` them rather than the CLI guessing.
     ///
-    /// The backend's `list_vms` error is returned verbatim — a reconcile
-    /// against a dead control plane must not masquerade as an empty one.
+    /// The backend's `list_golden_artifacts` error is returned verbatim — a
+    /// reconcile against a dead control plane must not masquerade as an empty
+    /// one.
     pub async fn golden_reconcile(&self) -> Result<GoldenReconcileReport, LsbxError> {
-        let live_vms = self.backend.list_vms().await?;
+        // Ask the backend where *its* goldens live. This is not
+        // `list_vms()`: on exedev a golden is a long-lived VM, on libvirt it
+        // is a qcow2 disk image and `list_vms()` would report domains
+        // instead, marking every manifest golden missing. See
+        // `Backend::list_golden_artifacts` for the contract.
+        let artifacts = self.backend.list_golden_artifacts().await?;
         let registry = self.registry.read().await;
 
         let items = registry
             .goldens
             .iter()
             .map(|golden| {
-                let live = live_vms.iter().any(|vm| vm == &golden.base);
+                let live = artifacts.iter().any(|vm| vm == &golden.base);
                 GoldenReconcileItem {
                     key: golden.key.clone(),
                     base: golden.base.clone(),
@@ -699,18 +705,17 @@ impl LsbxOps {
             })
             .collect::<Vec<_>>();
 
-        // Live VMs that look like golden base images (the `lsbx-*-v1`
-        // naming convention every golden base follows today) but have no
-        // manifest entry — surfaced so an operator can register them.
+        // Artifacts the backend can see that no manifest entry names —
+        // surfaced so an operator can register them. The backend already
+        // decided what "a golden artifact" is for its own storage model (the
+        // default implementation filters `list_vms` to the `lsbx-*-v*`
+        // naming convention; libvirt reports the image directory), so no
+        // second naming heuristic is applied here.
         let registered_bases: std::collections::HashSet<&str> =
             registry.goldens.iter().map(|g| g.base.as_str()).collect();
-        let unregistered = live_vms
+        let unregistered = artifacts
             .iter()
-            .filter(|vm| {
-                vm.starts_with("lsbx-")
-                    && vm.contains("-v")
-                    && !registered_bases.contains(vm.as_str())
-            })
+            .filter(|vm| !registered_bases.contains(vm.as_str()))
             .cloned()
             .collect::<Vec<_>>();
 
