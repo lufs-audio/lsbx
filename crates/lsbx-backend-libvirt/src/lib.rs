@@ -113,6 +113,20 @@ pub struct LibvirtBackend {
 /// identifier you gave me doesn't resolve"), so lumping every libvirt
 /// failure into `NotFound` would misreport those cases just as badly as
 /// lumping `NoDomain` into `BackendUnavailable` would misreport this one.
+/// Best-effort removal of the per-VM artifacts `create_from_golden` wrote:
+/// the working disk, the cloud-init seed ISO, and its staging directory.
+///
+/// Deliberately infallible and silent: it runs both after a successful domain
+/// destroy (where the domain is already gone, so a leftover file is the only
+/// thing at stake) and when the domain is *already absent* — the orphan case
+/// a reaper meets. A failure here must never turn "the VM is gone" into an
+/// error the caller would retry forever.
+fn cleanup_vm_artifacts(work_dir: &std::path::Path, vm_tag: &str) {
+    let _ = std::fs::remove_file(work_dir.join(format!("{vm_tag}.qcow2")));
+    let _ = std::fs::remove_file(work_dir.join(format!("{vm_tag}-cidata.iso")));
+    let _ = std::fs::remove_dir_all(work_dir.join(format!("{vm_tag}-seed")));
+}
+
 fn map_virt_err(e: VirtError) -> LsbxError {
     match e.code() {
         ErrorNumber::NoDomain => LsbxError::NotFound(e.message().to_string()),
@@ -612,22 +626,26 @@ impl Backend for LibvirtBackend {
     }
 
     async fn destroy(&self, vm_tag: &str) -> Result<(), LsbxError> {
-        let domain = self.lookup_domain(vm_tag)?;
+        let domain = match self.lookup_domain(vm_tag) {
+            Ok(domain) => domain,
+            // The domain is already gone, but its artifacts may not be: an
+            // interrupted earlier destroy, or a domain removed out of band,
+            // leaves the working qcow2 and cloud-init seed behind. The reaper
+            // (and any retry) needs those reclaimed even though the missing
+            // domain is still reported as `NotFound` — that return value is
+            // what tells the caller there is nothing left to shut down.
+            Err(LsbxError::NotFound(msg)) => {
+                cleanup_vm_artifacts(&self.vm_disks.work_dir, vm_tag);
+                return Err(LsbxError::NotFound(msg));
+            }
+            Err(e) => return Err(e),
+        };
         domain.destroy().map_err(map_virt_err)?;
 
         // Evict the cached IP for this VM — the entry is now stale.
         self.ip_cache.write().await.remove(vm_tag);
 
-        // Best-effort cleanup of the per-VM working disk and cloud-init
-        // seed artifacts this backend created in `create_from_golden`.
-        // Failures are deliberately not surfaced as errors: the domain
-        // is already gone.
-        let vm_disk_path = self.vm_disks.work_dir.join(format!("{vm_tag}.qcow2"));
-        let _ = std::fs::remove_file(vm_disk_path);
-        let seed_iso = self.vm_disks.work_dir.join(format!("{vm_tag}-cidata.iso"));
-        let _ = std::fs::remove_file(seed_iso);
-        let seed_dir = self.vm_disks.work_dir.join(format!("{vm_tag}-seed"));
-        let _ = std::fs::remove_dir_all(seed_dir);
+        cleanup_vm_artifacts(&self.vm_disks.work_dir, vm_tag);
 
         Ok(())
     }
@@ -712,6 +730,39 @@ mod tests {
     #[test]
     fn disk_mode_defaults_to_copy() {
         assert_eq!(DiskMode::default(), DiskMode::Copy);
+    }
+
+    /// The orphan case the reaper meets: the domain is gone, its working
+    /// disk and seed ISO are not. Reclaiming them must be silent and total —
+    /// and must not touch a neighbouring VM's artifacts.
+    #[test]
+    fn cleanup_vm_artifacts_removes_only_this_vms_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = dir.path();
+
+        std::fs::write(work.join("sbx-a.qcow2"), b"disk").expect("write");
+        std::fs::write(work.join("sbx-a-cidata.iso"), b"seed").expect("write");
+        std::fs::create_dir(work.join("sbx-a-seed")).expect("mkdir");
+        std::fs::write(work.join("sbx-a-seed/user-data"), b"x").expect("write");
+
+        // A neighbour that must survive.
+        std::fs::write(work.join("sbx-b.qcow2"), b"disk").expect("write");
+
+        cleanup_vm_artifacts(work, "sbx-a");
+
+        assert!(!work.join("sbx-a.qcow2").exists());
+        assert!(!work.join("sbx-a-cidata.iso").exists());
+        assert!(!work.join("sbx-a-seed").exists());
+        assert!(work.join("sbx-b.qcow2").exists());
+    }
+
+    /// Idempotence: a second call on an already-clean working directory is a
+    /// no-op, not a panic — every path in this helper is best-effort.
+    #[test]
+    fn cleanup_vm_artifacts_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        cleanup_vm_artifacts(dir.path(), "sbx-missing");
+        cleanup_vm_artifacts(dir.path(), "sbx-missing");
     }
 
     #[test]
