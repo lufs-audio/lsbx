@@ -41,16 +41,28 @@ count against an old baseline.
 GitHub Actions runner labels are conjunctive. Broker-managed jobs must carry
 `self-hosted` plus exactly one placement label:
 
+- `lsbx-default` — the Molimo zero-idle broker, runner group `lsbx-default`.
+  This repo's own workspace CI runs here (`.github/workflows/ci.yml` and
+  `ci/ci.yml`).
 - `lsbx-molimo` — exe.dev / Molimo, runner group `exe`
 - `lsbx-carnyx` — local libvirt / Carnyx, runner group `continuo`
 
-Never add both placement labels to one `runs-on` list to express "either,"
-and do not route zero-idle broker jobs through the legacy `lufs` label (that
-label is reserved for `lsbx`'s own workspace CI — see `.github/workflows/ci.yml`
-and SPEC.md Deviation 15 — pinned there deliberately until this repo's own
-broker is verified live). Use a matrix only when intentionally running a job
-once per host; otherwise select one placement through the repository CI
-variable or workflow input.
+Never add two placement labels to one `runs-on` list to express "either,"
+and do not route zero-idle broker jobs through the legacy `lufs` label. Use a
+matrix only when intentionally running a job once per host; otherwise select
+one placement through the repository CI variable or workflow input.
+
+> **Reconciled 2026-11-01 (#35).** This section previously listed only
+> `lsbx-molimo`/`lsbx-carnyx` as placement labels and reserved the legacy
+> `lufs` label for this repo's own workspace CI "until this repo's own broker
+> is verified live." That condition is now met: repo CI routes on
+> `lsbx-default` (`bfa67a4`) and Carnyx's broker runs the Rust binary
+> (`lsbx ci-broker run --backend=libvirt`, migrated 2026-08-27). The `lufs`
+> reservation is retired and `lsbx-default` is documented as the label
+> actually in use. `SPEC.md` Deviation 15 is deliberately left as written —
+> it is a dated record of the original chicken-and-egg decision, not a
+> statement of current practice, and retro-editing a dated spec would make
+> the record lie.
 
 ## exe.dev auth (backend configuration)
 
