@@ -203,7 +203,7 @@ fn golden_help_lists_its_subcommands() {
     let help = run_help(&["golden"]);
     assert_contains_all(
         &help,
-        &["list", "build", "verify", "register", "delete"],
+        &["list", "reconcile", "build", "verify", "register", "delete"],
         "`lsbx golden --help`",
     );
 }

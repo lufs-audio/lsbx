@@ -93,6 +93,7 @@ cargo test --workspace -- --ignored
 | Command | What it does |
 | --- | --- |
 | `lsbx golden list` | Show registry goldens and profiles |
+| `lsbx golden reconcile` | Cross-reference manifest goldens against what the backend actually has (`present`/`missing` per golden, plus unregistered artifacts): the libvirt image directory, or exedev's golden-shaped VMs |
 | `lsbx golden build <name> --from <golden> --script <path> …` | Rebuild a golden from a provisioning script |
 | `lsbx golden verify <golden>` | Boot a fresh clone and run its declared healthchecks, then destroy it |
 | `lsbx golden register <name> --base <golden> --flavor <flavor> [--os] [--cpu] [--memory] [--disk] [--mode] [--repo] …` | Add a golden to the registry |
@@ -152,7 +153,13 @@ overrides it) unless the environment says otherwise:
   (`exedev` by default; use `lsbx` for the baked Win11 desktop golden)
 - `LSBX_IMAGES` / `LSBX_IMAGES_PATH` / `--images` — image-manifest path
   (precedence: `--images` flag, `LSBX_IMAGES_PATH`, then the long-standing
-  `LSBX_IMAGES` host convention; falls back to `<state_dir>/images.json`)
+  `LSBX_IMAGES` host convention; falls back to `<state_dir>/images.json`).
+  When no manifest exists at the resolved default path, the CLI notes this
+  on stderr and proceeds with an empty registry — an explicit `--images`
+  path that is absent stays silent, since the caller chose it. `lsbx
+  golden reconcile` sees past a missing manifest by asking the backend what
+  golden artifacts actually exist — its image directory on libvirt, its
+  golden-shaped VMs on exedev.
 
 Carnyx's host config is the working reference: goldens in
 `/home/carnyx/ISOs/images/goldens/`, VM disks in `.../work/`, manifest

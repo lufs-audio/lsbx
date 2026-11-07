@@ -634,6 +634,16 @@ impl Backend for LibvirtBackend {
         Ok(names)
     }
 
+    /// Goldens here are **qcow2 disk images**, not domains: a manifest key
+    /// resolves to `{images_dir}/{key}.qcow2` (`GoldenDiskConfig::resolve`),
+    /// and `list_vms` above reports libvirt domains instead — the VMs built
+    /// *from* those images, plus anything else an operator defined. Answering
+    /// "which goldens still exist" from the domain list would mark every
+    /// manifest golden missing.
+    async fn list_golden_artifacts(&self) -> Result<Vec<String>, LsbxError> {
+        self.golden_disks.list()
+    }
+
     async fn rename_vm(&self, old_tag: &str, new_tag: &str) -> Result<(), LsbxError> {
         let domain = self.lookup_domain(old_tag)?;
         domain.rename(new_tag, 0).map_err(map_virt_err)?;

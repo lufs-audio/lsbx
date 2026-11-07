@@ -88,6 +88,70 @@ impl GoldenDiskConfig {
 
         Ok(self.images_dir.join(format!("{key}.qcow2")))
     }
+
+    /// Lists every golden key present in `images_dir`, by filename stem.
+    ///
+    /// Two properties matter to the caller (`lsbx-ops::golden_reconcile`):
+    ///
+    /// - **Symlinks are deduplicated by canonical target.** Hosts carry
+    ///   profile-shaped convenience links (`agent-base.qcow2 ->
+    ///   lsbx-agent-v1.qcow2`) next to the real image; reporting both would
+    ///   claim two artifacts where there is one, and the symlink name is not
+    ///   a key any manifest uses as `base`.
+    /// - **Only regular `.qcow2` targets count.** A dangling symlink, a
+    ///   `-cidata.iso` seed, or a half-written temp file is not a golden.
+    ///
+    /// A missing `images_dir` yields an empty list rather than an error:
+    /// "this host has no goldens yet" is a real, reportable state, and the
+    /// caller is the thing that decides whether that is alarming (it is, when
+    /// the manifest names goldens).
+    pub fn list(&self) -> Result<Vec<String>, LsbxError> {
+        let entries = match std::fs::read_dir(&self.images_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(LsbxError::BackendUnavailable(format!(
+                    "failed to read golden image directory '{}': {e}",
+                    self.images_dir.display()
+                )));
+            }
+        };
+
+        let mut seen: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        let mut keys: Vec<String> = Vec::new();
+
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                LsbxError::BackendUnavailable(format!(
+                    "failed to read an entry in '{}': {e}",
+                    self.images_dir.display()
+                ))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("qcow2") {
+                continue;
+            }
+            // `canonicalize` both resolves symlinks and proves the target
+            // exists, which is exactly the "is this a real golden file"
+            // question. A dangling link fails here and is skipped.
+            let Ok(canonical) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+            if !canonical.is_file() || !seen.insert(canonical.clone()) {
+                continue;
+            }
+            // Use the canonical target's name, never the entry's: a
+            // `agent-base.qcow2 -> lsbx-agent-v1.qcow2` convenience link must
+            // report the key the manifest actually uses as `base`.
+            if let Some(stem) = canonical.file_stem().and_then(|s| s.to_str()) {
+                keys.push(stem.to_string());
+            }
+        }
+
+        keys.sort();
+        Ok(keys)
+    }
 }
 
 #[cfg(test)]
@@ -122,5 +186,52 @@ mod tests {
         let cfg = GoldenDiskConfig::new("/var/lib/lsbx/images");
         let key = GoldenKey::new_unchecked(String::new());
         assert!(cfg.resolve(&key).is_err());
+    }
+
+    /// The inventory a `golden reconcile` compares a manifest against: real
+    /// qcow2 files only, symlink targets deduplicated to their canonical
+    /// name, and nothing else in the directory counted.
+    #[test]
+    fn list_reports_real_images_deduped_by_canonical_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let images = dir.path().join("goldens");
+        std::fs::create_dir(&images).expect("mkdir");
+
+        // Two real images.
+        std::fs::write(images.join("lsbx-agent-v1.qcow2"), b"x").expect("write");
+        std::fs::write(images.join("lsbx-ci-v1.qcow2"), b"x").expect("write");
+
+        // A profile-shaped convenience link to one of them: same file, so it
+        // must not appear as a second artifact (and its name is not a key any
+        // manifest uses as `base`).
+        std::os::unix::fs::symlink(
+            images.join("lsbx-agent-v1.qcow2"),
+            images.join("agent-base.qcow2"),
+        )
+        .expect("symlink");
+
+        // A dangling link: a golden was deleted out from under its alias.
+        std::os::unix::fs::symlink(
+            images.join("does-not-exist.qcow2"),
+            images.join("ghost.qcow2"),
+        )
+        .expect("symlink");
+
+        // Non-image noise the same directory accumulates.
+        std::fs::write(images.join("lsbx-agent-v1-cidata.iso"), b"x").expect("write");
+        std::fs::write(images.join("scratch.qcow2.part"), b"x").expect("write");
+
+        let cfg = GoldenDiskConfig::new(&images);
+        let keys = cfg.list().expect("list");
+        assert_eq!(keys, vec!["lsbx-agent-v1", "lsbx-ci-v1"]);
+    }
+
+    /// A host with no golden directory yet is a reportable state, not an
+    /// error: the caller decides whether an empty inventory is alarming.
+    #[test]
+    fn list_of_missing_directory_is_empty_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = GoldenDiskConfig::new(dir.path().join("absent"));
+        assert!(cfg.list().expect("list").is_empty());
     }
 }
