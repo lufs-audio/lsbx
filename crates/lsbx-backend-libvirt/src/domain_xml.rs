@@ -128,6 +128,22 @@ pub fn render_domain_xml(params: &DomainXmlParams<'_>, pubkey: &str) -> Result<S
         None => String::new(),
     };
 
+    // Guest NIC MTU is 1280 — deliberate, not inherited.
+    //
+    // 1280 is WireGuard's ceiling and the IPv6 minimum, so a guest stays
+    // correct on any path that may cross a tailnet: no dependence on ICMP
+    // `fragmentation needed` reaching us end to end, and no MSS blackhole
+    // ("connects, then hangs after the banner") when something in the path
+    // filters it. The cost is ~14% payload per packet on purely local
+    // transfers, which is invisible for exec/git/apt and only noticeable on
+    // multi-GB put/get.
+    //
+    // The same value is also set on the libvirt network's bridge and re-set
+    // inside Linux guests by cloud-init (see `lib.rs`), so a guest is right
+    // even if the host network was created differently. Read
+    // `docs/networking.md` before changing any of the three, and measure
+    // before proposing it — a local-only benchmark can "prove" 1500 is better
+    // and still regress every tailnet path.
     Ok(format!(
         r#"<domain type='kvm'>
   <name>{name}</name>

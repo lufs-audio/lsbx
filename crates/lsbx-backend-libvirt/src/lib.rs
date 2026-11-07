@@ -321,6 +321,13 @@ impl LibvirtBackend {
         } else {
             String::new()
         };
+        // Belt and braces for the guest NIC MTU: the domain XML already sets
+        // `<mtu size='1280'/>` on the interface (rendered by
+        // `domain_xml::render_domain_xml`), but a guest whose image ships its
+        // own netplan/NetworkManager config can bring the link up before
+        // libvirt's value is visible, so cloud-init re-asserts it. 1280 is
+        // WireGuard's ceiling and the IPv6 minimum — see `docs/networking.md`
+        // before changing it, and change all three sites together.
         let user_data = format!(
             "#cloud-config\n\
              bootcmd:\n\
