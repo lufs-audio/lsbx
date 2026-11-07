@@ -33,7 +33,93 @@ and neither lets a browser or an editor talk to a dev server inside a sandbox.
 | D5 | DNS | **No MagicDNS/custom DNS for the guest subnet in v1.** Use IPs from `lsbx list`. | dnsmasq inside libvirt already answers on `virbr0`, but pointing the tailnet's resolvers at a disposable-guest subnet is a footgun for little gain. |
 | D6 | Host prerequisite | `net.ipv4.ip_forward=1` (and `net.ipv6.conf.all.forwarding=1` if IPv6 ever matters) persisted via sysctl, plus `tailscale up --advertise-routes=...` in carnyx's tailscale unit. | Subnet routing is forwarding; without it the route exists and silently drops. `--advertise-routes` alone survives restarts only if it is in the unit's flags — a bare `tailscale up` on the CLI does not. |
 
-## 2. What it takes, concretely
+## 2. Cost/benefit, asked and answered 2026-11-07
+
+Recorded before implementation, so the decision is made against the real trade
+rather than "native networking sounds better".
+
+### What we have today (no route)
+
+| need | how it works now | cost |
+|---|---|---|
+| run a command in a sandbox | `lsbx exec <id> -- …` on carnyx; or `POST /sandboxes/<id>/exec` via the gateway | zero setup |
+| copy files in/out | `lsbx put` / `lsbx get`; or gateway `/put` `/get` | zero setup |
+| shell into a sandbox by hand | `ssh -J carnyx lsbx@<guest-ip>` — ProxyJump needs nothing but SSH to carnyx | zero setup |
+| reach a dev server in the guest | `ssh -L 8000:localhost:8000 -J carnyx lsbx@<guest-ip>`, browse localhost:8000 | one flag |
+| browser desktop (win11 / kali) | gateway `/console` → `/stream/<id>/websockify` (once the console work in the URL spec lands) | already in progress |
+
+Every capability already exists. ProxyJump covers ssh/scp/rsync and port
+forwarding; the gateway covers everything scripted.
+
+### What the route adds
+
+- **Native addressing**: `ssh lsbx@192.168.122.213`, `curl 192.168.122.213:8000`,
+  an IDE's remote-SSH with no jump-host stanza, a browser pointed straight at a
+  guest's noVNC. No jump flags, no forward flags, no gateway call.
+- **Independence from the gateway**: a `lsbx serve` deploy no longer interrupts
+  reachability.
+- It is the one exe.dev property (`ssh <vm>` from anywhere) the current stack
+  does not reproduce natively.
+
+### What it costs
+
+- **Four steps, one of them out-of-band**: `ip_forward` + `--advertise-routes`
+  on carnyx (2), route approval in the tailnet console (1, manual), ACL grant +
+  test in `danialrami/tailscale-acls` (1, reviewed PR).
+- **It exposes more than sandboxes.** `192.168.122.0/24` is libvirt's *default*
+  network: every domain on it becomes reachable, and today that includes
+  operator-owned `win11` and `provision-win11`, plus anything defined later.
+  Access control shifts from "the gateway's token" to "each guest's own sshd
+  and whatever it happens to listen on" — a VM with a dev server bound to
+  `0.0.0.0` becomes tailnet-reachable.
+- **One more invariant to keep true**: a reinstall without the persisted flag,
+  a re-approval after a node re-registers, or a bare `tailscale up` from the
+  CLI all change behaviour silently. `tailscale status` on carnyx is the only
+  place that shows the route.
+- **DHCP churn**: guest addresses change as sandboxes come and go, so any
+  workflow that hardcodes one breaks quietly. `lsbx list --json` stays the
+  source of truth — the route makes bad habits *possible* in a way the gateway
+  does not.
+
+### Verdict: not yet, and cheap to add later
+
+The deciding question is not "can we" but "what does it unlock that ProxyJump
+doesn't", and today the answer is convenience, not capability. Two conditions
+would flip it:
+
+1. A workflow that genuinely needs native L3 and cannot use a jump host —
+   e.g. tools driving Windows desktop guests that refuse ProxyJump, or an
+   editor that will not accept a jump stanza.
+2. Sandboxes on **their own bridge** (a dedicated prefix, e.g.
+   `192.168.123.0/24`), so the advertised route covers sandboxes only and does
+   not also publish operator VMs. That is the same split-network question as
+   MTU option C in §7, and doing both together is cheaper than doing either
+   alone.
+
+Until then: `ssh -J carnyx` is the documented human path (D3), the gateway is
+the automation path, and the stack grows no new trust boundary.
+
+### The stack, before and after (the component inventory)
+
+Asked alongside the decision, so it is recorded rather than re-derived:
+
+| layer | component | before | after | changes? |
+|---|---|---|---|---|
+| hypervisor | **libvirt/KVM on carnyx** (`virbr0 192.168.122.0/24`) | guest net local to the host | same | no |
+| engine | **lsbx** (`serve` gateway + `/stream` on carnyx `:8243`, `ci-broker`, CLI) | the only door to a guest | still the automation door | no |
+| mesh | **Tailscale** | L3 to carnyx/kora/calimbra only | + `192.168.122.0/24` routed via carnyx | **yes** |
+| edge | **Caddy on calimbra** (vhosts, TLS-internal, Cloudflare in front) | publishes `lsbx.lufshq.com` | unchanged | no |
+| host OS | **Ansible (danialrami/molimo)** | converges base/tailscale/caddy/incus | + a persisted `--advertise-routes` flag and a sysctl | **yes** |
+| access control | **tailnet ACLs** (`danialrami/tailscale-acls`) | member isolation confines family to own devices | + an explicit superadmin→subnet grant and a denial test | **yes** |
+| runner | **GitHub Actions + the zero-idle broker** | jobs run in guests created on carnyx | unchanged (broker stays off the public name) | no |
+| storage | golden qcow2s + per-VM disks under `~/ISOs/images/{goldens,work}` | host-local | unchanged | no |
+| console | **noVNC inside goldens** (`:8000`) + lsbx-stream WS relay | gateway-mediated | + reachable directly at `<guest>:8000` | reachable, not changed |
+
+So the route changes three things (tailscale, the Ansible flag, the ACL) and
+touches nothing in lsbx itself — which is also why it is easy to defer: no code
+depends on the answer.
+
+## 3. What it takes, concretely
 
 1. **carnyx**: `sudo tailscale set --advertise-routes=192.168.122.0/24`
    (needs `pkexec`-equivalent on that host — Daniel runs it), and the same flag
@@ -70,7 +156,7 @@ and neither lets a browser or an editor talk to a dev server inside a sandbox.
 5. **Document** the jump path (D3) in the lsbx operating notes so nobody copies
    a key off carnyx.
 
-## 3. Verification
+## 4. Verification
 
 - `tailscale status --json | jq '.Self.PrimaryRoutes'` on carnyx lists the
   prefix after approval (not before — this is the step people think worked).
@@ -83,13 +169,13 @@ and neither lets a browser or an editor talk to a dev server inside a sandbox.
   `mtu 1280` on carnyx (observed), so large transfers through the route should
   be tested for PMTU stalls.
 
-## 4. Rollback
+## 5. Rollback
 
 `tailscale set --advertise-routes=` (empty) + un-approve in the admin console.
 `ip_forward` can stay at 1 harmlessly, or be reverted with the sysctl file. No
 guest, golden, or lsbx state is touched by any of this.
 
-## 5. Open questions
+## 6. Open questions
 
 - **O1** Do we want guests reachable at all, or is the honest answer "the
   gateway is the interface, and `ssh` is an operator convenience"? *Leaning:*
@@ -99,10 +185,10 @@ guest, golden, or lsbx state is touched by any of this.
   (e.g. `192.168.122.128/25` for CI runners, separate from agent sandboxes)?
   *Leaning:* not yet; one prefix, revisit if a CI runner ever needs to be
   reachable from outside.
-- **O3 (INVESTIGATED — see §4)** `virbr0`'s `1280` MTU is deliberate in lsbx's
-  own code, not host drift. Crossover options weighed in §4; no decision yet.
+- **O3 (INVESTIGATED — see §7)** `virbr0`'s `1280` MTU is deliberate in lsbx's
+  own code, not host drift. Crossover options weighed in §7; no decision yet.
 
-## 4. The 1280 MTU: what it is, and the crossover options
+## 7. The 1280 MTU: what it is, and the crossover options
 
 ### What it actually is (measured 2026-11-07)
 
@@ -181,7 +267,7 @@ so the next person does not "correct" it.** Revisit with measurements, not
 intuition: two guests on `virbr0` running `iperf3` at 1280 vs 1500, plus
 `iperf3` host↔guest and guest↔tailnet-peer, before touching anything.
 
-## 5. Out of scope
+## 8. Out of scope
 
 - Per-sandbox tailnet nodes (a node per VM — the thing this design avoids).
 - IPv6 for guests.
