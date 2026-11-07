@@ -388,3 +388,149 @@ async fn reap_reports_zero_keys_reconciled_with_no_backend_key_listing_wired_in(
         .unwrap();
     assert_eq!(report.keys_reconciled, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Orphaned records: the VM is gone but the record still names it.
+// ---------------------------------------------------------------------------
+
+/// A backend that reports every VM as already absent — the real-world state
+/// after a host rebuild, an out-of-band `virsh undefine`, or a destroy that
+/// half-succeeded before the process died. This is exactly what libvirt
+/// produces on carnyx, where `LibvirtBackend::destroy` begins with a domain
+/// lookup that fails with `LsbxError::NotFound`.
+struct AllVmsGoneBackend;
+
+#[async_trait::async_trait]
+impl Backend for AllVmsGoneBackend {
+    fn capabilities(&self) -> lsbx_kernel::backend::BackendCapabilities {
+        lsbx_kernel::backend::BackendCapabilities::default()
+    }
+
+    async fn create_from_golden(
+        &self,
+        _req: lsbx_kernel::backend::CreateFromGoldenRequest<'_>,
+    ) -> Result<lsbx_kernel::backend::CreatedVm, lsbx_kernel::error::LsbxError> {
+        Err(lsbx_kernel::error::LsbxError::BackendUnavailable(
+            "not this test's concern".to_string(),
+        ))
+    }
+
+    async fn run(
+        &self,
+        _vm_tag: &str,
+        _command: &[String],
+        _timeout: Duration,
+        _identity_file: Option<&std::path::Path>,
+    ) -> Result<lsbx_kernel::backend::CommandOutput, lsbx_kernel::error::LsbxError> {
+        Err(lsbx_kernel::error::LsbxError::BackendUnavailable(
+            "not this test's concern".to_string(),
+        ))
+    }
+
+    async fn put_file(
+        &self,
+        _vm_tag: &str,
+        _source: &std::path::Path,
+        _destination: &str,
+        _identity_file: Option<&std::path::Path>,
+    ) -> Result<(), lsbx_kernel::error::LsbxError> {
+        Err(lsbx_kernel::error::LsbxError::BackendUnavailable(
+            "not this test's concern".to_string(),
+        ))
+    }
+
+    async fn get_file(
+        &self,
+        _vm_tag: &str,
+        _source: &str,
+        _destination: &std::path::Path,
+        _identity_file: Option<&std::path::Path>,
+    ) -> Result<(), lsbx_kernel::error::LsbxError> {
+        Err(lsbx_kernel::error::LsbxError::BackendUnavailable(
+            "not this test's concern".to_string(),
+        ))
+    }
+
+    /// The behavior under test: the VM does not exist, and this is reported
+    /// the way a real backend reports it — `NotFound`, not a generic failure.
+    async fn destroy(&self, vm_tag: &str) -> Result<(), lsbx_kernel::error::LsbxError> {
+        Err(lsbx_kernel::error::LsbxError::NotFound(format!(
+            "no VM with matching name '{vm_tag}'"
+        )))
+    }
+
+    async fn list_vms(&self) -> Result<Vec<String>, lsbx_kernel::error::LsbxError> {
+        Ok(Vec::new())
+    }
+
+    async fn rename_vm(
+        &self,
+        _old_tag: &str,
+        _new_tag: &str,
+    ) -> Result<(), lsbx_kernel::error::LsbxError> {
+        Err(lsbx_kernel::error::LsbxError::NotFound(
+            "not this test's concern".to_string(),
+        ))
+    }
+}
+
+/// A destroy that fails because the VM is *already absent* is terminal
+/// success for a reaper. The record must be retired, otherwise the sweep can
+/// never converge: every later pass repeats the same lookup and fails the
+/// same way, while `lsbx list` keeps reporting a sandbox that is long gone.
+#[tokio::test]
+async fn reap_retires_record_when_backend_reports_the_vm_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SandboxStore::new(dir.path().to_path_buf());
+    let backend = AllVmsGoneBackend;
+    let clock = fixed_clock();
+
+    let mut orphan = expired_record("sbx-orphan", "demo", &clock);
+    orphan.vm_tag = Some("vm-sbx-orphan".to_string());
+    store.save(&orphan).unwrap();
+
+    let allowed = HashSet::from(["demo".to_string()]);
+    let report = reap(&backend, &store, &clock, &allowed, Duration::ZERO, false)
+        .await
+        .unwrap();
+
+    assert_eq!(report.destroyed, vec!["sbx-orphan".to_string()]);
+    assert!(report.would_destroy.is_empty());
+    assert!(
+        store.load("sbx-orphan").is_err(),
+        "record must be retired, not retained forever"
+    );
+
+    // Convergence: a second sweep finds nothing to do and reports nothing.
+    let second = reap(&backend, &store, &clock, &allowed, Duration::ZERO, false)
+        .await
+        .unwrap();
+    assert!(second.destroyed.is_empty());
+    assert!(second.would_destroy.is_empty());
+}
+
+/// The complement, guarding the boundary: a *generic* destroy failure must
+/// still retain the record for retry. `NotFound` is the only error the reaper
+/// treats as "already gone".
+#[tokio::test]
+async fn reap_still_retains_record_on_generic_destroy_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SandboxStore::new(dir.path().to_path_buf());
+    let backend = DemoBackend::with_fault(FaultMode::Unavailable);
+    let clock = fixed_clock();
+
+    let mut expired = expired_record("sbx-still-there", "demo", &clock);
+    expired.vm_tag = Some("vm-sbx-still-there".to_string());
+    store.save(&expired).unwrap();
+
+    let allowed = HashSet::from(["demo".to_string()]);
+    let report = reap(&backend, &store, &clock, &allowed, Duration::ZERO, false)
+        .await
+        .unwrap();
+
+    assert!(report.destroyed.is_empty());
+    assert!(
+        store.load("sbx-still-there").is_ok(),
+        "a non-NotFound failure is retryable and must keep its record"
+    );
+}
