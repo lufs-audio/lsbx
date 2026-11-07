@@ -48,11 +48,16 @@ its 15 documented deviations from the original kickoff brief.
   time on kora (2026-09-15): `-b exedev` was live and authenticated, but
   the empty default view read as "the backend has no goldens" rather than
   "no manifest was ever installed at `<state_dir>/images.json`".
-- Also fixed: `lsbx-mcp` migrated off the `rmcp::model::ServerInfo`
-  deprecated alias to `ServerConfig` (rmcp 3.4.0 in the current lockfile
-  resolution), restoring a clean
-  `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-  gate.
+- Also fixed: `lsbx-mcp` keeps `#[allow(deprecated)]` on
+  `rmcp::model::ServerInfo`, which is a deprecated *alias* in rmcp 3.4.x and
+  the actual name in 3.1.x. The deprecated form is deliberate: the workspace
+  pins `rmcp = "3"` and `Cargo.lock` is gitignored (per AGENTS.md), so
+  different hosts resolve different 3.x minors — kora gets 3.4.0, carnyx's
+  local lock has 3.1.4 — and only the alias compiles on both. Migrating to
+  `ServerConfig` (the 3.4 name) builds everywhere a lock resolves 3.4+ and
+  fails `E0432` on a host with an older lock, which is what a release rebuild
+  on carnyx hit on 2026-11-07. Pinning rmcp to an exact version (or committing
+  the lock) is the real fix and is not part of this change.
 
 ### Removed
 

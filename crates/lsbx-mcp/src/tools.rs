@@ -41,7 +41,16 @@ use lsbx_kernel::envelope::Envelope;
 use lsbx_kernel::error::LsbxError;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig};
+// `ServerInfo` is a deprecated *alias* in rmcp 3.4.x and the real name in
+// 3.1.x. The workspace pins `rmcp = "3"` and `Cargo.lock` is gitignored (per
+// AGENTS.md), so hosts resolve different 3.x minors: kora gets 3.4.0, carnyx's
+// local lock is 3.1.4. `ServerConfig` (the 3.4 name) builds only where the
+// resolution is 3.4+ and fails `E0432` on an older lock — which is exactly what
+// a release rebuild on carnyx hit on 2026-11-07. Keep the alias until rmcp is
+// pinned exactly (or the lock is committed); the deprecation warning is the
+// cheaper cost.
+#[allow(deprecated)]
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -742,8 +751,10 @@ impl LsbxMcpServer {
 
 #[tool_handler]
 impl ServerHandler for LsbxMcpServer {
-    fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    #[allow(deprecated)]
+    fn get_info(&self) -> ServerInfo {
+        #[allow(deprecated)]
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "lsbx MCP door: one tool per LsbxOps operation (create, destroy, renew, reap, \
                  list, info, console_url, exec, put, get, status, golden_build, golden_verify, \
                  golden_register, golden_delete, golden_list, golden_reconcile, config_show, \
