@@ -456,10 +456,11 @@ impl GhCliFallback {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(LsbxError::AuthFailed(format!(
-                "`gh api {path}` failed ({}): {stderr}",
-                output.status
-            )));
+            return Err(crate::error_map::map_gh_cli_error(
+                output.status,
+                &stderr,
+                &path,
+            ));
         }
 
         serde_json::from_slice(&output.stdout).map_err(|e| {
