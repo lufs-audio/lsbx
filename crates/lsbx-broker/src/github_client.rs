@@ -84,19 +84,196 @@
 //! needing the original dispatch's `run_id` at all — see `reconcile.rs`'s
 //! module doc comment for the fuller writeup of this decision and the
 //! alternative considered.
+//!
+//! # Token lifetime: why this file holds `Arc<GitHubAppAuth>`, not a token (#43)
+//!
+//! Every `Octocrab` in this file used to be built once, at process start, from
+//! an installation token that was never re-minted. `GitHubAppAuth`'s cache and
+//! refresh margin were correct but unreachable after construction, so a
+//! long-lived broker spent most of every 60-minute token lifetime holding a
+//! dead token: `401 Bad credentials` -> `AuthFailed` -> fatal by design -> exit
+//! -> systemd restart -> repeat.
+//!
+//! [`Backing::App`] therefore stores the auth *handle* and asks it for a token
+//! on every call, rebuilding the `Octocrab` only when the token string
+//! actually changes. The invariant this file now maintains, and the one its
+//! tests assert:
+//!
+//! - while the token is healthy, the exchange endpoint is hit **exactly once**
+//!   and the client is **not** rebuilt;
+//! - across the 300s refresh margin, the next call **does** re-mint, and the
+//!   rebuilt client authenticates with the **new** token.
+//!
+//! [`Backing::Static`] exists only for the `test-util` seam and has no refresh
+//! path by construction.
+
+use std::sync::{Arc, Mutex};
 
 use lsbx_kernel::error::LsbxError;
 use octocrab::models::InstallationRepositories;
 use octocrab::{Octocrab, Page};
 use serde::Deserialize;
 
-use crate::auth::{GhCliFallback, GitHubAppAuth};
+use crate::auth::{now_unix, GhCliFallback, GitHubAppAuth};
 use crate::error_map::map_octocrab_error;
 
+/// Installation-token auth that **re-mints as the token nears expiry**,
+/// holding the auth handle rather than a captured token.
+///
+/// This structure is the fix for #43. `Backing` previously held a single
+/// `Octocrab` built from a token minted *exactly once, at process start*:
+/// `GitHubAppAuth::installation_token`'s cache and 300s refresh margin were
+/// correct, but after construction nothing ever called it again. GitHub App
+/// installation tokens expire after 60 minutes, so a long-lived broker spent
+/// most of every cycle holding a dead token — every `actions/runs` call
+/// returned `401 Bad credentials`, `map_octocrab_error` classified that as
+/// `AuthFailed`, and `AuthFailed` is fatal by design, so the process exited,
+/// systemd restarted it, and the loop repeated (1116 restarts and zero
+/// dispatches on molimo).
+///
+/// Keeping the *auth handle* is what makes re-minting possible: every call
+/// now asks `GitHubAppAuth` for a token, which answers from cache immediately
+/// while the token is healthy and re-exchanges it once it enters the refresh
+/// margin. While healthy this costs no network call at all.
+struct AppBacking {
+    auth: Arc<GitHubAppAuth>,
+    owner: String,
+    /// `None` until the first successful mint.
+    ///
+    /// A `std::sync::Mutex` (not `tokio`'s) is correct here: every critical
+    /// section below is synchronous — building an `Octocrab` is a sync call —
+    /// and nothing holds this lock across an `await`.
+    current: Mutex<Option<CurrentToken>>,
+}
+
+/// One minted installation token and everything derived from it.
+struct CurrentToken {
+    token: String,
+    /// Built from `token` via `installation_token_client_with_base_uri`,
+    /// against the same host the token was minted from. Reused for every
+    /// call that presents the same token, so a healthy broker neither
+    /// rebuilds a client nor re-spawns `octocrab`'s background service task.
+    client: Octocrab,
+    /// When this token was minted — derived by observing that the token
+    /// string changed, not by reaching into `GitHubAppAuth`'s private cache.
+    /// Surfaced in auth diagnostics, because token age is the one field that
+    /// separates "the token went stale" (401) from "the token is fine but
+    /// genuinely lacks a grant on this repo" (403) in a single log line.
+    minted_at_unix: u64,
+    /// The repos this token can see, recorded from a successful
+    /// `installation_repositories()` call made with this same token.
+    ///
+    /// Diagnostics only — never a source of truth for which repos to poll
+    /// (that is `PollConfig::repos`, or the installation's own answer).
+    /// Cleared whenever a new token is minted, because a scope observation
+    /// from an older token would be actively misleading: that staleness is
+    /// the leading hypothesis for #44's per-repo 403s.
+    granted_repos: Option<Vec<String>>,
+}
+
+impl AppBacking {
+    /// Returns a client authenticated with a currently-valid installation
+    /// token, re-minting (and rebuilding the client) only when the token
+    /// actually changed.
+    async fn client(&self) -> Result<Octocrab, LsbxError> {
+        let token = self.auth.installation_token(&self.owner).await?;
+        self.client_for_token(token)
+    }
+
+    /// Builds or reuses the client for `token`. Split out from
+    /// [`AppBacking::client`] so construction can seed the cache with the
+    /// token it already minted, without a second exchange.
+    fn client_for_token(&self, token: String) -> Result<Octocrab, LsbxError> {
+        let mut current = self.current.lock().map_err(|_| {
+            LsbxError::Interrupted("installation client cache lock poisoned".to_string())
+        })?;
+
+        if let Some(existing) = current.as_ref() {
+            if existing.token == token {
+                return Ok(existing.client.clone());
+            }
+        }
+
+        let client =
+            installation_token_client_with_base_uri(token.clone(), self.auth.base_uri_override())?;
+        *current = Some(CurrentToken {
+            token,
+            client: client.clone(),
+            minted_at_unix: now_unix()?,
+            granted_repos: None,
+        });
+
+        Ok(client)
+    }
+
+    /// Records the repo set `token` can see, for diagnostics only (#44).
+    fn record_granted_repos(&self, repos: &[String]) {
+        // A poisoned lock must not turn a successful API call into a failure;
+        // this is best-effort diagnostic state, not load-bearing state.
+        if let Ok(mut current) = self.current.lock() {
+            if let Some(existing) = current.as_mut() {
+                existing.granted_repos = Some(repos.to_vec());
+            }
+        }
+    }
+
+    /// Attaches the failing repo and the token's provenance to an
+    /// [`LsbxError::AuthFailed`], so a 403 is diagnosable from one log line
+    /// (#44).
+    ///
+    /// Only `AuthFailed` is rewritten. A rate-limited or unreachable GitHub is
+    /// not a scope problem, and rewriting those would erase the distinction
+    /// `map_github_http_error` deliberately draws between them.
+    fn enrich_auth_error(&self, err: LsbxError, repo: Option<&str>) -> LsbxError {
+        match err {
+            LsbxError::AuthFailed(message) => LsbxError::AuthFailed(format!(
+                "{message} [repo={}; {}]",
+                repo.unwrap_or("<unknown>"),
+                self.token_provenance()
+            )),
+            other => other,
+        }
+    }
+
+    /// One-line description of the token an auth failure was made with.
+    fn token_provenance(&self) -> String {
+        let Ok(current) = self.current.lock() else {
+            return "token=unknown (cache lock poisoned)".to_string();
+        };
+        let Some(existing) = current.as_ref() else {
+            return "token=none-minted".to_string();
+        };
+
+        let age = now_unix()
+            .ok()
+            .and_then(|now| now.checked_sub(existing.minted_at_unix))
+            .map(|age| format!("token_age={age}s"))
+            .unwrap_or_else(|| "token_age=unknown".to_string());
+
+        let scope = match &existing.granted_repos {
+            Some(repos) => format!("token_sees={} repos", repos.len()),
+            // Not an error: in App mode the poll loop only calls
+            // `installation_repositories()` when repo discovery is enabled, so
+            // an unprobed scope is a normal state, not a failure.
+            None => "token_scope=unprobed".to_string(),
+        };
+
+        format!("{age}, {scope}")
+    }
+}
+
 enum Backing {
-    /// Authenticated as a real installation, via an installation access
-    /// token obtained from `GitHubAppAuth::installation_token`.
-    Installation(Octocrab),
+    /// Authenticated as a real installation, re-minting from the App's own
+    /// cache as the token nears expiry. See [`AppBacking`].
+    App(AppBacking),
+    /// A fixed installation token with no refresh path — used only by this
+    /// crate's own tests (see
+    /// [`GitHubClient::from_installation_token_with_base_uri`]).
+    ///
+    /// A production App-auth deployment must use [`Backing::App`]; a `Static`
+    /// client in production would reintroduce exactly the never-refreshes bug
+    /// #43 is about.
+    Static(Octocrab),
     /// No GitHub App credentials configured — falls back to shelling out to
     /// `gh api` for every call, matching the existing fallback path.
     GhCli(GhCliFallback),
@@ -109,9 +286,15 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
-/// Builds a client authenticated as `owner`'s GitHub App installation,
-    /// exchanging (and caching, via `auth`) a real installation access
-    /// token.
+    /// Builds a client authenticated as `owner`'s GitHub App installation,
+    /// re-minting the installation access token from `auth`'s own cache as it
+    /// nears expiry.
+    ///
+    /// Takes `Arc<GitHubAppAuth>` rather than `&GitHubAppAuth` because the
+    /// client now has to outlive this call: it must be able to ask `auth` for
+    /// a fresh token for as long as the broker runs. That signature change is
+    /// the fix for #43 — the previous `&GitHubAppAuth` form could only ever
+    /// read a token once, here, at construction.
     ///
     /// This is **one of two co-equal, equally-first-class GitHub auth
     /// methods**, not a "primary." A deployment on a host that owns an
@@ -127,11 +310,23 @@ impl GitHubClient {
     /// `Authorization: Bearer <token>` header — is the right tool here. This
     /// is a different call site than the raw-JWT calls in `auth.rs`, which
     /// use `.app(...)` instead; see that module's doc comment for why.
-    pub async fn from_app_auth(auth: &GitHubAppAuth, owner: &str) -> Result<Self, LsbxError> {
-        let token = auth.installation_token(owner).await?;
-        let client = installation_token_client(token)?;
+    pub async fn from_app_auth(auth: Arc<GitHubAppAuth>, owner: &str) -> Result<Self, LsbxError> {
+        let backing = AppBacking {
+            auth,
+            owner: owner.to_string(),
+            current: Mutex::new(None),
+        };
+
+        // Mint once eagerly and keep the resulting client. Two deliberate
+        // reasons: a misconfigured App fails *here*, at construction, with the
+        // real credential error rather than on the first poll — the "a stale
+        // App path fails hard" property `MIGRATION-MOLIMO.md` §1.5 relies on;
+        // and it seeds the cache so the first real call is already a hit.
+        let token = backing.auth.installation_token(&backing.owner).await?;
+        backing.client_for_token(token)?;
+
         Ok(Self {
-            backing: Backing::Installation(client),
+            backing: Backing::App(backing),
         })
     }
 
@@ -165,9 +360,10 @@ impl GitHubClient {
     /// compile as a separate crate), same rationale: this unit's
     /// `test_divergence_nonfatal.rs` needs `GitHubClient::job_for_runner` to
     /// hit a `wiremock` mock server, not real GitHub, and
-    /// `GitHubClient::from_app_auth` has no seam for that on its own (its
-    /// `installation_token_client` helper never threads a base-uri override
-    /// through). Takes a plain `token: String` rather than a
+    /// `GitHubClient::from_app_auth` has no seam for that on its own — it
+    /// takes a `GitHubAppAuth`, and building one of those with a mock base URI
+    /// requires the `test-util`-gated constructor above. Takes a plain
+    /// `token: String` rather than a
     /// `GitHubAppAuth` — the divergence test only needs an authenticated
     /// `octocrab` client pointed at the mock, not a real JWT exchange, so
     /// skipping straight to the installation-token step avoids a second,
@@ -180,7 +376,7 @@ impl GitHubClient {
     ) -> Result<Self, LsbxError> {
         let client = installation_token_client_with_base_uri(token, Some(base_uri))?;
         Ok(Self {
-            backing: Backing::Installation(client),
+            backing: Backing::Static(client),
         })
     }
 
@@ -205,7 +401,16 @@ impl GitHubClient {
     /// say so and it changes.
     pub async fn installation_repositories(&self) -> Result<Vec<String>, LsbxError> {
         match &self.backing {
-            Backing::Installation(client) => installation_repositories_via_octocrab(client).await,
+            Backing::App(app) => {
+                let client = app.client().await?;
+                let repos = installation_repositories_via_octocrab(&client).await?;
+                // Record what this token can see, so a later 403 on any repo
+                // can report the scope it was made with (#44) without an
+                // extra API call at failure time.
+                app.record_granted_repos(&repos);
+                Ok(repos)
+            }
+            Backing::Static(client) => installation_repositories_via_octocrab(client).await,
             Backing::GhCli(fallback) => installation_repositories_via_gh_cli(fallback).await,
         }
     }
@@ -228,7 +433,13 @@ impl GitHubClient {
         status: &str,
     ) -> Result<Vec<WorkflowRunSummary>, LsbxError> {
         match &self.backing {
-            Backing::Installation(client) => workflow_runs_via_octocrab(client, repo, status).await,
+            Backing::App(app) => {
+                let client = app.client().await?;
+                workflow_runs_via_octocrab(&client, repo, status)
+                    .await
+                    .map_err(|e| app.enrich_auth_error(e, Some(repo)))
+            }
+            Backing::Static(client) => workflow_runs_via_octocrab(client, repo, status).await,
             Backing::GhCli(fallback) => workflow_runs_via_gh_cli(fallback, repo, status).await,
         }
     }
@@ -238,7 +449,13 @@ impl GitHubClient {
     /// 100 per page.
     pub async fn run_jobs(&self, repo: &str, run_id: u64) -> Result<Vec<JobSummary>, LsbxError> {
         match &self.backing {
-            Backing::Installation(client) => run_jobs_via_octocrab(client, repo, run_id).await,
+            Backing::App(app) => {
+                let client = app.client().await?;
+                run_jobs_via_octocrab(&client, repo, run_id)
+                    .await
+                    .map_err(|e| app.enrich_auth_error(e, Some(repo)))
+            }
+            Backing::Static(client) => run_jobs_via_octocrab(client, repo, run_id).await,
             Backing::GhCli(fallback) => run_jobs_via_gh_cli(fallback, repo, run_id).await,
         }
     }
@@ -247,7 +464,16 @@ impl GitHubClient {
     /// distinguish a successful GitHub completion from a local runner exit.
     pub async fn job(&self, repo: &str, job_id: u64) -> Result<JobSummary, LsbxError> {
         match &self.backing {
-            Backing::Installation(client) => {
+            Backing::App(app) => {
+                let client = app.client().await?;
+                let route = format!("/repos/{repo}/actions/jobs/{job_id}");
+                let result = client
+                    .get(&route, None::<&()>)
+                    .await
+                    .map_err(|e| map_octocrab_error(e, &route));
+                result.map_err(|e| app.enrich_auth_error(e, Some(repo)))
+            }
+            Backing::Static(client) => {
                 let route = format!("/repos/{repo}/actions/jobs/{job_id}");
                 client
                     .get(&route, None::<&()>)
@@ -343,16 +569,13 @@ pub struct JobSummary {
 /// installation access token. Centralized so there is exactly one place that
 /// constructs this builder (rather than repeating the same
 /// `Octocrab::builder()...build()` block at each call site).
-fn installation_token_client(token: String) -> Result<Octocrab, LsbxError> {
-    installation_token_client_with_base_uri(token, None)
-}
-
-/// Unit 18 addition: same construction path as
-/// [`installation_token_client`], with an optional base-URI override for
-/// this crate's own tests — see
-/// [`GitHubClient::from_installation_token_with_base_uri`]'s doc comment for
-/// why this seam exists, and `auth.rs`'s `build_app_client` for the
-/// identical pattern already established there.
+///
+/// `base_uri_override` is threaded through from the `GitHubAppAuth` that
+/// minted the token — see [`GitHubAppAuth::base_uri_override`]. Before this
+/// was threaded, an App-auth `GitHubClient` always pointed at
+/// `api.github.com` regardless of where its auth was pointed, which meant the
+/// token-refresh path had no seam a test could intercept; that is why the
+/// #43 defect outlived a green suite.
 fn installation_token_client_with_base_uri(
     token: String,
     base_uri_override: Option<&str>,
