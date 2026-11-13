@@ -150,6 +150,8 @@ fn missing_default_manifest_warns_on_stderr_but_still_succeeds() {
 
     // No --images: the default path <state_dir>/images.json does not exist.
     let output = Command::new(env!("CARGO_BIN_EXE_lsbx"))
+        .env_remove("LSBX_IMAGES")
+        .env_remove("LSBX_IMAGES_PATH")
         .args([
             "--backend",
             "demo",

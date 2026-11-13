@@ -36,6 +36,8 @@ fn up_with_demo_backend_and_json_prints_real_success_envelope() {
     let state_dir = fresh_state_dir("up-demo-json");
 
     let output = Command::new(env!("CARGO_BIN_EXE_lsbx"))
+        .env_remove("LSBX_IMAGES")
+        .env_remove("LSBX_IMAGES_PATH")
         .args([
             "--state-dir",
             state_dir
