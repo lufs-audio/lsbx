@@ -33,6 +33,7 @@ lsbx-mcp = { workspace = true }
 lsbx-gateway = { workspace = true }
 lsbx-stream = { workspace = true }
 lsbx-broker = { workspace = true }
+lsbx-tui = { workspace = true }
 tracing = { workspace = true }
 # `dispatch_serve`'s dual-listener branch (Gap 1/3) constructs two
 # `axum::serve(...)` futures directly (bypassing `lsbx-gateway`'s own

@@ -133,6 +133,7 @@ use lsbx_ops::{LsbxOps, StatusReport};
 use lsbx_store::ci_job_store::CiJobStore;
 use lsbx_store::sandbox_store::SandboxStore;
 use serde::Serialize;
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -624,15 +625,15 @@ async fn dispatch(
 ) -> Result<i32, LsbxError> {
     match &args.command {
         None => {
-            // TODO: hand off to lsbx-tui once wired as a dependency of this
-            // crate (Unit 12's dashboard, bare `lsbx` when stdout is a TTY
-            // — SPEC.md §4.8, this unit's own Boundaries). This
-            // deliberately does not add a dependency on `lsbx-tui` as part
-            // of this integration-wiring pass (out of scope for the four
-            // gaps this pass closes); falling back to `status`
-            // unconditionally (not just when stdout is not a TTY) keeps
-            // this crate's dependency graph honest about what it actually
-            // ships today.
+            // Bare `lsbx` invocation: when stdout is a TTY and not requesting JSON,
+            // hand off to lsbx-tui's dashboard (Unit 12, SPEC.md §4.8).
+            // When stdout is not a TTY (piped/scripted) or when `--json` is explicitly
+            // requested, fall back to rendering the status report.
+            if !as_json && std::io::stdout().is_terminal() {
+                lsbx_tui::install_panic_restore_hook();
+                lsbx_tui::dashboard::run_dashboard(ops).await?;
+                return Ok(0);
+            }
             let status = ops.status().await?;
             println!(
                 "{}",
@@ -793,6 +794,16 @@ async fn dispatch(
                 "{}",
                 format::render(&StatusReportDto::from(status), as_json)
             );
+            Ok(0)
+        }
+        Some(Command::Dashboard) => {
+            if !std::io::stdout().is_terminal() {
+                return Err(LsbxError::Usage(
+                    "dashboard requires an interactive terminal (stdout is not a TTY)".to_string(),
+                ));
+            }
+            lsbx_tui::install_panic_restore_hook();
+            lsbx_tui::dashboard::run_dashboard(ops).await?;
             Ok(0)
         }
         Some(Command::Profiles { full }) => {

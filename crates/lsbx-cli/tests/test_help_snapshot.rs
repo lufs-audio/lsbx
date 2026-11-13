@@ -92,6 +92,7 @@ fn top_level_help_lists_every_subcommand() {
             "console",
             "info",
             "status",
+            "dashboard",
             "profiles",
             "images",
             "reap",

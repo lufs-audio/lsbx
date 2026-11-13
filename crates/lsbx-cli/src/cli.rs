@@ -96,6 +96,8 @@ pub enum Command {
         id: String,
     },
     Status,
+    #[command(alias = "tui", alias = "dash")]
+    Dashboard,
     Profiles {
         #[arg(long)]
         full: bool,
