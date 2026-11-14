@@ -46,6 +46,7 @@ GitHub Actions runner labels are conjunctive. Broker-managed jobs must carry
   `ci/ci.yml`).
 - `lsbx-molimo` — exe.dev / Molimo, runner group `exe`
 - `lsbx-carnyx` — local libvirt / Carnyx, runner group `continuo`
+- `lsbx-windows` — local libvirt / Carnyx, Windows runner jobs (`win11-desktop`), runner group `continuo`
 
 Never add two placement labels to one `runs-on` list to express "either,"
 and do not route zero-idle broker jobs through the legacy `lufs` label. Use a

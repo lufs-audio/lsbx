@@ -14,6 +14,39 @@ its 15 documented deviations from the original kickoff brief.
 
 ### Added
 
+- **Interactive TUI dashboard wired into CLI** (#47, commit `c134d77`). Running
+  bare `lsbx` on an interactive TTY now launches the Ratatui dashboard, while
+  pipes and `--json` cleanly fall back to status reports. Added explicit `lsbx
+  dashboard` (aliases: `tui`, `dash`) subcommand.
+- **Reproducible Windows golden builds via `lsbx golden build`** (#36, commit
+  `b203cd6`). Added `--os <OS>` support across CLI, ops façade, MCP, and TUI
+  wizard; on Windows, scripts stage to `C:\Windows\Temp\` and run via PowerShell
+  with execution policy bypass. Added `scripts/provision-win11-golden.ps1` and
+  retired stale fallback image.
+- **Interactive Windows browser console & surfaced `console_url`** (#37, commit
+  `1b24c34`). Populated `host` with resolved guest IP and `https_url` from
+  `LSBX_PUBLIC_BASE_URL` / `LSBX_CONSOLE_BASE` or in-guest websockify (`:8000`).
+  Gateway `/console?target=<id>` now serves a responsive full-window noVNC
+  iframe with direct link.
+- **Zero-idle CI dispatch for Windows runner jobs** (#39, commit `064a365`).
+  Automated detection of `lsbx-windows` label in `Reconciler::dispatch` routing
+  to `win11-desktop`, native PowerShell Actions runner provisioner
+  (`scripts/provision-ci-runner.ps1`), 1280 MTU clamping, and lifecycle
+  monitoring.
+- **Golden commit/save helper & hardware upgrade** (commit `081284e`). Added
+  `scripts/lsbx-commit-golden.sh` to commit interactive sandbox changes into
+  golden images; upgraded `win11-desktop` to 8 vCPUs / 32 GB RAM / 256 GB virtual
+  disk with aliased `win11` profile.
+
+### Fixed
+
+- **Broker resilience for gh CLI network hiccups** (commit `0df6bb2`). Added
+  `map_gh_cli_error` so transient HTTP 502, connection resets, and TLS
+  handshake timeouts map to retryable `LsbxError::BackendUnavailable` rather
+  than fatal `AuthFailed` crashes.
+
+### Added
+
 - **`lsbx golden reconcile`** — cross-references the manifest's goldens
   against what the backend says it actually has, via the new
   `Backend::list_golden_artifacts`: each manifest golden reports `present`

@@ -87,6 +87,7 @@ cargo test --workspace -- --ignored
 | `lsbx renew <id> <duration>` | Extend a sandbox's lease |
 | `lsbx console <id>` | Open the WebSocket-noVNC console (stream proxy) |
 | `lsbx info <id>` / `lsbx status` | Per-sandbox detail / backend summary |
+| `lsbx dashboard` (aliases: `tui`, `dash`) | Interactive Ratatui TUI dashboard (launched by default on interactive TTYs) |
 
 ### Goldens
 
@@ -122,12 +123,26 @@ persist straight back to the manifest the CLI loaded (see
   `curl -fsS http://127.0.0.1:8000/vnc.html -o NUL` work verbatim.
 
 The verified Win11 desktop golden on Carnyx (`win11-desktop`, `os: windows`,
-`streaming: novnc`) exposes its console as noVNC:
+`streaming: novnc`, aliased to profile `win11`) runs with 8 vCPUs, 32 GB RAM,
+and 256 GB virtual disk, exposing its console as noVNC:
 
 ```bash
 LSBX_LIBVIRT_USER=lsbx lsbx golden verify win11-desktop
-LSBX_LIBVIRT_USER=lsbx lsbx up win11-desktop
-# → browser at http://<guest-ip>:8000/vnc.html  (VNC password `lsbx`)
+LSBX_LIBVIRT_USER=lsbx lsbx up win11
+# → prints console_url: http://<guest-ip>:8000/vnc.html (VNC password `lsbx`)
+lsbx console <id>   # prints the active console URL
+```
+
+Interactive customization sessions can be committed directly back into the golden:
+
+```bash
+./scripts/lsbx-commit-golden.sh <sandbox-id> win11-desktop
+```
+
+And reproducible builds from scripts support `--os windows`:
+
+```bash
+lsbx golden build win11-desktop --from win11 --script scripts/provision-win11-golden.ps1 --flavor desktop --cpu 8 --memory 32GB --os windows --streaming novnc
 ```
 
 ### Services
