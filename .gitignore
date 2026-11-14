@@ -7,3 +7,4 @@ Cargo.lock
 
 # Local environment overrides (never commit secrets)
 .env
+/sidecars/lsbx-scaleset/lsbx-scaleset

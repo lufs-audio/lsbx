@@ -1,0 +1,26 @@
+# systemd USER unit (carnyx has linger enabled, so it runs without a login):
+#   install -Dm644 lsbx-scaleset@.service ~/.config/systemd/user/lsbx-scaleset@.service
+#   systemctl --user daemon-reload && systemctl --user enable --now lsbx-scaleset@linux
+# One instance per scale set; %i selects ~/ISOs/images/scaleset-%i.env.
+[Unit]
+Description=lsbx runner scale set listener (%i)
+Documentation=https://github.com/lufs-audio/lsbx/tree/main/sidecars/lsbx-scaleset
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=LIBVIRT_DEFAULT_URI=qemu:///system
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/ISOs/images/scaleset-%i.env
+ExecStart=%h/.local/bin/lsbx-scaleset run
+Restart=always
+RestartSec=15
+# Teardown of in-flight VMs gets up to 4 minutes on stop; busy runners are
+# left running on purpose (a restart must not kill jobs).
+TimeoutStopSec=300
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
