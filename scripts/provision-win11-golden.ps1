@@ -45,24 +45,33 @@ Set-ItemProperty -Path $vncRegPath -Name "UseVncAuthentication" -Value 1 -Type D
 Set-ItemProperty -Path $vncRegPath -Name "LoopbackOnly" -Value 1 -Type DWord
 Set-ItemProperty -Path $vncRegPath -Name "AllowLoopback" -Value 1 -Type DWord
 
-# The password value is TightVNC's own storage encoding, NOT a transparent
-# DES(password) — writing a plausible-looking blob makes the stored password
-# garbage and every client is rejected (the server logs "Authentication failed"
-# and the console just disconnects). Measured the hard way on 2026-11-14.
+# THE PASSWORD ENCODING — read this before touching the bytes below.
 #
-# So: NEVER overwrite a value that is already present. Only seed one when the key
-# is absent (a from-scratch bake), and treat the golden's existing blob as the
-# source of truth — which is exactly what lsbx #55's follow-up will surface to the
-# console page instead of the hardcoded 'lsbx' literal it uses today.
-$existing = (Get-ItemProperty -Path $vncRegPath -Name "Password" -ErrorAction SilentlyContinue).Password
-if (-not $existing) {
-    Write-Host "    no VNC password stored; seeding the bake-time value"
-    # Bake-time value for password 'lsbx'.
-    [byte[]]$vncPassBytes = @(0xF2, 0x9E, 0x3C, 0xBC, 0xCB, 0x4C, 0xFA, 0x0C)
-    Set-ItemProperty -Path $vncRegPath -Name "Password" -Value $vncPassBytes -Type Binary
-} else {
-    Write-Host "    keeping the golden's existing VNC password blob"
-}
+# TightVNC stores `Password` as DES encrypted with the "fixed key"
+# 23 82 107 6 35 78 88 7, and — the part that cost a debugging session — every
+# byte of that key is **bit-reversed** before use, with the plaintext password
+# NUL-padded to 8 bytes:
+#
+#   storage = DES(key = bitrev(23 82 107 6 35 78 88 7), data = password padded)
+#
+# Write a plausible-looking blob without the reversal and the stored password
+# becomes garbage: the server offers VNC auth, every client is rejected, its
+# event log says "Authentication failed from <ip>", and the browser console just
+# shows "Disconnected unexpectedly" with no further clue. Measured 2026-11-14.
+#
+# Verified value for password 'lsbx' (matches a pristine golden byte for byte):
+#   F2 9E 3C BC 15 AA A9 6D
+# Recompute with:
+#   printf 'lsbx\0\0\0\0' | openssl enc -des-ecb -nopad -provider legacy \
+#     -provider default -K 17526b06234e5807   # note: NOT the reversed key
+# and bit-reverse the resulting key bytes first; see scripts/README note in #56.
+[byte[]]$vncPassBytes = @(0xF2, 0x9E, 0x3C, 0xBC, 0x15, 0xAA, 0xA9, 0x6D)
+Set-ItemProperty -Path $vncRegPath -Name "Password" -Value $vncPassBytes -Type Binary
+Write-Host "    VNC password set (stored blob is TightVNC's bit-reversed-key DES)"
+
+# NOTE for #55: this password is a *guest* secret and the console page currently
+# hardcodes it. It should come from the golden via ConsoleDetail.console_password
+# instead — see that issue's follow-up.
 
 # Ensure TightVNC service is configured and running.  Only restarted when it is
 # not already running: a restart mid-session drops whatever console client is

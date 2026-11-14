@@ -150,6 +150,47 @@ The resize design gets **simpler in one axis and one requirement bigger**:
    `DesktopSize(-223)` rect at the new geometry after each requested mode
 ```
 
+## 6b. Follow-up measurements (same day, after step 0 landed)
+
+### The TightVNC password encoding — solved
+
+A pristine golden stores `Password = F2 9E 3C BC 15 AA A9 6D` and authenticates
+with `lsbx`. That blob is exactly
+
+```
+DES(key = bitrev(23 82 107 6 35 78 88 7), data = "lsbx" padded to 8 bytes)
+```
+
+i.e. TightVNC's "fixed key" **with every key byte bit-reversed**. The provisioning
+script had been writing `F2 9E 3C BC CB 4C FA 0C` — right first four bytes, wrong
+last four — which makes the stored password garbage. Symptom: server offers VNC
+auth, rejects every client, its event log says `Authentication failed from <ip>`,
+and the browser console shows only "Disconnected unexpectedly". Fixing the blob
+made `security result: 0` again, on a guest **with** a logged-in session.
+
+### Session ≠ window station (the step-1 blocker, measured)
+
+| Caller | `ChangeDisplaySettingsEx` |
+|---|---|
+| SSH, session 0 | `-1` `DISP_CHANGE_FAILED` |
+| Scheduled task, `LogonType Interactive`, `session=1` | `-5` `DISP_CHANGE_BADPARAM` |
+| User's own logon: Startup folder / `HKCU…\Run` | **item never executed** |
+
+Task Scheduler reaches the right *session id* but not the interactive *window
+station*, and the display APIs refuse. The Run-key/Startup route is the right
+station but did not fire on this image at all: the `Run` value is present and
+correct in `HKEY_USERS\<sid>…\Run` after two logons, the agent script parses
+cleanly, and no log file is ever created — so nothing ran, rather than running and
+failing. (First attempt also used a `C:\lsbx` mailbox, which an
+Explorer-launched, non-elevated process cannot write to; the second attempt moved
+the mailbox to `%LOCALAPPDATA%\lsbx-display` and still saw nothing.)
+
+**Conclusion for step 1:** do not rely on shell startup items. Launch into the
+session explicitly — `WTSQueryUserToken` + `DuplicateTokenEx` +
+`CreateProcessAsUser` with `lpDesktop="winsta0\\default"` — which is the
+documented way to start a process on the user's interactive desktop from a
+service/SSH context, and which the host (already elevated) can drive.
+
 ## 7. Artefacts
 
 - `scripts/rfb-desktopsize-probe.py` — the probe (new, in-repo, documented).
