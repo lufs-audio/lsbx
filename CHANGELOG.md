@@ -14,6 +14,16 @@ its 15 documented deviations from the original kickoff brief.
 
 ### Added
 
+- **Push dispatch for Linux CI: `lsbx-scaleset`** (spec
+  `docs/specs/2026-11-14T1900Z_ci-broker-push-dispatch/`). Go sidecar on
+  `actions/scaleset` v0.5.0 registers runner scale set `lsbx-linux`
+  (`continuo`) and boots one lsbx VM per assigned job. No repo list, ~0 REST
+  calls (the poller used ~4,300/h), and the guest receives only a single-use
+  JIT config (`scripts/run-jit-runner.sh`) instead of the GitHub App private
+  key. Restart-safe (persisted state, recovery, ~60 s session hand-over),
+  cancel-safe (surplus idle runners deregistered before teardown) and sweeps
+  libvirt domains orphaned by an interrupted `lsbx up` (finding → unit 07).
+  The polling broker keeps only `lsbx-windows`.
 - **Interactive TUI dashboard wired into CLI** (#47, commit `c134d77`). Running
   bare `lsbx` on an interactive TTY now launches the Ratatui dashboard, while
   pipes and `--json` cleanly fall back to status reports. Added explicit `lsbx
