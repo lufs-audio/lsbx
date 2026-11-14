@@ -41,8 +41,24 @@ if (-not (Test-Path $vncRegPath)) {
     New-Item -Path $vncRegPath -Force | Out-Null
 }
 
+# Listen on 8000 with RAW RFB, not behind websockify.
+#
+# This was the console's real defect (lsbx #55): `lsbx serve`'s /stream relay is a
+# raw TCP relay — it terminates the browser's WebSocket, strips the framing, and
+# writes plain RFB bytes to <guest>:8000. The golden used to run *websockify* on
+# 8000 (an HTTP/WebSocket server proxying to VNC on 5900), so the relay's RFB
+# bytes arrived at an HTTP server and came back as an HTML error page: the browser
+# showed "Disconnected unexpectedly" with no useful clue. Verified by writing
+# "RFB 003.008\n" to <guest>:8000 and reading a `<!DOCTYPE HTML>` error response.
+#
+# With noVNC now served by the gateway (#55), websockify has no remaining job in
+# the guest: one raw RFB listener on 8000 is what the relay expects, and it
+# deletes a moving part (see #53's wedge-on-abandoned-client behaviour).
 Set-ItemProperty -Path $vncRegPath -Name "UseVncAuthentication" -Value 1 -Type DWord
-Set-ItemProperty -Path $vncRegPath -Name "LoopbackOnly" -Value 1 -Type DWord
+Set-ItemProperty -Path $vncRegPath -Name "RfbPort" -Value 8000 -Type DWord
+# Reachable from the hypervisor host (the relay's source), still not from anywhere
+# else: the guest has no routable address beyond virbr0.
+Set-ItemProperty -Path $vncRegPath -Name "LoopbackOnly" -Value 0 -Type DWord
 Set-ItemProperty -Path $vncRegPath -Name "AllowLoopback" -Value 1 -Type DWord
 
 # THE PASSWORD ENCODING — read this before touching the bytes below.
@@ -73,58 +89,45 @@ Write-Host "    VNC password set (stored blob is TightVNC's bit-reversed-key DES
 # hardcodes it. It should come from the golden via ConsoleDetail.console_password
 # instead — see that issue's follow-up.
 
-# Ensure TightVNC service is configured and running.  Only restarted when it is
-# not already running: a restart mid-session drops whatever console client is
-# attached, and it is not needed just to re-read an unchanged password.
+# Ensure TightVNC service is configured and running.
+#
+# The restart is REQUIRED, not incidental: `RfbPort`/`Password` are read when the
+# service starts, so without it the server keeps listening on its previous port
+# (5900) while the registry says 8000 — which is exactly how a "healthy" guest
+# ends up with the relay dialling a port nothing answers on. Restarting drops any
+# attached console client; that is acceptable here because this script runs at
+# bake time, not during a live session.
 $tvnService = Get-Service -Name "tvnserver" -ErrorAction SilentlyContinue
 if ($tvnService) {
     Set-Service -Name "tvnserver" -StartupType Automatic
-    if ($tvnService.Status -ne "Running") {
-        Start-Service -Name "tvnserver"
-    }
+    Restart-Service -Name "tvnserver" -Force
+    Start-Sleep -Seconds 2
 }
 
-# 3. noVNC index.html redirect to ?resize=scale
-Write-Host "--> Configuring noVNC resize=scale redirect..."
-if (Test-Path $NoVncDir) {
-    $redirectHtml = @'
-<!doctype html>
-<meta charset="utf-8">
-<title>lsbx console</title>
-<script>
-  const q = location.search.replace(/^\?/, "");
-  location.replace("/vnc.html?resize=scale" + (q ? "&" + q : "") + location.hash);
-</script>
-<noscript><meta http-equiv="refresh" content="0; url=/vnc.html"></noscript>
-'@
-    Set-Content -Path (Join-Path $NoVncDir "index.html") -Value $redirectHtml -Encoding UTF8
-}
-
-# 4. WebSockify Scheduled Task
-Write-Host "--> Configuring WebSockify scheduled task..."
-$pythonExe = "C:\Python312\python.exe"
-if (-not (Test-Path $pythonExe)) {
-    $pythonCmd = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($pythonCmd) { $pythonExe = $pythonCmd.Source }
-}
-
+# 3. Retire websockify (superseded by raw RFB on 8000 -- see the comment above).
+#    The noVNC assets are served by the gateway, so the guest needs neither the
+#    bridge nor a web root. Left as an explicit removal step rather than deleted
+#    silently so re-provisioning an older golden converges to the new shape.
+Write-Host "--> Retiring websockify bridge (raw RFB on :8000 replaces it)..."
 $taskName = "lsbx-websockify"
 $taskExists = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($taskExists) {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host "    unregistered scheduled task '$taskName'"
 }
+# Kill any python -m websockify that is still holding 8000 so TightVNC can bind it.
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*websockify*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-$action = New-ScheduledTaskAction -Execute $pythonExe -Argument "-m websockify --web `"$NoVncDir`" 8000 127.0.0.1:5900"
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
-Start-ScheduledTask -TaskName $taskName
+# 4. (removed) the noVNC resize=scale redirect lived in the websockify web root.
 
 # 5. Windows Firewall rules
 Write-Host "--> Configuring Firewall rules..."
-New-NetFirewallRule -Name "lsbx-websockify-8000" -DisplayName "lsbx WebSockify (8000)" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+# Raw RFB on 8000, allowed only from the libvirt guest subnet (the relay runs
+# on the hypervisor host). Not "any": this port speaks VNC, not HTTP.
+New-NetFirewallRule -Name "lsbx-vnc-8000" -DisplayName "lsbx VNC (8000, libvirt subnet)" -Direction Inbound -Protocol TCP -LocalPort 8000 -RemoteAddress 192.168.122.0/24 -Action Allow -ErrorAction SilentlyContinue | Out-Null
 New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -DisplayName "OpenSSH Server (sshd)" -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -ErrorAction SilentlyContinue | Out-Null
 
 # 5b. Interactive desktop session: autologon + no machine lock
@@ -247,6 +250,29 @@ New-Item -ItemType Directory -Force -Path "C:\lsbx" | Out-Null
 Set-Content -Path "C:\lsbx\session-check.ps1" -Value $probe -Encoding ASCII
 Write-Host "    wrote C:\lsbx\session-check.ps1 (healthcheck probe)"
 
+# 5c. RFB banner probe: the golden healthcheck that actually proves the console
+# path. :8000 speaks raw RFB, so an HTTP request is meaningless there now (it was
+# `curl .../vnc.html` before websockify was retired) — this asserts the RFB
+# greeting instead, which is what `lsbx serve`'s relay needs to see.
+$rfbProbe = @'
+$c = New-Object System.Net.Sockets.TcpClient
+try {
+    $c.Connect("127.0.0.1", 8000)
+    $buf = New-Object byte[] 12
+    $n = $c.GetStream().Read($buf, 0, 12)
+    $banner = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
+    $c.Close()
+    if ($banner -like "RFB *") { Write-Host $banner.Trim(); exit 0 }
+    Write-Host ("unexpected banner: " + $banner)
+    exit 1
+} catch {
+    Write-Host ("connect failed: " + $_.Exception.Message)
+    exit 1
+}
+'@
+Set-Content -Path "C:\lsbx\rfb-check.ps1" -Value $rfbProbe -Encoding ASCII
+Write-Host "    wrote C:\lsbx\rfb-check.ps1 (healthcheck probe)"
+
 # 6. Defender exclusions + Search indexing
 #
 # Real-time scanning of thousands of small files is the single most common
@@ -297,9 +323,20 @@ try {
 # 7. Verify Listeners
 Write-Host "--> Verifying listeners..."
 Start-Sleep -Seconds 2
-$listeners = Get-NetTCPConnection -LocalPort 5900, 8000 -State Listen -ErrorAction SilentlyContinue
+$listeners = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
 if ($listeners) {
-    Write-Host "Listeners verified active on 5900 and 8000."
+    Write-Host "Listener verified: raw RFB on :8000."
+    $banner = $null
+    try {
+        $c = New-Object System.Net.Sockets.TcpClient
+        $c.Connect("127.0.0.1", 8000)
+        $buf = New-Object byte[] 12
+        $n = $c.GetStream().Read($buf, 0, 12)
+        $banner = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
+        $c.Close()
+    } catch { }
+    if ($banner -like "RFB *") { Write-Host ("    RFB banner: " + $banner.Trim()) }
+    else { Write-Warning ("    :8000 did not answer with an RFB banner (got: " + $banner + ")") }
 } else {
     Write-Warning "Could not verify all listeners immediately; they will start with the system."
 }

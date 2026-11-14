@@ -95,9 +95,10 @@
       ],
       "healthcheck": [
         "echo lsbx-windows-ok",
-        "curl -fsS --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8000/vnc.html -o NUL"
+        "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\lsbx\\rfb-check.ps1",
+        "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\lsbx\\session-check.ps1"
       ],
-      "description": "Windows 11 desktop golden (OpenSSH key-only; vnc server loopback :5900; websockify :8000), used via browser noVNC (carnyx)"
+      "description": "Windows 11 desktop golden (OpenSSH key-only; TightVNC raw RFB on :8000 for the gateway relay; autologon gives an interactive desktop session), used via the browser console (carnyx)"
     },
     {
       "key": "kali",
