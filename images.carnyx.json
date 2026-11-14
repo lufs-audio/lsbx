@@ -85,8 +85,8 @@
       "os": "windows",
       "base": "win11-desktop",
       "mode": "copy",
-      "cpu": 4,
-      "memory": "8GB",
+      "cpu": 8,
+      "memory": "32GB",
       "disk": "goldens/win11-desktop.qcow2",
       "streaming": "novnc",
       "capabilities": [
@@ -95,7 +95,7 @@
       ],
       "healthcheck": [
         "echo lsbx-windows-ok",
-        "curl -fsS http://127.0.0.1:8000/vnc.html -o NUL"
+        "curl -fsS --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8000/vnc.html -o NUL"
       ],
       "description": "Windows 11 desktop golden (OpenSSH key-only; vnc server loopback :5900; websockify :8000), used via browser noVNC (carnyx)"
     },
@@ -135,8 +135,7 @@
       "golden": "ci-runner"
     },
     "win11": {
-      "iso": "win11",
-      "flavor": "desktop"
+      "golden": "win11-desktop"
     },
     "kali": {
       "golden": "kali"
