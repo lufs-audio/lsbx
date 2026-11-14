@@ -315,8 +315,14 @@ fn render_windows_domain_xml(
       <backend type='emulator' version='2.0'/>
     </tpm>
     <graphics type='vnc' port='-1' autoport='yes'/>
+    <!-- vgamem is the framebuffer memory the guest driver can allocate. 16 MiB
+         (the old value) holds 1920x1080 (8.3 MB) and 2560x1440 (14.7 MB) but
+         NOT 3840x2160 (33.2 MB) — and a running win11 golden was measured at
+         2560x1600, i.e. 98% of 16 MiB with nothing left over. Dynamic resize
+         (lsbx #56) cannot offer "whatever window size" under that ceiling, so
+         desktop guests get 64 MiB. See domain_xml_renders_enough_qxl_vgamem_for_4k. -->
     <video>
-      <model type='qxl' ram='65536' vram='65536' vgamem='16384' heads='1' primary='yes'/>
+      <model type='qxl' ram='65536' vram='65536' vgamem='65536' heads='1' primary='yes'/>
     </video>
   </devices>
 </domain>"#,
@@ -547,6 +553,31 @@ mod tests {
                 "{os} domain XML must set cache='writeback' on the root disk; got:\n{xml}"
             );
         }
+    }
+
+    /// #56: 16 MiB of QXL video memory cannot represent a 4K framebuffer
+    /// (3840×2160×4 B = 33.2 MB), so "resize to whatever window size" was
+    /// capped before any protocol mattered. The old value also left a live
+    /// 2560×1600 guest at 98% occupancy.
+    #[test]
+    fn domain_xml_renders_enough_qxl_vgamem_for_4k() {
+        let params = DomainXmlParams {
+            name: "lsbx-vgamem",
+            cpu: 4,
+            memory: "8GB",
+            disk_path: std::path::Path::new("/tmp/vram.qcow2"),
+            seed_iso: None,
+            os: "windows",
+        };
+        let xml = render_domain_xml(&params, "irrelevant").unwrap();
+        assert!(
+            xml.contains("vgamem='65536'"),
+            "QXL vgamem must be 64 MiB so a 4K framebuffer fits (#56); got:\n{xml}"
+        );
+        assert!(
+            !xml.contains("vgamem='16384'"),
+            "the 16 MiB value capped desktop resolution at ~2560x1440"
+        );
     }
 
     #[test]
