@@ -180,10 +180,23 @@ impl<'a> Reconciler<'a> {
         lease: Duration,
     ) -> Result<CiJobRecord, LsbxError> {
         let job_id_str = job.job_id.to_string();
+        let is_windows = job.labels.iter().any(|label| {
+            label.eq_ignore_ascii_case("lsbx-windows")
+                || label.eq_ignore_ascii_case("windows")
+                || label.eq_ignore_ascii_case("win11")
+                || label.eq_ignore_ascii_case("win11-desktop")
+        });
+        let profile = if is_windows {
+            "win11-desktop"
+        } else {
+            CI_PROFILE
+        };
+        let os = if is_windows { Some("windows") } else { None };
+
         let sandbox = self
             .ops
             .create(lsbx_lifecycle::create::CreateRequest {
-                profile: CI_PROFILE,
+                profile,
                 golden: None,
                 cpu: None,
                 memory: None,
@@ -192,10 +205,10 @@ impl<'a> Reconciler<'a> {
                 name: None,
                 task_id: Some(job_id_str.as_str()),
                 lease,
-                ready_timeout: Duration::from_secs(120),
+                ready_timeout: Duration::from_secs(180),
                 verify: true,
                 healthchecks: vec![],
-                os: None,
+                os,
             })
             .await?;
 
@@ -704,6 +717,12 @@ fn prepare_runner_upload(config: &RunnerConfig, repository: &str) -> Result<Temp
             config.provision_script.display()
         ))
     })?;
+
+    let win_script_source = config.provision_script.with_extension("ps1");
+    if win_script_source.is_file() {
+        let win_script_path = directory.path().join("provision-ci-runner.ps1");
+        let _ = fs::copy(&win_script_source, &win_script_path);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -742,11 +761,25 @@ impl<'a> Reconciler<'a> {
     }
 
     async fn read_runner_log(&self, sandbox_id: &str) -> Result<String, LsbxError> {
+        let is_windows = if let Ok(info) = self.ops.info(sandbox_id).await {
+            info.flavor == "desktop" || info.profile.contains("win")
+        } else {
+            false
+        };
+        let cmd = if is_windows {
+            vec![
+                "cmd".to_string(),
+                "/c".to_string(),
+                "type C:\\actions-runner\\runner.log".to_string(),
+            ]
+        } else {
+            vec!["cat".to_string(), RUNNER_LOG_PATH.to_string()]
+        };
         let output = self
             .ops
             .exec(
                 sandbox_id,
-                &["cat".to_string(), RUNNER_LOG_PATH.to_string()],
+                &cmd,
                 TAIL_EXEC_TIMEOUT,
             )
             .await?;
@@ -757,6 +790,28 @@ impl<'a> Reconciler<'a> {
             )));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    async fn exec_runner_command_windows(
+        &self,
+        sandbox_id: &str,
+        command: String,
+    ) -> Result<lsbx_kernel::backend::CommandOutput, LsbxError> {
+        let output = self
+            .ops
+            .exec(
+                sandbox_id,
+                &["cmd".to_string(), "/c".to_string(), command],
+                Duration::from_secs(300),
+            )
+            .await?;
+        if output.exit_code != 0 {
+            return Err(LsbxError::BackendUnavailable(format!(
+                "runner command failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(output)
     }
 
     async fn provision_runner(
@@ -770,49 +825,83 @@ impl<'a> Reconciler<'a> {
                 record.job_id
             ))
         })?;
+        let is_windows = if let Ok(info) = self.ops.info(sandbox_id).await {
+            info.flavor == "desktop" || info.profile.contains("win")
+        } else {
+            record.queue_label.contains("win")
+        };
+
         record.phase = "provisioning".to_string();
         record.updated_at = now_rfc3339();
         self.job_store.save(record)?;
 
         let upload = prepare_runner_upload(config, &record.repository)?;
-        let _ = self
-            .exec_runner_command(sandbox_id, "sudo rm -rf /tmp/lsbx-ci-broker".to_string())
-            .await;
-        self.ops
-            .put(sandbox_id, upload.path(), "/tmp/lsbx-ci-broker")
-            .await?;
-        for command in [
-            "sudo install -m 0600 /tmp/lsbx-ci-broker/lsbx-runner.env /etc/lsbx-runner.env",
-            "sudo install -m 0600 /tmp/lsbx-ci-broker/lsbx-runner-app.pem /etc/lsbx-runner-app.pem",
-            "sudo install -m 0755 /tmp/lsbx-ci-broker/provision-ci-runner.sh /usr/local/sbin/lsbx-provision-ci-runner",
-        ] {
-            self.exec_runner_command(sandbox_id, command.to_string()).await?;
-        }
-        let provision_command = format!(
-            "sudo env RUNNER_HOST_PREFIX={} LUFSS_RUNNER_ENV=/etc/lsbx-runner.env bash /usr/local/sbin/lsbx-provision-ci-runner",
-            shell_quote(&config.host_prefix)
-        );
-        let output = self
-            .exec_runner_command(sandbox_id, provision_command)
-            .await?;
-        let runner_name = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .find_map(LifecycleMarkers::parse_runner_registered)
-            .ok_or_else(|| {
-                LsbxError::BackendUnavailable(
-                    "runner provisioning did not report a runner name".to_string(),
-                )
-            })?;
-        record.runner_name = Some(runner_name);
-        record.updated_at = now_rfc3339();
-        self.job_store.save(record)?;
 
-        let start = format!(
-            "sudo -u {} nohup {}/run.sh </dev/null >/tmp/lsbx-ci-broker-runner.log 2>&1 &",
-            shell_quote(&config.runner_user),
-            shell_quote(&config.runner_dir)
-        );
-        self.exec_runner_command(sandbox_id, start).await?;
+        if is_windows {
+            let _ = self
+                .exec_runner_command_windows(
+                    sandbox_id,
+                    "if exist C:\\lsbx-ci-broker rmdir /s /q C:\\lsbx-ci-broker".to_string(),
+                )
+                .await;
+            self.ops
+                .put(sandbox_id, upload.path(), "C:\\lsbx-ci-broker")
+                .await?;
+            let provision_command = "powershell -ExecutionPolicy Bypass -File C:\\lsbx-ci-broker\\provision-ci-runner.ps1";
+            let output = self
+                .exec_runner_command_windows(sandbox_id, provision_command.to_string())
+                .await?;
+            let runner_name = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(LifecycleMarkers::parse_runner_registered)
+                .ok_or_else(|| {
+                    LsbxError::BackendUnavailable(
+                        "runner provisioning did not report a runner name".to_string(),
+                    )
+                })?;
+            record.runner_name = Some(runner_name);
+            record.updated_at = now_rfc3339();
+            self.job_store.save(record)?;
+        } else {
+            let _ = self
+                .exec_runner_command(sandbox_id, "sudo rm -rf /tmp/lsbx-ci-broker".to_string())
+                .await;
+            self.ops
+                .put(sandbox_id, upload.path(), "/tmp/lsbx-ci-broker")
+                .await?;
+            for command in [
+                "sudo install -m 0600 /tmp/lsbx-ci-broker/lsbx-runner.env /etc/lsbx-runner.env",
+                "sudo install -m 0600 /tmp/lsbx-ci-broker/lsbx-runner-app.pem /etc/lsbx-runner-app.pem",
+                "sudo install -m 0755 /tmp/lsbx-ci-broker/provision-ci-runner.sh /usr/local/sbin/lsbx-provision-ci-runner",
+            ] {
+                self.exec_runner_command(sandbox_id, command.to_string()).await?;
+            }
+            let provision_command = format!(
+                "sudo env RUNNER_HOST_PREFIX={} LUFSS_RUNNER_ENV=/etc/lsbx-runner.env bash /usr/local/sbin/lsbx-provision-ci-runner",
+                shell_quote(&config.host_prefix)
+            );
+            let output = self
+                .exec_runner_command(sandbox_id, provision_command)
+                .await?;
+            let runner_name = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(LifecycleMarkers::parse_runner_registered)
+                .ok_or_else(|| {
+                    LsbxError::BackendUnavailable(
+                        "runner provisioning did not report a runner name".to_string(),
+                    )
+                })?;
+            record.runner_name = Some(runner_name);
+            record.updated_at = now_rfc3339();
+            self.job_store.save(record)?;
+
+            let start = format!(
+                "sudo -u {} nohup {}/run.sh </dev/null >/tmp/lsbx-ci-broker-runner.log 2>&1 &",
+                shell_quote(&config.runner_user),
+                shell_quote(&config.runner_dir)
+            );
+            self.exec_runner_command(sandbox_id, start).await?;
+        }
         Ok(())
     }
 

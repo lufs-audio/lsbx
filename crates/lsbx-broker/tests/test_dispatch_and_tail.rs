@@ -215,6 +215,38 @@ async fn dispatch_calls_create_with_ci_profile_and_persists_dispatched_phase() {
 
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn dispatch_calls_create_with_win11_desktop_profile_for_windows_labels() {
+    let backend = LogInjectingBackend::new();
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let sandbox_store = SandboxStore::new(state_dir.path().to_path_buf());
+    let ci_job_store = CiJobStore::new(state_dir.path().to_path_buf());
+
+    let ops = LsbxOps::new(
+        Box::new(backend),
+        "log-injecting-demo".to_string(),
+        sandbox_store,
+        ci_job_store,
+        empty_registry(),
+        Box::new(SystemClock),
+    );
+
+    let job_store_for_reconciler = CiJobStore::new(state_dir.path().to_path_buf());
+    let github = GitHubClient::from_gh_cli_fallback();
+    let reconciler = Reconciler::new(&ops, &job_store_for_reconciler, &github);
+
+    let mut job = sample_job();
+    job.labels = vec!["self-hosted".to_string(), "lsbx-windows".to_string()];
+    let record = reconciler
+        .dispatch(&job, Duration::from_secs(3600))
+        .await
+        .expect("dispatch should succeed");
+
+    assert_eq!(record.phase, "dispatched");
+    assert!(record.sandbox_id.is_some());
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn tail_and_update_advances_phase_and_runner_name_from_lifecycle_markers() {
     let backend = LogInjectingBackend::new();
     let state_dir = tempfile::tempdir().expect("tempdir");
