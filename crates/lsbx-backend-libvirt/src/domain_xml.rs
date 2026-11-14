@@ -101,15 +101,47 @@ pub struct DomainXmlParams<'a> {
 /// never attached (callers must pass `seed_iso: None`) and the injected
 /// pubkey lives only in `<metadata>` (it must already be baked into the
 /// golden's `authorized_keys` for SSH to work at all).
+/// Renders the `<topology>` element for the requested vCPU count.
+///
+/// ### Why this is not just `<vcpu>{cpu}</vcpu>`
+/// With no `<topology>`, libvirt defaults to **one socket per vCPU** — a
+/// `<vcpu>8</vcpu>` domain renders as `-smp 8,sockets=8,cores=1,threads=1`.
+/// That is a live-traffic bug for Windows guests, not a cosmetic detail:
+/// Windows **client** SKUs are socket-limited (Home 1, **Pro 2**, Pro for
+/// Workstations 4), so a Windows 11 Pro guest presented with 8 sockets only
+/// ever schedules on 2 processors and silently ignores the remaining 6.
+/// Measured 2026-11-14 on `win11-desktop` with `cpu: 8`:
+/// `echo %NUMBER_OF_PROCESSORS%` inside the guest printed `2`.
+///
+/// One socket with N cores is the safe shape for every SKU (and matches how a
+/// real desktop is presented), so that is the default. `threads='1'` keeps the
+/// guest's view deterministic; SMT is not advertised through this path because
+/// a mismatched threads count is a harder failure than a missing SMT win.
+///
+/// This mirrors ticket #54; if you are "tidying" it back to a bare `<vcpu>`
+/// element, re-read this comment and the regression test
+/// `domain_xml_renders_one_socket_topology_not_one_socket_per_vcpu`.
+fn render_topology(cpu: u32) -> String {
+    format!("<topology sockets='1' dies='1' cores='{cpu}' threads='1'/>")
+}
+
 pub fn render_domain_xml(params: &DomainXmlParams<'_>, pubkey: &str) -> Result<String, LsbxError> {
     let memory_kib = parse_memory_to_kib(params.memory)?;
     let name = xml_escape(params.name);
     let disk_path = xml_escape(&params.disk_path.to_string_lossy());
     let pubkey_escaped = xml_escape(pubkey);
+    // One socket, N cores — see `render_topology`'s doc comment (#54).
+    let cpu = params.cpu.max(1);
+    let topology = render_topology(cpu);
 
     if params.os == "windows" {
         return Ok(render_windows_domain_xml(
-            &name, memory_kib, params.cpu, &disk_path, &pubkey_escaped,
+            &name,
+            memory_kib,
+            cpu,
+            &topology,
+            &disk_path,
+            &pubkey_escaped,
         ));
     }
 
@@ -158,14 +190,16 @@ pub fn render_domain_xml(params: &DomainXmlParams<'_>, pubkey: &str) -> Result<S
     <acpi/>
     <apic/>
   </features>
-  <cpu mode='host-passthrough'/>
+  <cpu mode='host-passthrough'>
+    {topology}
+  </cpu>
   <metadata>
     <lsbx:pubkey xmlns:lsbx="https://lufs.org/lsbx/domain-metadata">{pubkey_escaped}</lsbx:pubkey>
   </metadata>
   <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
     <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2'/>
+      <driver name='qemu' type='qcow2' cache='writeback'/>
       <source file='{disk_path}'/>
       <target dev='vda' bus='virtio'/>
     </disk>
@@ -198,6 +232,7 @@ fn render_windows_domain_xml(
     name: &str,
     memory_kib: u64,
     cpu: u32,
+    topology: &str,
     disk_path: &str,
     pubkey_escaped: &str,
 ) -> String {
@@ -237,7 +272,9 @@ fn render_windows_domain_xml(
     <vmport state='off'/>
     <smm state='on'/>
   </features>
-  <cpu mode='host-passthrough' check='none' migratable='on'/>
+  <cpu mode='host-passthrough' check='none' migratable='on'>
+    {topology}
+  </cpu>
   <clock offset='localtime'>
     <timer name='rtc' tickpolicy='catchup'/>
     <timer name='pit' tickpolicy='delay'/>
@@ -257,7 +294,7 @@ fn render_windows_domain_xml(
   <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
     <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2'/>
+      <driver name='qemu' type='qcow2' cache='writeback'/>
       <source file='{disk_path}'/>
       <target dev='vda' bus='virtio'/>
     </disk>
@@ -460,6 +497,56 @@ mod tests {
         assert!(xml.contains("<memory unit='KiB'>8388608</memory>"));
         assert!(xml.contains("<currentMemory unit='KiB'>8388608</currentMemory>"));
         assert!(xml.contains("vcpu placement='static'>4<"));
+    }
+
+    /// Regression test for #54: with no `<topology>`, libvirt defaults to one
+    /// socket per vCPU, and Windows client SKUs are socket-limited (Pro = 2),
+    /// so an 8-vCPU guest silently became a 2-CPU guest. Measured on the live
+    /// `win11-desktop` sandbox 2026-11-14: `%NUMBER_OF_PROCESSORS%` printed `2`.
+    #[test]
+    fn domain_xml_renders_one_socket_topology_not_one_socket_per_vcpu() {
+        for os in ["windows", "linux"] {
+            let params = DomainXmlParams {
+                name: "lsbx-topology",
+                cpu: 8,
+                memory: "32GB",
+                disk_path: std::path::Path::new("/tmp/topo.qcow2"),
+                seed_iso: None,
+                os,
+            };
+            let xml = render_domain_xml(&params, "irrelevant").unwrap();
+            assert!(
+                xml.contains("<topology sockets='1' dies='1' cores='8' threads='1'/>"),
+                "{os} domain XML must pin one socket with 8 cores (Windows client \
+                 SKUs cap at 2 sockets); got:\n{xml}"
+            );
+            // The degenerate shape this bug shipped: 8 sockets, 1 core each.
+            assert!(
+                !xml.contains("sockets='8'"),
+                "{os} domain XML must never present one socket per vCPU"
+            );
+        }
+    }
+
+    /// Disposable sandboxes have no durability requirement worth O_DIRECT for;
+    /// `cache=none` made installer-heavy work (Unity/Unreal/Wwise) thrash. See #54.
+    #[test]
+    fn domain_xml_sets_writeback_disk_cache() {
+        for os in ["windows", "linux"] {
+            let params = DomainXmlParams {
+                name: "lsbx-cache",
+                cpu: 2,
+                memory: "2G",
+                disk_path: std::path::Path::new("/tmp/cache.qcow2"),
+                seed_iso: None,
+                os,
+            };
+            let xml = render_domain_xml(&params, "irrelevant").unwrap();
+            assert!(
+                xml.contains("<driver name='qemu' type='qcow2' cache='writeback'/>"),
+                "{os} domain XML must set cache='writeback' on the root disk; got:\n{xml}"
+            );
+        }
     }
 
     #[test]

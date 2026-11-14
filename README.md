@@ -180,6 +180,28 @@ Carnyx's host config is the working reference: goldens in
 `/home/carnyx/ISOs/images/goldens/`, VM disks in `.../work/`, manifest
 `LSBX_IMAGES=/home/carnyx/repos/lsbx/images.carnyx.json`.
 
+### Guest CPU topology and disk cache (why they are pinned)
+
+Every domain renders an explicit `<topology sockets='1' dies='1' cores='N'
+threads='1'/>` and `<driver ... cache='writeback'/>`. Both are load-bearing,
+not defaults left unset:
+
+- **One socket, N cores.** With no `<topology>`, libvirt defaults to *one
+  socket per vCPU*, and Windows **client** SKUs are socket-limited (Home 1,
+  Pro 2, Pro for Workstations 4). A `cpu: 8` Windows 11 Pro guest therefore
+  reported `%NUMBER_OF_PROCESSORS% = 2` and ran on a quarter of its vCPUs —
+  measured 2026-11-14 on the live `win11-desktop` sandbox (lsbx#54).
+- **`cache='writeback'`.** Disposable VMs have no durability requirement worth
+  O_DIRECT for; the default `cache=none` made installer-heavy work (Unity /
+  Unreal / Wwise) thrash the disk. Host crash = lost unsynced writes, which is
+  acceptable for a sandbox that exists to be destroyed.
+
+Goldens must also be **uncompressed** (`qemu-img convert -O qcow2`, no `-c`):
+with `mode: copy`, every sandbox is a COW overlay on the golden, so a
+compressed backing cluster costs a zlib inflate on every read inside QEMU's
+main loop. `scripts/lsbx-commit-golden.sh` is the supported way to flatten an
+interactive session back into a golden and is written this way on purpose.
+
 ## Networking
 
 Guest NICs are pinned to **MTU 1280** (domain XML, the libvirt bridge, and

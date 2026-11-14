@@ -50,9 +50,17 @@ if virsh -c qemu:///system domstate "$SANDBOX_ID" >/dev/null 2>&1; then
     fi
 fi
 
-# 2. Convert and compress overlay into standalone golden image
-echo "--> Flattening and compressing overlay into new golden..."
-qemu-img convert -O qcow2 -c -p "$OVERLAY_DISK" "$NEW_GOLDEN"
+# 2. Flatten overlay into a standalone golden image.
+#
+# Deliberately NOT `-c` (compressed). A golden is a *runtime backing file*: every
+# sandbox is a COW overlay on it, so a compressed backing cluster costs a zlib
+# inflate on every read, taken in QEMU's single main loop. That is a constant
+# tax on exactly the workloads these VMs exist for (installers, asset imports,
+# builds). Compression belongs in a transfer/export step, never in a live
+# backing image. Rebuilding this way also un-compresses an already-compressed
+# golden. See lsbx issue #54.
+echo "--> Flattening overlay into new golden (uncompressed - see #54)..."
+qemu-img convert -O qcow2 -p "$OVERLAY_DISK" "$NEW_GOLDEN"
 
 # 3. Preserve virtual disk size
 echo "--> Aligning virtual disk size..."

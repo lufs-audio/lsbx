@@ -6,6 +6,11 @@
     2. Python websockify + noVNC assets (Port 8000 -> 127.0.0.1:5900, resize=scale)
     3. OpenSSH Server & lsbx authorized_keys hardening
     4. QEMU Guest Agent verification
+    5. Defender exclusions + Windows Search indexing off (issue #54)
+
+  NOTE: the per-sandbox vCPU topology and disk cache mode are NOT set here --
+  they are host-side domain XML concerns (`crates/lsbx-backend-libvirt/src/
+  domain_xml.rs`). A guest cannot fix an 8-socket/1-core topology from inside.
 #>
 
 param(
@@ -92,7 +97,54 @@ Write-Host "--> Configuring Firewall rules..."
 New-NetFirewallRule -Name "lsbx-websockify-8000" -DisplayName "lsbx WebSockify (8000)" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow -ErrorAction SilentlyContinue | Out-Null
 New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -DisplayName "OpenSSH Server (sshd)" -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -ErrorAction SilentlyContinue | Out-Null
 
-# 6. Verify Listeners
+# 6. Defender exclusions + Search indexing
+#
+# Real-time scanning of thousands of small files is the single most common
+# cause of "my fast machine makes Unity/Unreal installs crawl" — true on bare
+# metal too, and doubly true inside a disposable VM where the whole disk is
+# expendable and nothing here needs on-access AV. These are the standard
+# gamedev exclusions (project roots, package caches, toolchain dirs).
+# See lsbx issue #54.
+Write-Host "--> Configuring Defender exclusions and indexing..."
+$defenderPaths = @(
+    'C:\actions-runner',
+    'C:\lsbx',
+    'C:\lsbx-novnc',
+    'C:\lsbx-ci-broker',
+    'C:\Python312',
+    'C:\Program Files\QSC',
+    'C:\Program Files\Audiokinetic',
+    'C:\Program Files\Epic Games',
+    'C:\Program Files\Unity',
+    'C:\Program Files\REAPER (x64)',
+    'C:\Users\lsbx\AppData\Local\Unity',
+    'C:\Users\danielito\AppData\Local\Unity',
+    'C:\Users\danielito\Documents',
+    'C:\Users\Public\Documents'
+)
+if (Get-Command Add-MpPreference -ErrorAction SilentlyContinue) {
+    foreach ($p in $defenderPaths) {
+        try { Add-MpPreference -ExclusionPath $p -ErrorAction Stop } catch { }
+    }
+    # Scanning the executables themselves is what makes an installer take 4x
+    # longer than its own payload copy time.
+    foreach ($proc in @('Unity.exe', 'UnityHub.exe', 'UnrealEditor.exe', 'wwiseauthoring.exe', 'reaper.exe', 'QSC Designer.exe')) {
+        try { Add-MpPreference -ExclusionProcess $proc -ErrorAction Stop } catch { }
+    }
+    Write-Host "Defender exclusions applied."
+} else {
+    Write-Warning "Defender cmdlets unavailable; skipping exclusions."
+}
+# Stop the search indexer from crawling the same trees.
+try {
+    Set-Service -Name WSearch -StartupType Disabled -ErrorAction Stop
+    Stop-Service -Name WSearch -Force -ErrorAction SilentlyContinue
+    Write-Host "Windows Search indexing disabled."
+} catch {
+    Write-Warning "Could not disable Windows Search indexing."
+}
+
+# 7. Verify Listeners
 Write-Host "--> Verifying listeners..."
 Start-Sleep -Seconds 2
 $listeners = Get-NetTCPConnection -LocalPort 5900, 8000 -State Listen -ErrorAction SilentlyContinue
