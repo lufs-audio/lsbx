@@ -55,22 +55,36 @@ use std::sync::Arc;
 /// one-line stub with no explanation.
 const NOVNC_CONSOLE_HTML: &str = include_str!("../assets/novnc-console.html");
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct ConsoleParams {
-    pub target: String,
+    pub target: Option<String>,
+    pub id: Option<String>,
 }
 
-/// `GET /console?target=<sandbox-id>` — serves the bundled noVNC console
-/// page. Does not itself look up `target` against the store or attempt any
-/// connection; the page's own client-side script is what would open a
-/// WebSocket back to `/stream/<sandbox-id>/vnc` (this crate's `proxy.rs`
-/// handler), which is where the real, store-mediated destination lookup
-/// and security property actually live. `target` is accepted here purely
-/// so the served page can embed it (e.g. into a query string it hands to
-/// the stream endpoint) — see the placeholder gap noted on
-/// `NOVNC_CONSOLE_HTML` above for why that wiring is not fleshed out yet.
-pub async fn console_page_handler(Query(_params): Query<ConsoleParams>) -> Html<&'static str> {
-    Html(NOVNC_CONSOLE_HTML)
+/// `GET /console?target=<sandbox-id>` — serves the noVNC console page.
+/// If `target` (or `id`) is provided, resolves the sandbox's console URL
+/// and embeds the desktop in a full-window iframe with an "Open direct" link.
+/// If absent, falls back to the bundled placeholder page.
+pub async fn console_page_handler(
+    ops: Option<&lsbx_ops::LsbxOps>,
+    Query(params): Query<ConsoleParams>,
+) -> Response {
+    let target = params.target.as_deref().or(params.id.as_deref());
+    if let (Some(target), Some(ops)) = (target, ops) {
+        if let Ok(Some(url)) = ops.console_url(target).await {
+            let html = format!(
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>lsbx console: {target}</title>\
+                 <style>body {{ margin: 0; background: #101418; color: #e8eef5; overflow: hidden; height: 100vh; font-family: system-ui, sans-serif; }} \
+                 header {{ padding: 10px 16px; background: #161c24; border-bottom: 1px solid #232c38; display: flex; align-items: center; justify-content: space-between; }} \
+                 header a {{ color: #58a6ff; font-size: 13px; text-decoration: none; }} \
+                 iframe {{ width: 100%; height: calc(100vh - 42px); border: none; background: #000; }}</style></head>\
+                 <body><header><span>lsbx console · <code>{target}</code></span><a href=\"{url}\" target=\"_blank\">Open direct</a></header>\
+                 <iframe src=\"{url}\" allowfullscreen></iframe></body></html>"
+            );
+            return Html(html).into_response();
+        }
+    }
+    Html(NOVNC_CONSOLE_HTML).into_response()
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

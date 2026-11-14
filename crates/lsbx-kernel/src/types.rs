@@ -40,7 +40,13 @@ impl SandboxRecord {
 
     pub fn public(&self) -> PublicSandbox {
         let console_url = match (self.streaming.as_str(), &self.https_url) {
-            ("novnc", Some(url)) => Some(format!("{}/vnc.html", url.trim_end_matches('/'))),
+            ("novnc", Some(url)) => {
+                if url.contains("/console?") || url.ends_with("/vnc.html") {
+                    Some(url.clone())
+                } else {
+                    Some(format!("{}/vnc.html", url.trim_end_matches('/')))
+                }
+            }
             _ => None,
         };
 

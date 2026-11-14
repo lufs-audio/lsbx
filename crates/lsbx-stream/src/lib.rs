@@ -83,7 +83,8 @@ pub fn router(state: StreamState) -> Router {
 /// than in `console.rs` since it's routing-composition glue, not console
 /// logic.
 async fn proxy_console_page(
+    axum::extract::State(ops): axum::extract::State<Arc<lsbx_ops::LsbxOps>>,
     params: axum::extract::Query<ConsoleParams>,
-) -> axum::response::Html<&'static str> {
-    console_page_handler(params).await
+) -> axum::response::Response {
+    console_page_handler(Some(&ops), params).await
 }

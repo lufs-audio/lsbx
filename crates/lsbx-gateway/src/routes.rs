@@ -1001,9 +1001,13 @@ async fn browser_console(
 ) -> Response {
     match state.ops.console_url(&query.target).await {
         Ok(Some(url)) => Html(format!(
-            "<!DOCTYPE html><html><head><title>lsbx console: {id}</title></head>\
-             <body><p>Console for sandbox <code>{id}</code>:</p>\
-             <p><a href=\"{url}\">{url}</a></p></body></html>",
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>lsbx console: {id}</title>\
+             <style>body {{ margin: 0; background: #101418; color: #e8eef5; overflow: hidden; height: 100vh; font-family: system-ui, sans-serif; }} \
+             header {{ padding: 10px 16px; background: #161c24; border-bottom: 1px solid #232c38; display: flex; align-items: center; justify-content: space-between; }} \
+             header a {{ color: #58a6ff; font-size: 13px; text-decoration: none; }} \
+             iframe {{ width: 100%; height: calc(100vh - 42px); border: none; background: #000; }}</style></head>\
+             <body><header><span>lsbx console · <code>{id}</code></span><a href=\"{url}\" target=\"_blank\">Open direct</a></header>\
+             <iframe src=\"{url}\" allowfullscreen></iframe></body></html>",
             id = html_escape(&query.target),
             url = html_escape(&url)
         ))

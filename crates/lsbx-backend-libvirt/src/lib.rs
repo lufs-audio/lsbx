@@ -496,12 +496,13 @@ impl Backend for LibvirtBackend {
         // disk + seed artifacts before propagating the error — the gateway
         // has no record of this VM yet (create_from_golden never returned
         // Ok), so an orphan here would be unreachable by any cleanup path.
-        match self.guest_host_for(&vm_tag).await {
-            Ok(guest_ip) => {
+        let guest_ip = match self.guest_host_for(&vm_tag).await {
+            Ok(ip) => {
                 self.ip_cache
                     .write()
                     .await
-                    .insert(vm_tag.clone(), guest_ip);
+                    .insert(vm_tag.clone(), ip.clone());
+                ip
             }
             Err(e) => {
                 let _ = domain.destroy();
@@ -512,17 +513,31 @@ impl Backend for LibvirtBackend {
                 let _ = std::fs::remove_dir_all(seed_dir);
                 return Err(e);
             }
-        }
+        };
 
         let host = match &self.transport {
-            LibvirtTransport::Local { .. } => "localhost".to_string(),
+            LibvirtTransport::Local { .. } => guest_ip.clone(),
             LibvirtTransport::RemoteSsh { host, .. } => host.clone(),
+        };
+
+        let base_console_url = std::env::var("LSBX_PUBLIC_BASE_URL")
+            .or_else(|_| std::env::var("LSBX_CONSOLE_BASE"))
+            .or_else(|_| std::env::var("LUFSS_CONSOLE_BASE"))
+            .ok();
+
+        let req_name = req.name;
+        let https_url = match base_console_url {
+            Some(base) => {
+                let base = base.trim_end_matches('/');
+                Some(format!("{base}/console?target={req_name}"))
+            }
+            None => Some(format!("http://{guest_ip}:8000")),
         };
 
         Ok(CreatedVm {
             vm_tag,
             host,
-            https_url: None,
+            https_url,
         })
     }
 
