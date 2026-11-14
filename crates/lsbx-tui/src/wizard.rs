@@ -568,6 +568,7 @@ pub async fn run_golden_build_wizard(
             // the same placeholder shape `lsbx-golden`'s own tests use
             // rather than fabricate a "real-looking" key that isn't.
             pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHdpemFyZC1wbGFjZWhvbGRlcg== lsbx:wizard",
+            os: "linux",
         })
         .await?;
 

@@ -195,6 +195,9 @@ pub enum GoldenCommand {
         memory: String,
         #[arg(long)]
         streaming: Option<String>,
+        /// Guest operating system; default `linux`. Use `windows` for Windows goldens.
+        #[arg(long, default_value = "linux")]
+        os: String,
         #[arg(long)]
         register: bool,
         #[arg(long)]

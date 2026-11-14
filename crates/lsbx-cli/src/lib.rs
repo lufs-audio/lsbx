@@ -930,6 +930,7 @@ async fn dispatch_golden(
             cpu,
             memory,
             streaming,
+            os,
             register,
             no_cleanup,
             interactive: _,
@@ -968,6 +969,7 @@ async fn dispatch_golden(
                 dry_run: *dry_run,
                 pubkey: &pubkey,
                 key_path: keypair.as_ref().map(|kp| kp.private_key_path.as_path()),
+                os: os.as_str(),
             };
 
             let result = ops.golden_build(req).await;

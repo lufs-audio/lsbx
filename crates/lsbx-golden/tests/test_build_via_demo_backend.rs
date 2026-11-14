@@ -82,6 +82,7 @@ async fn golden_build_end_to_end_against_real_demo_backend() {
             cleanup: true,
             dry_run: false,
             pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGRlbW8ta2V5 lsbx:unit08-test",
+            os: "linux",
         },
         Some(&flattener),
     )
@@ -138,6 +139,7 @@ async fn golden_build_with_cleanup_false_leaves_a_real_demo_vm_alive() {
             cleanup: false,
             dry_run: false,
             pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGRlbW8ta2V5 lsbx:unit08-test",
+            os: "linux",
         },
         Some(&flattener),
     )
@@ -173,6 +175,7 @@ async fn golden_build_dry_run_never_calls_the_real_backend() {
             cleanup: true,
             dry_run: true,
             pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGRlbW8ta2V5 lsbx:unit08-test",
+            os: "linux",
         },
         None,
     )

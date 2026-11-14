@@ -318,6 +318,13 @@ pub struct GoldenBuildParams {
     /// See `lsbx_golden::build::GoldenBuildRequest`'s own doc comment for why
     /// this façade-level operation requires the caller to already hold one.
     pub pubkey: String,
+    /// Guest operating system; default `linux`. Use `windows` for Windows goldens.
+    #[serde(default = "default_os")]
+    pub os: String,
+}
+
+fn default_os() -> String {
+    "linux".to_string()
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -633,6 +640,7 @@ impl LsbxMcpServer {
                 cleanup: p.cleanup,
                 dry_run: p.dry_run,
                 pubkey: &p.pubkey,
+                os: &p.os,
             })
             .await
             .map(|outcome| {

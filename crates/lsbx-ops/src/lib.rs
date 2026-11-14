@@ -542,8 +542,12 @@ impl LsbxOps {
     /// note for why the contract's literal return type is stale.
     pub async fn golden_build(
         &self,
-        req: lsbx_golden::build::GoldenBuildRequest<'_>,
+        mut req: lsbx_golden::build::GoldenBuildRequest<'_>,
     ) -> Result<lsbx_golden::build::GoldenBuildOutcome, LsbxError> {
+        if req.os == "windows" {
+            req.pubkey = WINDOWS_VERIFY_PUBKEY;
+            req.key_path = None;
+        }
         let register = req.register;
         let outcome = lsbx_golden::build::golden_build(self.backend.as_ref(), req, None).await?;
 

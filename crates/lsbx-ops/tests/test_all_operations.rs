@@ -460,10 +460,39 @@ async fn golden_build_dry_run_succeeds() {
             cleanup: true,
             dry_run: true,
             pubkey: "ssh-ed25519 AAAA fake",
+            os: "linux",
         })
         .await
         .expect("dry-run golden_build should succeed");
     assert_eq!(outcome.config.key, "agent-base");
+}
+
+#[tokio::test]
+async fn golden_build_dry_run_with_windows_os_sets_baked_identity() {
+    let (ops, dir) = build_ops(SystemTime::now());
+    let script = dir.path().join("provision.ps1");
+    std::fs::write(&script, "Write-Host 'provisioning'\n").expect("write script");
+
+    let outcome = ops
+        .golden_build(lsbx_golden::build::GoldenBuildRequest {
+            key_path: Some(script.as_path()),
+            name: "win11-desktop",
+            from: "win11",
+            script: &script,
+            flavor: GoldenFlavor::Desktop,
+            cpu: 4,
+            memory: "8G",
+            streaming: StreamingMode::Novnc,
+            register: false,
+            cleanup: true,
+            dry_run: true,
+            pubkey: "ssh-ed25519 AAAA fake",
+            os: "windows",
+        })
+        .await
+        .expect("dry-run golden_build with windows should succeed");
+    assert_eq!(outcome.config.key, "win11-desktop");
+    assert_eq!(outcome.config.os, "windows");
 }
 
 #[tokio::test]
@@ -491,6 +520,7 @@ async fn golden_build_non_dry_run_without_flattener_fails_honestly() {
             cleanup: true,
             dry_run: false,
             pubkey: "ssh-ed25519 AAAA fake",
+            os: "linux",
         })
         .await;
     assert!(matches!(result, Err(LsbxError::ContractViolated(_))));

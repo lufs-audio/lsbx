@@ -142,6 +142,8 @@ pub struct GoldenBuildRequest<'a> {
     /// Exedev uses it for upload/run and key revocation; other backends may
     /// ignore it.
     pub key_path: Option<&'a Path>,
+    /// Guest operating system; default `"linux"`. Use `"windows"` for Windows goldens.
+    pub os: &'a str,
 }
 
 /// Result of a non-dry-run build: the registered `GoldenConfig`, plus the
@@ -169,7 +171,7 @@ pub async fn golden_build(
             config: GoldenConfig {
                 key: req.name.to_string(),
                 flavor: req.flavor,
-                os: "linux".to_string(),
+                os: req.os.to_string(),
                 base: req.from.to_string(),
                 mode: GoldenMode::Copy,
                 cpu: req.cpu,
@@ -204,10 +206,7 @@ pub async fn golden_build(
             pubkey: req.pubkey,
             cpu: req.cpu,
             memory: req.memory,
-            // Golden builds are a Linux-only workflow today (the build
-            // script is a POSIX provisioning script); a Windows golden is
-            // produced by direct provisioning, not `golden build`.
-            os: "linux",
+            os: req.os,
         })
         .await?;
     let vm_tag = created.vm_tag;
@@ -215,7 +214,15 @@ pub async fn golden_build(
     // From this point on, any early return must still respect `req.cleanup`
     // for the VM we just created — a helper keeps that from being
     // duplicated (or forgotten) at every fallible step below.
-    let result = run_build_steps(backend, &vm_tag, req.script, req.key_path, flattener).await;
+    let result = run_build_steps(
+        backend,
+        &vm_tag,
+        req.script,
+        req.os,
+        req.key_path,
+        flattener,
+    )
+    .await;
 
     if req.cleanup {
         // Best-effort teardown: a destroy failure here must not mask the
@@ -255,7 +262,7 @@ pub async fn golden_build(
     let config = GoldenConfig {
         key: key.as_str().to_string(),
         flavor: req.flavor,
-        os: "linux".to_string(),
+        os: req.os.to_string(),
         base: req.from.to_string(),
         mode: GoldenMode::Copy,
         cpu: req.cpu,
@@ -284,12 +291,47 @@ async fn run_build_steps(
     backend: &dyn Backend,
     vm_tag: &str,
     script: &Path,
+    os: &str,
     key_path: Option<&Path>,
     flattener: Option<&dyn GoldenFlattener>,
 ) -> Result<String, LsbxError> {
+    let (remote_path, command) = if os == "windows" {
+        let is_bat = script
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
+            .unwrap_or(false);
+        if is_bat {
+            (
+                "C:\\Windows\\Temp\\lsbx-golden-build-script.bat",
+                vec![
+                    "cmd".to_string(),
+                    "/c".to_string(),
+                    "C:\\Windows\\Temp\\lsbx-golden-build-script.bat".to_string(),
+                ],
+            )
+        } else {
+            (
+                "C:\\Windows\\Temp\\lsbx-golden-build-script.ps1",
+                vec![
+                    "powershell".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-File".to_string(),
+                    "C:\\Windows\\Temp\\lsbx-golden-build-script.ps1".to_string(),
+                ],
+            )
+        }
+    } else {
+        (
+            REMOTE_SCRIPT_PATH,
+            vec!["sh".to_string(), REMOTE_SCRIPT_PATH.to_string()],
+        )
+    };
+
     // Step 2: copy the provisioning script onto the build VM.
     backend
-        .put_file(vm_tag, script, REMOTE_SCRIPT_PATH, key_path)
+        .put_file(vm_tag, script, remote_path, key_path)
         .await?;
 
     // Step 3: actually execute it on the guest. `run`'s `Ok` only means the
@@ -299,7 +341,7 @@ async fn run_build_steps(
     let output = backend
         .run(
             vm_tag,
-            &["sh".to_string(), REMOTE_SCRIPT_PATH.to_string()],
+            &command,
             BUILD_SCRIPT_TIMEOUT,
             key_path,
         )
@@ -366,6 +408,7 @@ mod tests {
                 cleanup: true,
                 dry_run: true,
                 pubkey: "ssh-ed25519 AAAA fake",
+                os: "linux",
             },
             None,
         )
@@ -400,6 +443,7 @@ mod tests {
                 cleanup: true,
                 dry_run: false,
                 pubkey: "ssh-ed25519 AAAA fake",
+                os: "linux",
             },
             None, // no flattener supplied
         )
@@ -432,6 +476,7 @@ mod tests {
                 cleanup: true,
                 dry_run: false,
                 pubkey: "ssh-ed25519 AAAA fake",
+                os: "linux",
             },
             None,
         )
@@ -479,6 +524,7 @@ mod tests {
                 cleanup: true,
                 dry_run: false,
                 pubkey: "ssh-ed25519 AAAA fake",
+                os: "linux",
             },
             Some(&flattener),
         )
@@ -521,6 +567,7 @@ mod tests {
                 cleanup: false,
                 dry_run: false,
                 pubkey: "ssh-ed25519 AAAA fake",
+                os: "linux",
             },
             Some(&flattener),
         )
@@ -555,11 +602,46 @@ mod tests {
                 cleanup: true,
                 dry_run: false,
                 pubkey: "ssh-ed25519 AAAA fake",
+                os: "linux",
             },
             None,
         )
         .await;
 
         assert!(matches!(result, Err(LsbxError::BackendUnavailable(_))));
+    }
+
+    #[tokio::test]
+    async fn dry_run_honors_windows_os() {
+        let backend = DemoBackend::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = write_script(&dir);
+
+        let outcome = golden_build(
+            &backend,
+            GoldenBuildRequest {
+                key_path: None,
+                name: "win11-desktop",
+                from: "win11",
+                script: &script,
+                flavor: GoldenFlavor::Desktop,
+                cpu: 4,
+                memory: "8G",
+                streaming: StreamingMode::Novnc,
+                register: false,
+                cleanup: true,
+                dry_run: true,
+                pubkey: "ssh-ed25519 AAAA fake",
+                os: "windows",
+            },
+            None,
+        )
+        .await
+        .expect("dry run should succeed");
+
+        assert_eq!(outcome.config.key, "win11-desktop");
+        assert_eq!(outcome.config.os, "windows");
+        assert_eq!(outcome.config.flavor, GoldenFlavor::Desktop);
+        assert_eq!(outcome.config.streaming, StreamingMode::Novnc);
     }
 }

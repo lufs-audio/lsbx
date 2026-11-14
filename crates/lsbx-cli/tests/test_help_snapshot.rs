@@ -221,6 +221,7 @@ fn golden_build_help_lists_its_flags() {
             "--cpu",
             "--memory",
             "--streaming",
+            "--os",
             "--register",
             "--no-cleanup",
             "--interactive",
