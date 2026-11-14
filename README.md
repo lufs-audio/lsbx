@@ -191,6 +191,38 @@ framebuffer change is detected. Tunnel `5900` first (`ssh -f -N -L
 | Command | What it does |
 | --- | --- |
 | `lsbx serve` | Axum HTTP gateway + WebSocket/noVNC stream proxy + broker sidecar |
+
+### Opening a desktop console in a browser
+
+The gateway serves the console **and** the noVNC client, so a browser never needs
+to reach a guest's private IP:
+
+```
+GET  /console?target=<sandbox-id>     HTML console (public page, no secrets)
+GET  /assets/novnc/<path>             vendored noVNC 1.5.0 bundle (public)
+POST /consoles/<id>/token             mint a short-lived ticket (bearer auth)
+GET  /stream/<id>/vnc                 WebSocket relay (bearer OR ?t=<ticket>)
+```
+
+Usage:
+
+1. `lsbx console <id>` prints the console URL (or open `/console` with no target
+   for an index of running sandboxes).
+2. The page asks for your **gateway token** once; the browser keeps it in
+   `localStorage` and exchanges it for a 60-second, sandbox-scoped ticket.
+3. The WebSocket then carries `?t=<ticket>`, because a browser cannot set an
+   `Authorization` header on a WS handshake. Tickets are HMAC-SHA256 over a key
+   derived from the gateway token, scoped to one sandbox id, and never cached
+   (`Cache-Control: no-store`). The master token never appears in a URL, a log,
+   or the served page.
+4. The guest's own VNC password (`lsbx` on desktop goldens) is still required by
+   the RFB server — the ticket only authorises the relay.
+
+Why the assets live here rather than in Caddy: the noVNC client and the
+`/stream/*` protocol are one version contract, so vendoring keeps them pinned to
+the same release by construction. See
+`crates/lsbx-stream/assets/novnc/PROVENANCE.md` for the pinned upstream release,
+checksum and the re-vendor procedure.
 | `lsbx ci-broker run --backend <libvirt\|exedev>` | Zero-idle CI broker (GitHub App or `gh`-CLI auth) |
 | `lsbx mcp` | stdio MCP server for tool agents |
 | `lsbx reap` | TTL sweep with orphaned-key reconciliation |

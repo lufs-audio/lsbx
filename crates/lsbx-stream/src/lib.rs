@@ -27,6 +27,7 @@
 //! Deviation 12 (every door depends on `lsbx-ops` and *only* `lsbx-ops` for
 //! operational logic) for the operations `LsbxOps` actually does own.
 
+pub mod assets;
 pub mod console;
 pub mod proxy;
 
@@ -74,7 +75,15 @@ pub fn router(state: StreamState) -> Router {
         .route("/consoles/{id}", get(consoles_route_handler))
         .with_state(state.ops);
 
-    stream_routes.merge(console_routes)
+    // The vendored noVNC bundle. Stateless, so it needs no `with_state`; it is
+    // same-origin with `/stream/*` and `/console` by construction, which is the
+    // whole point (issue #55).
+    let asset_routes = Router::new().route(
+        "/assets/novnc/{*path}",
+        get(assets::serve_asset),
+    );
+
+    stream_routes.merge(console_routes).merge(asset_routes)
 }
 
 /// Thin wrapper so `console_page_handler` (which takes no `State`) can sit

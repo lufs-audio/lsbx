@@ -81,6 +81,7 @@
 
 pub mod auth;
 pub mod ratelimit;
+pub mod ticket;
 pub mod routes;
 
 pub use ratelimit::RateLimitConfig;
@@ -359,16 +360,36 @@ mod tests {
         // lsbx-stream, mounted via this merge): must be served by the SAME
         // router value, proving the merge actually happened rather than
         // two separately-bound servers.
-        let console_req = axum::http::Request::builder()
-            .uri("/console?target=sbx-does-not-matter")
+        //
+        // `/console` with no `target` renders the index page (200); with an
+        // unknown `target` it is a 404 — the console page resolves the sandbox
+        // before rendering, because a page whose WebSocket can only fail is
+        // worse than a clear 404 (issue #55). Neither case is unauthenticated
+        // *access to a sandbox*, so both are still served without a token.
+        let console_index_req = axum::http::Request::builder()
+            .uri("/console")
             .body(axum::body::Body::empty())
-            .expect("build console request");
-        let console_response = router
+            .expect("build console index request");
+        let console_index_response = router
             .clone()
-            .oneshot(console_req)
+            .oneshot(console_index_req)
             .await
-            .expect("oneshot console");
-        assert_eq!(console_response.status(), axum::http::StatusCode::OK);
+            .expect("oneshot console index");
+        assert_eq!(console_index_response.status(), axum::http::StatusCode::OK);
+
+        let console_unknown_req = axum::http::Request::builder()
+            .uri("/console?target=sbx-does-not-exist")
+            .body(axum::body::Body::empty())
+            .expect("build unknown-target console request");
+        let console_unknown_response = router
+            .clone()
+            .oneshot(console_unknown_req)
+            .await
+            .expect("oneshot console with unknown target");
+        assert_eq!(
+            console_unknown_response.status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
 
         // Stream and console-detail routes are protected by the gateway
         // composition layer even though their handlers live in lsbx-stream.

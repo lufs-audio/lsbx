@@ -106,22 +106,97 @@ pub async fn auth_middleware(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if request.uri().path() == "/console" {
+    let path = request.uri().path();
+
+    // `/console` and the vendored noVNC bundle are the public, browser-facing
+    // surface: an HTML navigation cannot carry an `Authorization` header, and a
+    // static JS/CSS fetch would need it on every subresource. Neither contains
+    // a secret — the page only becomes dangerous once it holds a ticket, which
+    // it must mint with the master token (see `crate::ticket`).
+    if path == "/console" || path.starts_with("/assets/novnc/") {
         return next.run(request).await;
     }
 
-    let authorized = config
-        .token
-        .as_deref()
-        .and_then(|configured| {
-            extract_presented_token(request.headers()).map(|presented| presented == configured)
-        })
-        .unwrap_or(false);
-    if authorized {
-        next.run(request).await
-    } else {
-        AuthError::InvalidToken.into_response()
+    if let Some(configured) = config.token.as_deref() {
+        // 1. Ordinary bearer / API-key header wins, exactly as before.
+        if extract_presented_token(request.headers())
+            .map(|presented| presented == configured)
+            .unwrap_or(false)
+        {
+            return next.run(request).await;
+        }
+
+        // 2. A browser's WebSocket handshake can only carry a URL, so a
+        //    sandbox-scoped ticket may arrive as `?t=` on the stream route.
+        //    Verification pins it to the sandbox id in the path, so a ticket for
+        //    one sandbox can never open another (#55, canonical-url D7).
+        if let Some(sandbox_id) = sandbox_id_for_stream_path(path) {
+            if let Some(ticket) = query_param(request.uri().query(), "t") {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if crate::ticket::verify(configured, sandbox_id, &ticket, now).is_ok() {
+                    return next.run(request).await;
+                }
+            }
+        }
     }
+
+    AuthError::InvalidToken.into_response()
+}
+
+/// Extracts the sandbox id from `/stream/<sandbox-id>/<guest-path>`, or `None`
+/// for any other route. Only the stream route accepts a ticket: `?t=` on an
+/// arbitrary API route would spread a URL-borne credential across the surface
+/// for no benefit.
+fn sandbox_id_for_stream_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/stream/")?;
+    let (sandbox_id, _guest_path) = rest.split_once('/')?;
+    if sandbox_id.is_empty() {
+        None
+    } else {
+        Some(sandbox_id)
+    }
+}
+
+/// First value of `name` in a raw query string.
+///
+/// Hand-rolled rather than pulling `serde_urlencoded` up into the middleware:
+/// one lookup, no allocation of a map, and no behaviour to keep in sync. Values
+/// are percent-decoded because a ticket is `<digits>.<hex>` and never needs
+/// escaping — but a client that escapes it anyway must still work.
+fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+    let query = query?;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == name {
+            return Some(percent_decode(value));
+        }
+    }
+    None
+}
+
+/// Minimal `%XX` decoding (no `+`-as-space: that is form encoding, not query
+/// syntax, and a ticket never contains spaces).
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // (not `#[async_trait]`) with a `Send`-bounded return future — implementing

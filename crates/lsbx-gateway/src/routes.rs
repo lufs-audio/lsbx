@@ -226,7 +226,12 @@ fn build_router_inner(
         .route("/sandboxes/{id}/check", post(check_sandbox))
         .route("/sandboxes/{id}/info", post(info_sandbox))
         .route("/sandboxes/{id}/renew", post(renew_sandbox))
-        .route("/sandboxes/{id}/console", post(console_for_sandbox));
+        .route("/sandboxes/{id}/console", post(console_for_sandbox))
+        // Short-lived, sandbox-scoped ticket for the browser console's
+        // WebSocket handshake — a browser cannot set an Authorization header on
+        // a WS upgrade, so the page mints one of these with its bearer token
+        // and presents it as `?t=` on `/stream/<id>/vnc` (#55).
+        .route("/consoles/{id}/token", post(mint_console_ticket));
 
     if include_own_console_routes {
         // See `build_router_for_merge`'s doc comment: this crate's own
@@ -975,6 +980,47 @@ async fn console_for_sandbox(
         Ok(url) => success_response(serde_json::json!({ "id": id, "console_url": url })),
         Err(e) => error_response(e),
     }
+}
+
+/// `POST /consoles/<id>/token` -> a short-lived ticket for the console's
+/// WebSocket handshake (see `crate::ticket`).
+///
+/// Bearer-authenticated like every other route: the escaping credential is the
+/// *ticket*, never the master token, which is why the browser keeps the master
+/// token in localStorage and exchanges it here instead of putting it in a URL.
+///
+/// The sandbox is resolved first, so a ticket is never minted for an id this
+/// gateway cannot see — an unknown id is a `404`, exactly like `GET
+/// /consoles/<id>`.
+async fn mint_console_ticket(
+    State(state): State<GatewayState>,
+    AxumPath(id): AxumPath<String>,
+    auth: AuthedRequest,
+) -> Response {
+    if let Err(e) = state.ops.info(&id).await {
+        return error_response(e);
+    }
+    let master = auth.token.as_str();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expires_at = now + crate::ticket::TICKET_TTL_SECS;
+    let ticket = crate::ticket::mint(master, &id, expires_at);
+
+    let mut response = success_response(serde_json::json!({
+        "id": id,
+        "t": ticket,
+        "expires_at": expires_at,
+        "ttl_secs": crate::ticket::TICKET_TTL_SECS,
+        "stream_path": format!("stream/{id}/vnc"),
+    }));
+    // A ticket is a credential: never let an intermediary or the browser cache it.
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 // ---------------------------------------------------------------------

@@ -14,6 +14,7 @@ axum = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+include_dir = { workspace = true }
 
 [dev-dependencies]
 # This crate's own destination-resolution logic only ever touches

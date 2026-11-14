@@ -1,4 +1,23 @@
-//! noVNC console page + console detail (Unit 14).
+//! noVNC console page + console detail.
+//!
+//! ## The console page is served by the gateway, same-origin (issue #55)
+//! This module used to render an `<iframe>` of the sandbox's `console_url`, which
+//! on the libvirt backend is the guest's private `http://192.168.122.x:8000/…`.
+//! No browser outside the hypervisor host can load that, so the page was dead
+//! off-host — and before that it was an explicit placeholder, because the real
+//! noVNC client was never in the repository.
+//!
+//! It now renders a real client that loads the vendored bundle from
+//! [`crate::assets`] and opens a WebSocket to `/stream/<id>/vnc` **on its own
+//! origin**. Consequences worth keeping in mind:
+//! - the guest IP never reaches the browser;
+//! - the same page works over the tailnet, over the public HTTPS vhost, and over
+//!   any future transport door, unchanged;
+//! - the browser authenticates with a short-lived, sandbox-scoped ticket minted
+//!   by the gateway, because a WebSocket handshake cannot carry an
+//!   `Authorization` header (canonical-url spec D7). The master token stays in
+//!   the browser's localStorage and is only ever sent as a header to the ticket
+//!   endpoint — never in a URL.
 //!
 //! ## `console_password` — an honest gap, not a fabricated value
 //! This unit's acceptance criteria says `/consoles/<id>` must return
@@ -33,58 +52,141 @@ use lsbx_ops::LsbxOps;
 use serde::Deserialize;
 use std::sync::Arc;
 
-/// Bundled noVNC HTML console page, embedded at build time via
-/// `include_str!` — never fetched from a CDN at runtime, per this unit's
-/// acceptance criteria and the house's no-CDN-dependency discipline for
-/// offline-capable surfaces.
-///
-/// ## Flagged gap: this is a clearly-labeled placeholder, not real noVNC
-/// `assets/novnc-console.html` is a deliberately minimal, explicitly
-/// labeled placeholder page — not a vendored copy of the real noVNC JS
-/// client. Fetching and vendoring the actual noVNC client (its RFB
-/// protocol implementation, its UI chrome, its asset bundle) is a
-/// materially larger effort than this unit's remaining scope justifies,
-/// and doing it via an AI-generated approximation of noVNC's JS instead of
-/// the real, upstream-maintained client would be worse than an honest
-/// placeholder: a fake "noVNC-shaped" client that doesn't actually speak
-/// the RFB-over-WebSocket protocol correctly would silently fail in a way
-/// that's harder to diagnose than a page that plainly says "not yet
-/// wired up." This is flagged here, in the file this unit ships, and again
-/// in this crate's own PR description, as an explicit gap for whoever
-/// picks up real console UI work next — not silently left as a bare
-/// one-line stub with no explanation.
-const NOVNC_CONSOLE_HTML: &str = include_str!("../assets/novnc-console.html");
+/// The console page template, embedded at build time. It is a template rather
+/// than a finished document because three values are per-request: the sandbox
+/// id, the vendored noVNC version (for diagnostics), and the resize mode.
+/// Substitution is a plain `str::replace` per token — deliberately not
+/// `format!`, whose brace escaping is a poor fit for a file full of CSS.
+const CONSOLE_PAGE_TEMPLATE: &str = include_str!("../assets/console.html");
+
+/// Vendored noVNC release, surfaced in the served page's `generator` meta tag so
+/// a running deployment can be identified without reading the binary.
+const NOVNC_BUNDLE_VERSION: &str = "1.5.0";
 
 #[derive(Deserialize, Default)]
 pub struct ConsoleParams {
     pub target: Option<String>,
     pub id: Option<String>,
+    /// `scale` (default) or `remote`. `remote` asks the RFB server to resize the
+    /// guest to the viewport, which needs a server that supports it — see #56.
+    pub resize: Option<String>,
 }
 
-/// `GET /console?target=<sandbox-id>` — serves the noVNC console page.
-/// If `target` (or `id`) is provided, resolves the sandbox's console URL
-/// and embeds the desktop in a full-window iframe with an "Open direct" link.
-/// If absent, falls back to the bundled placeholder page.
+/// `GET /console?target=<sandbox-id>` — the browser console page.
+///
+/// No guest address appears in the response: the page loads the vendored noVNC
+/// client from this origin and opens a WebSocket to `/stream/<id>/vnc`. An id
+/// that does not resolve is a `404`, matching every other door's treatment of an
+/// unknown sandbox (and preventing the page from advertising that a console
+/// exists).
 pub async fn console_page_handler(
     ops: Option<&lsbx_ops::LsbxOps>,
     Query(params): Query<ConsoleParams>,
 ) -> Response {
+    let Some(ops) = ops else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "console unavailable: this router was built without an LsbxOps",
+        )
+            .into_response();
+    };
+
     let target = params.target.as_deref().or(params.id.as_deref());
-    if let (Some(target), Some(ops)) = (target, ops) {
-        if let Ok(Some(url)) = ops.console_url(target).await {
-            let html = format!(
-                "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>lsbx console: {target}</title>\
-                 <style>body {{ margin: 0; background: #101418; color: #e8eef5; overflow: hidden; height: 100vh; font-family: system-ui, sans-serif; }} \
-                 header {{ padding: 10px 16px; background: #161c24; border-bottom: 1px solid #232c38; display: flex; align-items: center; justify-content: space-between; }} \
-                 header a {{ color: #58a6ff; font-size: 13px; text-decoration: none; }} \
-                 iframe {{ width: 100%; height: calc(100vh - 42px); border: none; background: #000; }}</style></head>\
-                 <body><header><span>lsbx console · <code>{target}</code></span><a href=\"{url}\" target=\"_blank\">Open direct</a></header>\
-                 <iframe src=\"{url}\" allowfullscreen></iframe></body></html>"
-            );
-            return Html(html).into_response();
+    let Some(target) = target else {
+        return html_response(render_index_page(ops).await);
+    };
+
+    // Resolve first: an unknown id must 404 rather than render a page whose
+    // WebSocket can only ever fail.
+    match ops.info(target).await {
+        Ok(sandbox) => {
+            let resize = match params.resize.as_deref() {
+                Some("remote") => "remote",
+                _ => "scale",
+            };
+            html_response(render_console_page(&sandbox.id, resize))
         }
+        Err(LsbxError::NotFound(message)) => (
+            axum::http::StatusCode::NOT_FOUND,
+            format!("no such sandbox: {message}"),
+        )
+            .into_response(),
+        Err(err) => error_response(&err),
     }
-    Html(NOVNC_CONSOLE_HTML).into_response()
+}
+
+fn html_response(body: String) -> Response {
+    let mut response = Html(body).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Renders the per-sandbox console page.
+///
+/// The only substitutions are the sandbox id, the vendored noVNC version and the
+/// resize mode. The id is HTML-escaped because it is interpolated into both a
+/// title and a JS string literal; today ids are `sbx-<hex>-<hex>`, but escaping
+/// costs nothing and keeps the template honest if that ever loosens.
+fn render_console_page(sandbox_id: &str, resize_mode: &str) -> String {
+    CONSOLE_PAGE_TEMPLATE
+        .replace("%SANDBOX_ID%", &html_escape(sandbox_id))
+        .replace("%NOVNC_VERSION%", NOVNC_BUNDLE_VERSION)
+        .replace("%RESIZE_MODE%", resize_mode)
+}
+
+/// Bare index: no `target`, so list what can be opened instead of erroring.
+/// Deliberately minimal and link-only — the full dashboard lives in `lsbx-tui`
+/// and in the gateway's JSON API.
+async fn render_index_page(ops: &LsbxOps) -> String {
+    let mut rows = String::new();
+    match ops.list().await {
+        Ok(sandboxes) if sandboxes.is_empty() => {
+            rows.push_str("<li>No sandboxes are running. Start one with <code>lsbx up &lt;profile&gt;</code>.</li>");
+        }
+        Ok(sandboxes) => {
+            for sandbox in sandboxes {
+                if sandbox.console_url.is_none() {
+                    continue;
+                }
+                let id = html_escape(&sandbox.id);
+                rows.push_str(&format!(
+                    "<li><a href=\"/console?target={id}\">{id}</a> <span class=dim>{}</span></li>",
+                    html_escape(&sandbox.profile)
+                ));
+            }
+            if rows.is_empty() {
+                rows.push_str("<li>No running sandbox has a console.</li>");
+            }
+        }
+        Err(err) => rows.push_str(&format!(
+            "<li class=err>Could not list sandboxes: {}</li>",
+            html_escape(&err.to_string())
+        )),
+    }
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>lsbx consoles</title>\
+         <meta name=\"generator\" content=\"lsbx console · noVNC {version}\">\
+         <style>body{{margin:0;background:#101418;color:#e8eef5;font:14px system-ui,sans-serif;padding:24px}}\
+         a{{color:#58a6ff}}code{{background:#0b0f14;padding:1px 5px;border-radius:4px}}\
+         .dim{{opacity:.6}}.err{{color:#fca5a5}}li{{margin:6px 0}}</style></head>\
+         <body><h1 style=\"font-size:16px\">lsbx consoles</h1><ul>{rows}</ul></body></html>",
+        version = NOVNC_BUNDLE_VERSION
+    )
+}
+
+/// Minimal HTML-entity escaping for the values interpolated into the pages above.
+/// Same narrow, deliberate scope as the gateway's own helper: the five characters
+/// that can break out of HTML text or an attribute.
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

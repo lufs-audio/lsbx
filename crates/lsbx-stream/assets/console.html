@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<!--
+  lsbx desktop console — served by `lsbx serve`, same origin as the WebSocket it
+  opens. Placeholders substituted server-side (see crates/lsbx-stream/src/console.rs):
+    %SANDBOX_ID%      the sandbox this page is for
+    %NOVNC_VERSION%   vendored noVNC release, for diagnostics
+    %RESIZE_MODE%     "scale" (default) or "remote" (see lsbx #51/#56)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="generator" content="lsbx console · noVNC %NOVNC_VERSION%">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lsbx console · %SANDBOX_ID%</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #101418; color: #e8eef5;
+               font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  header { display: flex; gap: 12px; align-items: center; justify-content: space-between;
+           padding: 8px 14px; background: #161c24; border-bottom: 1px solid #232c38;
+           font-size: 13px; flex: 0 0 auto; }
+  header .id { opacity: .75; font-family: ui-monospace, monospace; }
+  header .right { display: flex; gap: 10px; align-items: center; }
+  button { background: #1f2937; color: #e8eef5; border: 1px solid #334155;
+           border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+  button:hover { background: #273449; }
+  #screen { flex: 1 1 auto; background: #000; position: relative; overflow: hidden; }
+  #screen canvas { display: block; }
+  #status { position: absolute; inset: 0; display: flex; align-items: center;
+            justify-content: center; text-align: center; padding: 24px;
+            font-size: 14px; color: #b7bcc6; }
+  #status.hidden { display: none; }
+  #status .box { max-width: 30rem; }
+  #status input { width: 100%; margin: 10px 0; padding: 8px;
+                  background: #0b0f14; border: 1px solid #334155; border-radius: 6px;
+                  color: inherit; font-family: ui-monospace, monospace; }
+  .err { color: #fca5a5; }
+  .hint { font-size: 12px; opacity: .7; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span>lsbx console · <span class="id">%SANDBOX_ID%</span></span>
+    <span class="right">
+      <span id="state" class="hint">connecting…</span>
+      <button id="reconnect" hidden>reconnect</button>
+      <button id="scale" title="Toggle fit-to-window scaling">fit: on</button>
+    </span>
+  </header>
+  <div id="screen">
+    <div id="status"><div class="box">
+      <div id="status-text">Loading noVNC…</div>
+      <div id="token-form" hidden>
+        <p class="hint">This console needs your lsbx gateway token. It is kept in
+          this browser's localStorage and exchanged for a short-lived,
+          sandbox-scoped ticket — the master token never goes in a URL.</p>
+        <input id="token-input" type="password" placeholder="gateway token" autocomplete="off">
+        <button id="token-save">connect</button>
+      </div>
+    </div></div>
+  </div>
+</div>
+
+<script type="module">
+import RFB from '/assets/novnc/core/rfb.js';
+
+const SANDBOX_ID = '%SANDBOX_ID%';
+const RESIZE_MODE = '%RESIZE_MODE%';   // "scale" | "remote"
+const TOKEN_KEY = 'lsbx_gateway_token';
+const TOKEN_ENDPOINT = '/consoles/' + encodeURIComponent(SANDBOX_ID) + '/token';
+const WS_PATH = 'stream/' + encodeURIComponent(SANDBOX_ID) + '/vnc';
+
+const elScreen = document.getElementById('screen');
+const elStatus = document.getElementById('status');
+const elStatusText = document.getElementById('status-text');
+const elState = document.getElementById('state');
+const elReconnect = document.getElementById('reconnect');
+const elTokenForm = document.getElementById('token-form');
+const elTokenInput = document.getElementById('token-input');
+const elTokenSave = document.getElementById('token-save');
+const elScale = document.getElementById('scale');
+
+let rfb = null;
+let scaleToWindow = true;
+
+function showStatus(html, isError) {
+  elStatus.classList.remove('hidden');
+  elStatusText.innerHTML = html;
+  elStatusText.className = isError ? 'err' : '';
+}
+function hideStatus() { elStatus.classList.add('hidden'); }
+
+function setState(text) { elState.textContent = text; }
+
+// The gateway mints a single-use-ish ticket scoped to this sandbox; the WS
+// handshake cannot carry an Authorization header, which is exactly why the
+// ticket exists (canonical-url spec D7).
+async function mintTicket(masterToken) {
+  const res = await fetch(TOKEN_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + masterToken },
+  });
+  if (res.status === 401) throw new Error('token rejected');
+  if (!res.ok) throw new Error('ticket endpoint returned HTTP ' + res.status);
+  const body = await res.json();
+  const ticket = (body.data && body.data.t) || body.t;
+  if (!ticket) throw new Error('no ticket in response');
+  return ticket;
+}
+
+function wsUrl(ticket) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  return proto + '://' + location.host + '/' + WS_PATH + '?t=' + encodeURIComponent(ticket);
+}
+
+function applyScale() {
+  if (!rfb) return;
+  rfb.scaleViewport = scaleToWindow;
+  rfb.clipViewport = false;
+  elScale.textContent = 'fit: ' + (scaleToWindow ? 'on' : 'off');
+}
+
+function connectWith(ticket) {
+  setState('connecting…');
+  showStatus('Connecting to the desktop…');
+  rfb = new RFB(elScreen, wsUrl(ticket), { shared: true, wsProtocols: ['binary'] });
+  // `scale` keeps the fixed guest framebuffer usable today; `remote` asks the
+  // server to resize (needs a server that supports it — see #56).
+  rfb.resizeSession = RESIZE_MODE === 'remote';
+  applyScale();
+
+  rfb.addEventListener('connect', () => {
+    hideStatus();
+    setState('connected');
+    elReconnect.hidden = true;
+  });
+  rfb.addEventListener('disconnect', (e) => {
+    setState('disconnected');
+    elReconnect.hidden = false;
+    showStatus('Disconnected' + (e.detail && e.detail.clean ? '' : ' unexpectedly') + '.',
+               !(e.detail && e.detail.clean));
+    rfb = null;
+  });
+  rfb.addEventListener('credentialsrequired', () => {
+    // Desktop goldens use the shared 'lsbx' VNC password; it is not a secret
+    // worth a prompt (the guest is disposable and the tunnel is authenticated).
+    rfb.sendCredentials({ password: 'lsbx' });
+  });
+  rfb.addEventListener('desktopname', () => { /* keep the sandbox id in the header */ });
+}
+
+elScale.addEventListener('click', () => { scaleToWindow = !scaleToWindow; applyScale(); });
+elReconnect.addEventListener('click', () => start());
+elTokenSave.addEventListener('click', () => {
+  const value = elTokenInput.value.trim();
+  if (!value) return;
+  localStorage.setItem(TOKEN_KEY, value);
+  elTokenForm.hidden = true;
+  start();
+});
+
+async function start() {
+  elReconnect.hidden = true;
+  const master = localStorage.getItem(TOKEN_KEY);
+  if (!master) {
+    showStatus('Authentication required.', false);
+    elTokenForm.hidden = false;
+    elTokenInput.focus();
+    return;
+  }
+  try {
+    const ticket = await mintTicket(master);
+    connectWith(ticket);
+  } catch (err) {
+    if (String(err.message).includes('token rejected')) {
+      localStorage.removeItem(TOKEN_KEY);
+    }
+    showStatus('Could not authenticate: ' + err.message, true);
+    elTokenForm.hidden = false;
+  }
+}
+
+start();
+</script>
+</body>
+</html>

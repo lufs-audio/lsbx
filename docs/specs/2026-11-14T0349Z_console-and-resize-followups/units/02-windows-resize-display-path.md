@@ -5,6 +5,37 @@ Make "drag the browser window to any size and the Windows desktop becomes exactl
 that size, sharply" true — which first requires choosing the mechanism, because the
 current server cannot do the protocol half of it.
 
+## Scope update (2026-11-14T0425Z, after measurement)
+
+`docs/specs/2026-11-14T0425Z_win11-resize-measurement/FINDINGS.md` ran the gate this
+unit's Option A depended on. Outcome:
+
+- **Confirmed:** TightVNC 2.8.81 *does* report framebuffer size changes via the
+  legacy `DesktopSize` (-223) rect, and noVNC 1.5.0 handles it. **No VNC-server
+  swap is needed**; Option B (TigerVNC WinVNC, officially unsupported on Windows
+  since 2020) stays rejected.
+- **New hard constraint:** a display-mode change **cannot** be issued from an SSH
+  session. SSH lands in session 0, where `ChangeDisplaySettingsEx` returns
+  `DISP_CHANGE_FAILED` unconditionally. The "gateway → `lsbx exec` → script"
+  shape therefore needs the script to run *inside the interactive session*.
+- **New hard constraint:** the `win11` golden currently has **no logged-in
+  session** (`qwinsta`: console session `Conn`, no user), so there is no session
+  for a mode change to run in — and what a browser sees today is the logon
+  screen, not a desktop.
+- Classic `Winlogon\AutoAdminLogon` + `DefaultPassword`, the Win11
+  `PasswordLess\Device` registry fix, and injected RFB keystrokes all failed to
+  produce a session; the logon desktop needs a secure attention sequence.
+
+**So this unit gains a step 0 that is independently valuable:**
+
+| Step | What | Why now |
+|---|---|---|
+| **0** | **Autologon that works on Win11 25H2 + keep the session unlocked** (Sysinternals `Autologon`/LSA secret or `netplwiz`; `NoLockScreen=1`, no inactivity lock) | Without it there is no interactive session at all: no resize, and the console shows a logon prompt instead of a desktop |
+| 1 | `C:\lsbx\set-resolution.ps1` runs **in that session** (`schtasks /IT` as the logged-in user, or a small in-session display agent watching a file/pipe) | Session 0 cannot change the display |
+| 2 | QXL `vgamem` 16 MiB → 64 MiB for `flavor: desktop` | 2560×1600 already consumes 98% of 16 MiB; 4K needs 33 MB |
+| 3 | Gateway `POST /sandboxes/{id}/display` + console-page debounce | unchanged |
+| 4 | Verify with `scripts/rfb-desktopsize-probe.py` | expect a second `-223` rect per mode change |
+
 ## Context
 Read `docs/specs/2026-11-14T0337Z_console-endgame-recon/SPEC.md` §1.4–§1.5 and this
 phase's `SPEC.md` §2 and §5-Q1 first. The three facts that force this unit:

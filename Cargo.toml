@@ -70,6 +70,10 @@ http = "1"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
 sha2 = "0.10"
+# Embedded static assets for the gateway-served console (lsbx-stream/assets/novnc).
+# Compile-time tree embedding keeps the noVNC bundle inside the single binary
+# the systemd unit runs, with no asset directory to ship alongside it (#55).
+include_dir = "0.7"
 jsonwebtoken = "9.3"
 
 # Filesystem & IO
