@@ -1,18 +1,51 @@
 #!/usr/bin/env bash
-# lsbx-commit-golden: Merges an ephemeral sandbox's overlay disk into its base golden image.
-# Acts as a "save point" for interactive VM customization sessions.
+# lsbx-commit-golden: merges an ephemeral sandbox's overlay disk into its
+# base golden image — the "save point" for an interactive customization session.
 #
 # Usage:
-#   ./scripts/lsbx-commit-golden.sh <sandbox-id> [golden-key]
+#   ./scripts/lsbx-commit-golden.sh [--force] <sandbox-id> [golden-key]
+#
+#   --force   hard power-off the guest if it has not honoured an ACPI shutdown
+#             within LSBX_COMMIT_SHUTDOWN_WAIT (default 180 s) and flatten anyway.
+#             Without it, the script refuses to convert a live disk.
+#
+# Env overrides: LSBX_STATE_DIR, LSBX_LIBVIRT_IMAGES_DIR, LSBX_LIBVIRT_VM_DIR,
+#                LSBX_COMMIT_SHUTDOWN_WAIT
+#
+# What it does, in order:
+#   1. ACPI-shutdown the domain and WAIT for it to disappear (aborts if it won't)
+#   2. qemu-img convert  overlay -> <golden>.new   (deliberately UNCOMPRESSED)
+#   3. qemu-img resize   <golden>.new -> the previous golden's virtual size
+#   4. atomically swap   <golden>.new -> <golden>.qcow2
+#   5. remove the sandbox's overlay, seed ISO, and state record
+#
+# Usage recommendations:
+#   - Run it from a shell on the hypervisor host, not through a pipe: the
+#     conversion can take minutes for a 50 GiB+ overlay.
+#   - The sandbox is DESTROYED by this script. Anything not installed inside the
+#     guest is lost, so finish the session before committing.
+#   - Never compress the output (no `-c`): a golden is a live COW backing file,
+#     so compression costs an inflate on every guest read. See issue #54.
+#   - Resizing the qcow2 does NOT grow the guest partition. If you bumped the
+#     virtual size, extend the filesystem inside the guest too:
+#       reagentc /disable; diskpart delete partition override (the inert Recovery
+#       partition between C: and the free space); Resize-Partition; reagentc /enable
+#   - Verify afterwards:  lsbx golden verify <golden-key>   and   lsbx up <profile>
 #
 # Example:
-#   ./scripts/lsbx-commit-golden.sh sbx-18e7c5c98a41ddbb-7da4d00c win11-desktop
+#   ./scripts/lsbx-commit-golden.sh sbx-18e7cb8ac0ca9b71-ab2474e9 win11-desktop
 
 set -euo pipefail
 
+FORCE=0
+if [ "${1:-}" = "--force" ]; then
+    FORCE=1
+    shift
+fi
+
 SANDBOX_ID="${1:-}"
 if [ -z "$SANDBOX_ID" ]; then
-    echo "Usage: $0 <sandbox-id> [golden-key]" >&2
+    echo "Usage: $0 [--force] <sandbox-id> [golden-key]" >&2
     exit 1
 fi
 
@@ -35,17 +68,35 @@ echo "Sandbox ID:   $SANDBOX_ID"
 echo "Overlay Disk: $OVERLAY_DISK"
 echo "Target Golden: $GOLDEN_DISK"
 
-# 1. Gracefully shut down domain if running
+# 1. Gracefully shut down the domain, and REFUSE to convert a live disk.
+#
+# Converting while the guest still has the overlay open produces a torn image
+# (the qcow2 is not quiesced), so a failed shutdown must abort the whole commit
+# rather than fall through to `qemu-img convert`. Windows in particular can take
+# minutes to honour an ACPI shutdown when an installer or update is mid-flight;
+# `--force` is the escape hatch (hard power-off, then convert).
+SHUTDOWN_WAIT="${LSBX_COMMIT_SHUTDOWN_WAIT:-180}"
 if virsh -c qemu:///system domstate "$SANDBOX_ID" >/dev/null 2>&1; then
     STATE=$(virsh -c qemu:///system domstate "$SANDBOX_ID" 2>/dev/null || echo "shut off")
     if [ "$STATE" = "running" ]; then
-        echo "--> Gracefully shutting down domain $SANDBOX_ID..."
+        echo "--> Gracefully shutting down domain $SANDBOX_ID (waiting up to ${SHUTDOWN_WAIT}s)..."
         virsh -c qemu:///system shutdown "$SANDBOX_ID" >/dev/null 2>&1 || true
-        for i in {1..30}; do
-            if ! virsh -c qemu:///system domstate "$SANDBOX_ID" >/dev/null 2>&1; then
+        waited=0
+        while virsh -c qemu:///system domstate "$SANDBOX_ID" >/dev/null 2>&1; do
+            if [ "$waited" -ge "$SHUTDOWN_WAIT" ]; then
+                if [ "${FORCE:-0}" = "1" ]; then
+                    echo "--> still running after ${SHUTDOWN_WAIT}s; --force: hard power-off" >&2
+                    virsh -c qemu:///system destroy "$SANDBOX_ID" >/dev/null 2>&1 || true
+                else
+                    echo "Error: domain $SANDBOX_ID still running after ${SHUTDOWN_WAIT}s." >&2
+                    echo "       Refusing to flatten a live disk (it would be torn)." >&2
+                    echo "       Let the guest finish shutting down and re-run, or pass --force." >&2
+                    exit 1
+                fi
                 break
             fi
-            sleep 1
+            sleep 2
+            waited=$((waited + 2))
         done
     fi
 fi

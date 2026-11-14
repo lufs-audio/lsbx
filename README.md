@@ -145,6 +145,47 @@ And reproducible builds from scripts support `--os windows`:
 lsbx golden build win11-desktop --from win11 --script scripts/provision-win11-golden.ps1 --flavor desktop --cpu 8 --memory 32GB --os windows --streaming novnc
 ```
 
+### Working rules for desktop goldens (read before customizing one)
+
+These come from real sessions on carnyx; each one cost debugging time.
+
+**Committing a session (`scripts/lsbx-commit-golden.sh`)**
+
+- The script **destroys the sandbox**. Finish in the guest first; anything not
+  installed is lost.
+- It waits up to `LSBX_COMMIT_SHUTDOWN_WAIT` (default 180 s) for an ACPI shutdown
+  and then **refuses to flatten a live disk** rather than producing a torn image.
+  Windows can take minutes to honour ACPI when an installer is mid-flight; `--force`
+  hard-powers-off and flattens anyway.
+- Output is deliberately **uncompressed** — a golden is a live COW backing file, so
+  a compressed backing cluster costs an inflate on every guest read (see #54).
+- Growing the qcow2 (`qemu-img resize`) does **not** grow the guest partition.
+  Extend it inside the guest: `reagentc /disable` → delete the inert Recovery
+  partition that sits between `C:` and the free space (`diskpart delete partition
+  override`) → `Resize-Partition` → `reagentc /enable`.
+- Always follow with `lsbx golden verify <key>` and a real `lsbx up`.
+
+**Reaching the guest**
+
+- Console: `lsbx console <id>` prints the console URL; VNC password is `lsbx`. The
+  guest's own bridge listens on `:8000` (websockify → `127.0.0.1:5900`).
+- From another machine on the tailnet, a plain TCP forward is enough:
+  `socat TCP-LISTEN:8008,bind=<carnyx-tailnet-ip>,fork TCP:<guest-ip>:8000` then
+  browse `http://<carnyx-tailnet-ip>:8008/vnc.html`. (Proper doors are #52/#55.)
+- Management is SSH as user `lsbx` with `~/.ssh/lsbx_guest_key`, which **lands in
+  session 0**. Anything that needs the interactive desktop — display mode changes
+  above all — cannot run from there; see
+  `docs/specs/2026-11-14T0425Z_win11-resize-measurement/FINDINGS.md`.
+- Windows Search indexing is disabled and Defender exclusions are baked in for
+  install/toolchain paths, so installer-heavy sessions are not double-taxed.
+
+**Verifying VNC-level behaviour without a browser**
+
+`scripts/rfb-desktopsize-probe.py` speaks RFB 3.8 to a guest's VNC port and prints
+whatever pseudo-rects the server sends — including `DesktopSize`, which is how a
+framebuffer change is detected. Tunnel `5900` first (`ssh -f -N -L
+15900:127.0.0.1:5900 …`) because VNC is loopback-only in every desktop golden.
+
 ### Services
 
 | Command | What it does |
