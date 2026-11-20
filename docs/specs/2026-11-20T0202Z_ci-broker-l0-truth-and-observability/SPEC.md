@@ -176,3 +176,21 @@ Proof of *claim* (not just eligibility) still outstanding: trigger a `kb` or `ls
 ### Deliberately not done
 
 Runner group `lsbx-carnyx` was **not** created and `RUNNER_GROUP` stays `continuo` — see §4.
+
+### 10.1 Follow-up found by the live restart: no subscriber existed
+
+The first restart proved the binary swapped but emitted **nothing** — because the workspace had **no
+`tracing` subscriber anywhere**. Every `tracing::*` call in the codebase (including the 15
+pre-existing ones in `reconcile.rs`) had always been a no-op. L0's log lines were therefore
+"known-present, not known-live" — the exact distinction this phase's own acceptance criteria warn
+about.
+
+Fixed by initialising a subscriber in `crates/lsbx-cli/src/main.rs` (`tracing-subscriber`'s
+`EnvFilter`, default `info`, `RUST_LOG` overriding, `try_init` so it cannot panic). Proven live:
+
+```
+$ ./target/release/lsbx serve --port 18123 --stream-port 18124
+ INFO lsbx serve: background reap pass completed destroyed=[] keys_reconciled=0
+```
+
+Requires one more service restart to take effect. `RUST_LOG=debug` enables the per-cell poll lines.
