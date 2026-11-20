@@ -672,26 +672,31 @@ fn shell_assignment(key: &str, value: &str) -> String {
 
 /// Creates the small, sanitized upload set consumed by the guest provisioner.
 fn prepare_runner_upload(config: &RunnerConfig, repository: &str) -> Result<TempDir, LsbxError> {
+    // RETIRED (push-dispatch unit 06): the GitHub App PRIVATE KEY is no longer
+    // copied into the guest. Minting the runner registration token inside the VM
+    // meant any job that could read /etc/lsbx-runner-app.pem held org-wide
+    // runner-admin for the App's lifetime — a disposable VM is the wrong place
+    // for that credential.
+    //
+    // The replacement is the `lsbx-linux` scale set, which passes a single-use
+    // JIT config and keeps the key on the host
+    // (sidecars/lsbx-scaleset, scripts/run-jit-runner.sh).
+    //
+    // This path is now FAIL-CLOSED: GITHUB_APP_KEY is absent from the uploaded
+    // env, so guest-side registration fails rather than silently exposing the key.
+    // Full removal (host-side token minting, deleting provision-ci-runner.sh) is
+    // tracked in unit 06 and gated on unit 05 plus a 7-day green window.
     let directory = TempDirBuilder::new()
         .prefix("lsbx-ci-broker-")
         .tempdir()
         .map_err(|e| {
             LsbxError::ContractViolated(format!("failed to create runner upload directory: {e}"))
         })?;
-    let key_bytes = fs::read(&config.app_key_path).map_err(|e| {
-        LsbxError::AuthFailed(format!(
-            "failed to read GitHub App private key '{}': {e}",
-            config.app_key_path.display()
-        ))
-    })?;
     let repo_name = repository.rsplit('/').next().unwrap_or(repository);
     let mut env = String::new();
     for (key, value) in [
         ("GITHUB_APP_ID", config.app_id.to_string()),
-        (
-            "GITHUB_APP_KEY",
-            "/tmp/lsbx-ci-broker/lsbx-runner-app.pem".to_string(),
-        ),
+        // GITHUB_APP_KEY deliberately omitted — see the retirement note above.
         ("GITHUB_SCOPE", config.scope.clone()),
         ("GITHUB_OWNER", config.owner.clone()),
         ("GITHUB_REPO", repo_name.to_string()),
@@ -705,12 +710,9 @@ fn prepare_runner_upload(config: &RunnerConfig, repository: &str) -> Result<Temp
         env.push_str(&shell_assignment("RUNNER_GROUP", group));
     }
     let env_path = directory.path().join("lsbx-runner.env");
-    let key_path = directory.path().join("lsbx-runner-app.pem");
     let script_path = directory.path().join("provision-ci-runner.sh");
     fs::write(&env_path, env)
         .map_err(|e| LsbxError::ContractViolated(format!("failed to write runner env: {e}")))?;
-    fs::write(&key_path, key_bytes)
-        .map_err(|e| LsbxError::ContractViolated(format!("failed to write runner key: {e}")))?;
     fs::copy(&config.provision_script, &script_path).map_err(|e| {
         LsbxError::ContractViolated(format!(
             "failed to copy runner provision script '{}': {e}",
@@ -728,8 +730,6 @@ fn prepare_runner_upload(config: &RunnerConfig, repository: &str) -> Result<Temp
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&env_path, fs::Permissions::from_mode(0o600))
             .map_err(|e| LsbxError::ContractViolated(format!("failed to chmod runner env: {e}")))?;
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-            .map_err(|e| LsbxError::ContractViolated(format!("failed to chmod runner key: {e}")))?;
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).map_err(|e| {
             LsbxError::ContractViolated(format!("failed to chmod runner script: {e}"))
         })?;
@@ -836,6 +836,12 @@ impl<'a> Reconciler<'a> {
         self.job_store.save(record)?;
 
         let upload = prepare_runner_upload(config, &record.repository)?;
+        tracing::warn!(
+            repo = %record.repository,
+            "polling-broker runner provisioning is retired: the GitHub App private key is no \
+             longer uploaded to the guest, so registration will fail. Linux CI is dispatched by \
+             the lsbx-linux scale set (JIT, key stays on the host); see push-dispatch unit 06"
+        );
 
         if is_windows {
             let _ = self
@@ -871,7 +877,6 @@ impl<'a> Reconciler<'a> {
                 .await?;
             for command in [
                 "sudo install -m 0600 /tmp/lsbx-ci-broker/lsbx-runner.env /etc/lsbx-runner.env",
-                "sudo install -m 0600 /tmp/lsbx-ci-broker/lsbx-runner-app.pem /etc/lsbx-runner-app.pem",
                 "sudo install -m 0755 /tmp/lsbx-ci-broker/provision-ci-runner.sh /usr/local/sbin/lsbx-provision-ci-runner",
             ] {
                 self.exec_runner_command(sandbox_id, command.to_string()).await?;
