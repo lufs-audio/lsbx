@@ -24,6 +24,7 @@
       "mode": "copy",
       "cpu": 2,
       "memory": "4GB",
+      "disk": null,
       "streaming": "none",
       "capabilities": [
         "web-search"
@@ -34,6 +35,8 @@
         "curl --version",
         "test -x /usr/local/bin/web-search"
       ],
+      "repo": null,
+      "content_hash": null,
       "description": "Lean agent golden with an explicit DuckDuckGo HTML web-search CLI (carnyx)"
     },
     {
@@ -44,7 +47,9 @@
       "mode": "copy",
       "cpu": 4,
       "memory": "8GB",
+      "disk": null,
       "streaming": "none",
+      "capabilities": [],
       "healthcheck": [
         "python3 --version",
         "python3 -m venv --without-pip /tmp/lsbx-venv-check",
@@ -57,6 +62,8 @@
         "test -x /opt/lufs-runner/lufs-runner.sh",
         "docker image inspect myoung34/github-runner:ubuntu-noble"
       ],
+      "repo": null,
+      "content_hash": null,
       "description": "carnyx CI runner VM golden with Docker, lufs-runner, build-essential, and python3-venv"
     },
     {
@@ -67,6 +74,7 @@
       "mode": "copy",
       "cpu": 2,
       "memory": "4GB",
+      "disk": null,
       "streaming": "novnc",
       "capabilities": [
         "desktop",
@@ -77,6 +85,8 @@
         "systemctl is-active --quiet lsbx-desktop.service",
         "curl -fsS --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8000/vnc.html >/dev/null"
       ],
+      "repo": null,
+      "content_hash": null,
       "description": "Shared desktop/operator golden for browser and computer-use agents (carnyx)"
     },
     {
@@ -98,16 +108,97 @@
         "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\lsbx\\rfb-check.ps1",
         "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\lsbx\\session-check.ps1"
       ],
+      "repo": null,
+      "content_hash": null,
       "description": "Windows 11 desktop golden (OpenSSH key-only; TightVNC raw RFB on :8000 for the gateway relay; autologon gives an interactive desktop session), used via the browser console (carnyx)"
     },
     {
       "key": "kali",
+      "flavor": "desktop",
+      "os": "linux",
+      "base": "lsbx-kali-open-v1",
+      "mode": "copy",
+      "cpu": 4,
+      "memory": "8GB",
+      "disk": null,
+      "streaming": "novnc",
+      "capabilities": [
+        "security",
+        "desktop",
+        "computer-use",
+        "browser",
+        "torrent"
+      ],
+      "healthcheck": [
+        "chromium --version",
+        "systemctl is-active --quiet lsbx-desktop.service",
+        "curl -fsS --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8000/vnc.html >/dev/null",
+        "! systemctl is-active --quiet tor",
+        "aria2c --version",
+        "test -f /etc/motd.d/00-kali-no-tor"
+      ],
+      "repo": null,
+      "content_hash": null,
+      "description": "Kali desktop, OPEN egress: NO Tor. aria2c present. Use kali-tor for torified egress."
+    },
+    {
+      "key": "kali-genericcloud-base",
+      "flavor": "agent",
+      "os": "linux",
+      "base": "lsbx-kali-v0",
+      "mode": "copy",
+      "cpu": 4,
+      "memory": "8GB",
+      "disk": null,
+      "streaming": "none",
+      "capabilities": [],
+      "healthcheck": [
+        "true"
+      ],
+      "repo": null,
+      "content_hash": null,
+      "description": "Stock Kali 2026.2 genericcloud base (pristine, no curl/Tor/desktop) \u2014 build base for kali and kali-tor"
+    },
+    {
+      "key": "kali-tor",
+      "flavor": "desktop",
+      "os": "linux",
+      "base": "lsbx-kali-v2",
+      "mode": "copy",
+      "cpu": 4,
+      "memory": "8GB",
+      "disk": null,
+      "streaming": "novnc",
+      "capabilities": [
+        "security",
+        "tor",
+        "desktop",
+        "computer-use",
+        "browser"
+      ],
+      "healthcheck": [
+        "chromium --version",
+        "systemctl is-active --quiet lsbx-desktop.service",
+        "curl -fsS --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8000/vnc.html >/dev/null",
+        "systemctl is-active --quiet tor",
+        "systemctl is-active --quiet lsbx-tor-route.service",
+        "curl -fsS --retry 6 --retry-delay 3 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip",
+        "sudo -n /usr/local/bin/tor-mode status",
+        "! command -v aria2c"
+      ],
+      "repo": null,
+      "content_hash": null,
+      "description": "Kali desktop, Tor-LOCKED egress (fail-closed: v4 redirect, v6 closed, non-DNS UDP rejected). No torrent client."
+    },
+    {
+      "key": "kali-v1-tor",
       "flavor": "agent",
       "os": "linux",
       "base": "lsbx-kali-v1",
       "mode": "copy",
       "cpu": 2,
       "memory": "4GB",
+      "disk": null,
       "streaming": "none",
       "capabilities": [
         "security",
@@ -116,30 +207,37 @@
       "healthcheck": [
         "curl --version",
         "nmap --version",
-        "systemctl is-active tor",
-        "curl -fsS --retry 6 --retry-delay 3 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip"
+        "systemctl is-active tor"
       ],
-      "description": "Kali Linux + Tor"
+      "repo": null,
+      "content_hash": null,
+      "description": "ROLLBACK ONLY: previous headless Kali+Tor golden (v1, 2026-09-17). No profile registered."
     }
   ],
   "profiles": {
-    "default": {
-      "golden": "agent-base"
+    "win11": {
+      "golden": "win11-desktop"
     },
     "desktop": {
-      "golden": "agent-web"
-    },
-    "web": {
       "golden": "agent-web"
     },
     "ci": {
       "golden": "ci-runner"
     },
-    "win11": {
-      "golden": "win11-desktop"
-    },
     "kali": {
       "golden": "kali"
+    },
+    "default": {
+      "golden": "agent-base"
+    },
+    "web": {
+      "golden": "agent-web"
+    },
+    "kali-base": {
+      "golden": "kali-genericcloud-base"
+    },
+    "kali-tor": {
+      "golden": "kali-tor"
     }
   }
 }

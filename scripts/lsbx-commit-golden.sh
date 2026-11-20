@@ -115,9 +115,17 @@ qemu-img convert -O qcow2 -p "$OVERLAY_DISK" "$NEW_GOLDEN"
 
 # 3. Preserve virtual disk size
 echo "--> Aligning virtual disk size..."
-VIRT_SIZE=$(qemu-img info "$GOLDEN_DISK" | grep "virtual size:" | awk '{print $3$4}')
-if [ -n "$VIRT_SIZE" ]; then
-    qemu-img resize "$NEW_GOLDEN" "$VIRT_SIZE" >/dev/null 2>&1 || true
+# A brand-new golden has no previous image to align to, so this must tolerate
+# GOLDEN_DISK not existing yet. Without the guard, `qemu-img info` fails inside a
+# command substitution, `set -e`/pipefail aborts the script, and a fully converted
+# .new image is left stranded before the swap.
+if [ -f "$GOLDEN_DISK" ]; then
+    VIRT_SIZE=$(qemu-img info "$GOLDEN_DISK" | grep "virtual size:" | awk '{print $3$4}' || true)
+    if [ -n "${VIRT_SIZE:-}" ]; then
+        qemu-img resize "$NEW_GOLDEN" "$VIRT_SIZE" >/dev/null 2>&1 || true
+    fi
+else
+    echo "--> No existing golden to align to (creating '$GOLDEN_KEY' for the first time)"
 fi
 
 # 4. Atomic swap

@@ -180,46 +180,55 @@ making the safe state a default that can be switched away.
   Firefox is a patched build, **not** branded Firefox; browsers install to `~/.cache/ms-playwright`.
 - **Skill file:** `~/.agents/skills/lsbx/SKILL.md` — outside this repo.
 
-## 12. Implementation status (2026-11-20, branch `feature/kali-and-kali-tor-goldens`)
+## 12. Implementation status — COMPLETE (2026-11-20)
 
-### Landed and verified
+All seven units landed on branch `feature/kali-and-kali-tor-goldens` and verified on real VMs.
 
-- **Unit 01** — `scripts/build-kali-golden.sh` exists and passes: `bash -n`, `--check`, `--emit
-  locked`, `--emit open`, and `--dry-run` in both modes. Emitted files re-verify cleanly and report
-  `mode already baked as '<mode>'`.
+### Delivered
 
-### Deferred in Unit 06 — deliberately, with reason
+| Golden | Base disk | CPU/RAM | Egress | Size |
+|---|---|---|---|---|
+| `kali` | `lsbx-kali-open-v1.qcow2` | 4 / 8 GB | **open**, no Tor, `aria2c` | 9.4 GB |
+| `kali-tor` | `lsbx-kali-v2.qcow2` | 4 / 8 GB | **Tor-locked**, fail-closed | 9.6 GB |
+| `kali-v1-tor` | `lsbx-kali-v1.qcow2` | 2 / 4 GB | Tor (v1) | 3.6 GB — **rollback only, no profile** |
+| `kali-genericcloud-base` | `lsbx-kali-v0.qcow2` | 4 / 8 GB | none | 359 MB — build base |
 
-`images.carnyx.json` was **not** edited. Registering `kali` → `lsbx-kali-open-v1` before those qcow2
-files exist would break the currently-working `lsbx up kali` in the live working tree. The registry
-change and the image build must land **atomically**; splitting them regresses a working command.
-Unit 07 (skill) is deferred for the same reason — it would document profiles that do not exist yet.
+Both new goldens are standalone (no backing file) and boot with **all healthchecks passing**.
 
-### Precondition discovered — Unit 06 cannot run as written
+### Verified on live VMs
 
-`golden build --from <name>` resolves base disks from `<images_dir>/goldens/<name>.qcow2`
-(`crates/lsbx-backend-libvirt/src/golden_disk.rs:197`). The stock base lives in
-`<images_dir>/build/kali-genericcloud-base.qcow2`, so **`--from kali-genericcloud-base` will not
-resolve in a real build**. `lsbx golden reconcile` confirms only the five manifest goldens are
-`present`.
+- `kali-tor`: plain `curl https://check.torproject.org/api/ip` → `{"IsTor":true}` through the
+  transparent redirect; IPv6 egress blocked; `aria2c` absent; `vnc.html` HTTP 200.
+- `kali`: `tor` inactive; `aria2c` present; no-Tor motd present; `vnc.html` HTTP 200.
+- Rule surface confirmed present: `OUTPUT -j LSBX_TOR_OUT` (nat), `OUTPUT -j LSBX_V6_OUT`,
+  `OUTPUT -j LSBX_TOR_UDP`.
 
-Fix (one of, to decide):
-1. Register the stock base as a golden (key `kali-genericcloud-base` → `lsbx-kali-v0.qcow2`), or
-2. symlink `goldens/kali-genericcloud-base.qcow2` → `build/kali-genericcloud-base.qcow2`, or
-3. use `--from kali` (v1) as the base — **not recommended**: the open variant would inherit the Tor
-   install, and only Unit 06's negative healthcheck (`! systemctl is-active tor`) would catch it.
+### Three defects found and fixed during implementation
 
-### Correction to a claim made during implementation
+1. **`lsbx golden build` cannot be used at all.** `lsbx-ops` passes `flattener = None`, and
+   `NoFlatten::flatten` returns `ContractViolated` — the build would fail *after* provisioning.
+   Delivered via the supported path instead: provision a sandbox, then
+   `scripts/lsbx-commit-golden.sh <vm> <golden-key>`.
+2. **`lsbx-commit-golden.sh` could not create a *new* golden.** `VIRT_SIZE=$(qemu-img info
+   "$GOLDEN_DISK" ...)` fails when the target does not exist yet, and `set -e`/pipefail abort the
+   script *after* a complete convert, stranding a valid `.new` image. Fixed with an existence guard.
+3. **`tor-route` failed its systemd unit** because `/var/lib/lsbx` did not exist when the unit
+   started, even though the iptables rules had already applied. Fixed by creating the state dir
+   earlier in provisioning and defensively inside `tor-route`.
 
-`lsbx golden build --dry-run` **does not validate anything**: `build.rs:169` returns a canned config
-(`content_hash: lufs-dryrun`) before touching the backend
-(`dry_run_returns_canned_config_without_touching_backend`). A passing dry-run is therefore **not**
-evidence that the base resolves or that the script would succeed.
+Also: `tor-mode status` originally required root, which broke its own healthcheck; `status` is now
+an unprivileged read (mode *changes* still require root).
 
-### Tooling gap
+### Notes and honest caveats
 
-`shellcheck` is not installed on this host, so the `shellcheck` acceptance criterion in Unit 01 is
-**unverified**; `bash -n` plus manual review were used instead.
+- `lsbx golden build --dry-run` **validates nothing** — `build.rs:169` returns a canned config
+  (`content_hash: lufs-dryrun`) before touching the backend. It is not evidence of anything.
+- The QUIC/non-DNS-UDP probe was **inconclusive**: the guest `curl` has no HTTP/3 support. The rule
+  is verified by inspection (`-A OUTPUT -j LSBX_TOR_UDP`), not by a functional UDP test.
+- `shellcheck` is not installed on the host; it was run via the `koalaman/shellcheck:stable`
+  container instead. Clean.
+- `golden register` ignored `--profile`; the `kali-base` profile was added by editing
+  `images.carnyx.json` directly.
 
 ## 13. Units
 

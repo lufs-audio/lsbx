@@ -49,8 +49,9 @@
 
 KALI_MODE="__KALI_MODE__"
 KALI_STATE_DIR="/var/lib/lsbx"
-KALI_NOVNC_WEB="/usr/share/novnc"
-KALI_CDP_PORT="9222"
+# noVNC is served from /usr/share/novnc and Chromium's CDP port defaults to
+# 9222 (overridable at runtime via LSBX_CDP_PORT inside lsbx-chromium). Both
+# are written literally in the quoted heredocs below so they survive unexpanded.
 
 set -euo pipefail
 
@@ -145,6 +146,9 @@ run apt-get install -y --no-install-recommends \
   ca-certificates curl git jq openssh-server sudo ufw \
   kali-tools-top10 nmap nikto gobuster tcpdump tshark \
   procps python3
+
+# The state dir must exist before any unit writes /var/lib/lsbx/tor-mode.
+run mkdir -p "$KALI_STATE_DIR"
 
 # ---------------------------------------------------------------------------
 # 2. SSH hardening + sudoers (parity with lsbx-kali-v1)
@@ -307,6 +311,10 @@ ip6tables -A LSBX_V6_OUT -j REJECT --reject-with icmp6-adm-prohibited
 ip6tables -C OUTPUT -j LSBX_V6_OUT 2>/dev/null \
   || ip6tables -A OUTPUT -j LSBX_V6_OUT
 
+# Defensive: this unit can also be started by systemd on boot, before any
+# provisioning-side mkdir. A missing dir here previously failed the whole unit
+# *after* the iptables rules had already been applied.
+mkdir -p /var/lib/lsbx
 echo locked > /var/lib/lsbx/tor-mode
 echo "tor-route: locked egress active (v4 redirect, v6 closed, non-DNS UDP rejected)" >&2
 EOF
@@ -325,7 +333,16 @@ set -euo pipefail
 STATE_FILE=/var/lib/lsbx/tor-mode
 ALLOWLIST=/etc/lsbx/tor-allowlist
 
-[ "$(id -u)" -eq 0 ] || { echo "tor-mode: needs root" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || {
+  # `status` is a pure read and must work unprivileged, so healthchecks and
+  # agents can query the mode without sudo. Only mode *changes* need root.
+  if [ "${1:-status}" = "status" ]; then
+    cat /var/lib/lsbx/tor-mode 2>/dev/null || echo unknown
+    exit 0
+  fi
+  echo "tor-mode: needs root" >&2
+  exit 1
+}
 
 allow_base() {
   iptables -A OUTPUT -o lo -j ACCEPT
@@ -453,6 +470,7 @@ run ufw --force enable
 # ---------------------------------------------------------------------------
 run systemctl daemon-reload
 run systemctl enable lsbx-desktop.service
+run systemctl start lsbx-desktop.service
 
 if [ "$KALI_MODE" = "locked" ]; then
   run systemctl enable tor.service
@@ -460,8 +478,6 @@ if [ "$KALI_MODE" = "locked" ]; then
   run systemctl start tor.service
   run systemctl start lsbx-tor-route.service
 fi
-
-run mkdir -p "$KALI_STATE_DIR"
 
 if [ "$KALI_MODE" = "locked" ]; then
   log "done: locked golden (Tor egress, no torrent client)"
