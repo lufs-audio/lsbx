@@ -39,7 +39,8 @@ fallback if the transport migration stalls.
 
 ## 3. Decisions carried in from intake
 
-- **`lufs` is wanted on Carnyx** (owner decision). Carnyx will advertise `lufs` as a label.
+- **`lufs` is wanted on Carnyx** (owner decision) - and it is **already served** by the live
+  `lsbx-linux` runner scale set, not by this poller. Correction recorded in section 11.
 - **The x86-placement discriminator is `lsbx-carnyx`** (owner decision — option C in the intake
   discussion): both Carnyx and the ARM fleet may advertise `lufs`, and jobs that must be x86 say
   `lsbx-carnyx`.
@@ -49,6 +50,9 @@ fallback if the transport migration stalls.
 - **P1:** A (runner scale sets) conditional on the P3 spike. **P2:** (a) Go sidecar.
   **P3:** `lsbx-linux` labels `lsbx-default, lsbx-carnyx, lufs, X64`. **P4:** runner group
   `lsbx-carnyx` — but see §4.
+- **Single dispatch path (corrected).** Linux CI is push-dispatched by the `lsbx-linux` scale
+  set, live since 2026-11-14T20:06Z. This poller must hold **no** label the scale set serves, or
+  the two race and both boot a VM for one job. See section 11.
 - **No GitHub-side mutation in this phase.** Carnyx's runners get the `lsbx-carnyx` **label** here.
   The `lsbx-carnyx` **runner group** does not exist (`/orgs/lufs-audio/actions/runner-groups` has
   `Default, exe, continuo, lufs, lsbx-default`) and is created by the scale-set work, because
@@ -194,3 +198,42 @@ $ ./target/release/lsbx serve --port 18123 --stream-port 18124
 ```
 
 Requires one more service restart to take effect. `RUST_LOG=debug` enables the per-cell poll lines.
+
+## 11. Correction: the first diagnosis was incomplete
+
+Implementation initially widened the poller to `LSBX_QUEUE_LABEL=lsbx-default,lufs`. That was
+**wrong, and reverted before merge.**
+
+`origin/main` moved to `29d510d` (2026-11-14) while this phase was in progress. It records that
+P1–P4 were already decided, the Go sidecar is the chosen implementation (P2a), the scale set is
+`lsbx-linux` (P3), the group is `continuo` (P4) — and that **unit 04 landed and has been live since
+2026-11-14T20:06Z** as the systemd **user** unit `lsbx-scaleset@linux.service`.
+
+Verified live on this host:
+
+- `lsbx-scaleset@linux.service` — active, PID 7841, long-polling (`Getting next message
+  lastMessageID=…`), 74 Actions-service requests/hr vs 3 REST/hr. Healthy.
+- Its labels: `lsbx-linux, lsbx-default, lsbx-carnyx, lufs, self-hosted, Linux, X64`
+  (`~/ISOs/images/scaleset-linux.env`).
+- `ci-broker.env` had been **deliberately narrowed** to `LSBX_QUEUE_LABEL=lsbx-windows` for exactly
+  this reason.
+
+So the original framing — "the broker's label is wrong" — was only half right. The poller's label was
+correct **for its narrowed role**. The genuinely broken things were:
+
+1. the poller's total silence (real; fixed here), and
+2. `lufs` not matching the scale set until it was recreated with that label — the most plausible
+   explanation for the `kb` job that sat 23 h on 2026-11-18, since a scale set matches only the labels
+   it was **created** with, and a changed `LSBX_SS_LABELS` only takes effect on a recreate.
+
+### The hazard this avoided
+
+Two dispatch paths serving one label is worse than either path being down: both boot a VM for one
+job, and placement becomes a race. The poller's own `TickOutcome` counters would eventually have
+shown it, but only after the waste.
+
+### Corrected end state
+
+- Scale set `lsbx-linux`: the sole Linux dispatch path.
+- Poller: narrowed to `lsbx-windows` (inert — nothing requests it), or stopped outright once the
+  Windows decision is final. **One path at a time, chosen explicitly, never overlapping.**
