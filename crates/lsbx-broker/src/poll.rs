@@ -579,4 +579,34 @@ mod tests {
         assert!(!zero_eligible_should_warn(50, 5, 0));
     }
 
+    /// Regression lock for the 2026-11-14 outage. The live config must make the
+    /// labels workflows actually request eligible; under the old single
+    /// `lsbx-windows` label, every one of these was ineligible and nothing said so.
+    #[test]
+    fn live_label_contract_makes_workflow_labels_eligible() {
+        let cfg = PollConfig {
+            queue_labels: vec!["lsbx-default".to_string(), "lufs".to_string()],
+            ..PollConfig::default()
+        };
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+
+        let job = |labels: &[&str]| QueuedJob {
+            job_id: 1,
+            run_id: 1,
+            repository: "lufs-audio/kb".to_string(),
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            name: None,
+            created_at: Some("1970-01-01T00:00:00Z".to_string()),
+        };
+
+        // what `kb` asks for, and what `lsbx`'s ci.yml asks for
+        assert!(is_eligible(&job(&["self-hosted", "lufs"]), &cfg, now));
+        assert!(is_eligible(&job(&["self-hosted", "lsbx-default"]), &cfg, now));
+
+        // the retired label must not resurrect eligibility
+        assert!(!is_eligible(&job(&["self-hosted", "lsbx-windows"]), &cfg, now));
+        // and an unrelated label is never eligible
+        assert!(!is_eligible(&job(&["self-hosted", "some-other"]), &cfg, now));
+    }
+
 }
