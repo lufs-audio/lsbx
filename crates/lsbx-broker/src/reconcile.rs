@@ -1246,7 +1246,7 @@ pub async fn run_broker(
 
         let now = std::time::SystemTime::now();
         let queued = match poller.tick(github, now).await {
-            Ok(queued) => queued,
+            Ok(outcome) => outcome.eligible,
             Err(error) if is_retryable_poll_error(&error) => {
                 warn!(error = %error, "GitHub poll failed transiently; will retry on the next poll tick");
                 if iterations.is_none() {
@@ -1336,7 +1336,7 @@ async fn run_runner_broker(
         }
         step += 1;
         let queued = match poller.tick(github, std::time::SystemTime::now()).await {
-            Ok(queued) => queued,
+            Ok(outcome) => outcome.eligible,
             Err(error) if is_retryable_poll_error(&error) => {
                 warn!(error = %error, "GitHub poll failed transiently; will retry on the next poll tick");
                 if iterations.is_none() {

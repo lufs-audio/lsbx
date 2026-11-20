@@ -63,7 +63,9 @@
 use super::github_client::GitHubClient;
 use crate::labels::is_eligible;
 use lsbx_kernel::error::LsbxError;
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
+use tracing::{debug, info, warn};
 
 pub const FALLBACK_QUEUE_LABEL: &str = "lsbx-default";
 
@@ -245,6 +247,9 @@ pub struct Poller {
     config: PollConfig,
     repos: Vec<String>,
     last_repo_refresh: Option<SystemTime>,
+    /// Consecutive ticks that saw queued work but claimed none of it. Drives the
+    /// once-per-streak warning below; reset to 0 by any tick that claims a job.
+    zero_eligible_streak: u32,
 }
 
 impl Poller {
@@ -253,6 +258,7 @@ impl Poller {
             repos: config.repos.clone().unwrap_or_default(),
             config,
             last_repo_refresh: None,
+            zero_eligible_streak: 0,
         }
     }
 
@@ -315,7 +321,7 @@ impl Poller {
         &mut self,
         client: &GitHubClient,
         now: SystemTime,
-    ) -> Result<Vec<QueuedJob>, LsbxError> {
+    ) -> Result<TickOutcome, LsbxError> {
         // Static-repo (gh-CLI) mode: repos were populated at construction;
         // never hit the App-only installation endpoint. Only the
         // discovery mode (config.repos == None) refreshes via the client.
@@ -325,19 +331,97 @@ impl Poller {
         }
 
         let mut eligible = Vec::new();
+        let mut eligible_ids: BTreeSet<(String, u64)> = BTreeSet::new();
+        let mut seen_ids: BTreeSet<(String, u64)> = BTreeSet::new();
+        let mut seen_labels: BTreeSet<String> = BTreeSet::new();
+
+        let repos_scanned = self.repos.len();
+        let labels_scanned = self.config.queue_labels.len();
+
         for repo in &self.repos {
             for label in &self.config.queue_labels {
                 let jobs = queued_jobs(client, label, repo).await?;
+                // Per-cell visibility: without this, a label mismatch shows up as
+                // "nothing happened" rather than as "this exact cell returned 0".
+                debug!(repo = %repo, queue_label = %label, jobs = jobs.len(), "poll cell");
                 for job in jobs {
+                    let id = (job.repository.clone(), job.job_id);
+                    seen_ids.insert(id.clone());
+                    for job_label in &job.labels {
+                        seen_labels.insert(job_label.clone());
+                    }
                     if is_eligible(&job, &self.config, now) {
-                        eligible.push(job);
+                        // Dedupe: one job carrying several configured labels is a
+                        // single unit of work and must not be dispatched twice.
+                        if eligible_ids.insert(id) {
+                            eligible.push(job);
+                        }
                     }
                 }
             }
         }
 
-        Ok(eligible)
+        let jobs_seen = seen_ids.len();
+        let jobs_eligible = eligible_ids.len();
+        let jobs_skipped = jobs_seen.saturating_sub(jobs_eligible);
+
+        if jobs_seen > 0 && jobs_eligible == 0 {
+            self.zero_eligible_streak = self.zero_eligible_streak.saturating_add(1);
+        } else {
+            self.zero_eligible_streak = 0;
+        }
+
+        if zero_eligible_should_warn(self.zero_eligible_streak, jobs_seen, jobs_eligible) {
+            warn!(
+                streak = self.zero_eligible_streak,
+                configured = ?self.config.queue_labels,
+                seen = ?seen_labels,
+                "queued jobs seen but none eligible: no queued job carries a configured \
+                 queue label. Compare LSBX_QUEUE_LABEL against the workflows' runs-on labels"
+            );
+        }
+
+        info!(
+            repos = repos_scanned,
+            labels = labels_scanned,
+            seen = jobs_seen,
+            eligible = jobs_eligible,
+            skipped = jobs_skipped,
+            "poll tick"
+        );
+
+        Ok(TickOutcome {
+            eligible,
+            repos_scanned,
+            labels_scanned,
+            jobs_seen,
+            jobs_skipped,
+        })
     }
+}
+
+/// What one [`Poller::tick`] saw and decided.
+///
+/// Counts are **distinct** jobs, deduped by `(repository, job_id)`: the same job
+/// is returned once per configured label cell it carries, so raw per-cell totals
+/// would over-count it.
+pub struct TickOutcome {
+    /// Jobs eligible for dispatch, deduped, in discovery order.
+    pub eligible: Vec<QueuedJob>,
+    pub repos_scanned: usize,
+    pub labels_scanned: usize,
+    pub jobs_seen: usize,
+    pub jobs_skipped: usize,
+}
+
+/// Pure decision: warn **once** per streak of ticks that see work but claim none.
+///
+/// `streak` is the current number of consecutive such ticks, including this one.
+/// Returning true only at exactly 2 means one warning per streak rather than one
+/// per tick — a persistent misconfiguration is stated once, not used as a log
+/// flood. Kept free of I/O and clocks so it is directly testable.
+pub fn zero_eligible_should_warn(streak: u32, jobs_seen: usize, eligible: usize) -> bool {
+    streak == 2 && jobs_seen > 0 && eligible == 0
 }
 
 /// Pure "is a refresh due" decision, factored out of [`Poller::should_refresh_repos`]
@@ -473,4 +557,26 @@ mod tests {
         assert_eq!(parse_repo_csv(""), Vec::<String>::new());
         assert_eq!(parse_repo_csv(" , "), Vec::<String>::new());
     }
+    /// The warning must fire exactly once per streak of "saw work, claimed none"
+    /// ticks — the 2026-11-14 outage was five days of that condition with zero
+    /// log output, and one line would have named the fix immediately.
+    #[test]
+    fn zero_eligible_warns_once_per_streak_and_never_without_work() {
+        // no work seen: never warn, however long the silence
+        assert!(!zero_eligible_should_warn(1, 0, 0));
+        assert!(!zero_eligible_should_warn(2, 0, 0));
+        assert!(!zero_eligible_should_warn(99, 0, 0));
+
+        // something claimed: never warn
+        assert!(!zero_eligible_should_warn(2, 5, 1));
+
+        // first blind tick is silent (one flake is not a misconfiguration) ...
+        assert!(!zero_eligible_should_warn(1, 5, 0));
+        // ... the second consecutive one warns ...
+        assert!(zero_eligible_should_warn(2, 5, 0));
+        // ... and only that one: a persistent misconfiguration is stated once.
+        assert!(!zero_eligible_should_warn(3, 5, 0));
+        assert!(!zero_eligible_should_warn(50, 5, 0));
+    }
+
 }

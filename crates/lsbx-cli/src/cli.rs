@@ -11,7 +11,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "lsbx", version)]
+#[command(name = "lsbx", version = crate::VERSION)]
 pub struct Cli {
     #[arg(long, short = 'j', global = true)]
     pub json: bool,

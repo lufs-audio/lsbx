@@ -118,6 +118,14 @@
 pub mod cli;
 pub mod format;
 
+/// Binary version including the git commit it was built from.
+///
+/// `LSBX_GIT_COMMIT` is injected by this crate's `build.rs` and falls back to
+/// `unknown` when git metadata is unavailable. The commit is part of the version
+/// string because a stale binary silently outliving `main` is exactly the
+/// failure this makes visible.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("LSBX_GIT_COMMIT"), ")");
+
 use clap::Parser as _;
 use cli::{BackendChoice, CiBrokerCommand, Cli, Command, GoldenCommand};
 use format::Formattable;
@@ -1612,6 +1620,34 @@ async fn dispatch_ci_broker(args: &Cli, action: &CiBrokerCommand) -> Result<i32,
                 lease: DEFAULT_CI_BROKER_LEASE,
                 runner,
             };
+
+            // Effective-configuration banner. Filed as a deliberate design note:
+            // this logs what the process *is*, and never validates it against
+            // workflow files — discovering workflows would cost 14 repos x N
+            // fetches against the same 5,000/hr REST budget that motivated push
+            // dispatch in the first place. A mismatch instead names itself within
+            // one poll interval via `poll::tick`'s zero-eligible warning.
+            let (runner_labels, runner_group) = broker_config
+                .runner
+                .as_ref()
+                .map(|r| (r.labels.clone(), r.group.clone().unwrap_or_default()))
+                .unwrap_or_default();
+            tracing::info!(
+                version = crate::VERSION,
+                queue_labels = ?broker_config.poll.queue_labels,
+                runner_labels = %runner_labels,
+                runner_group = %runner_group,
+                repo_mode = if broker_config.poll.repos.is_some() { "static" } else { "discovery" },
+                repos = broker_config.poll.repos.as_ref().map_or(0, |r| r.len()),
+                poll_interval_secs = broker_config.poll.poll_interval.as_secs(),
+                fallback_delay_secs = broker_config.poll.fallback_delay.as_secs(),
+                "lsbx ci-broker starting"
+            );
+            if broker_config.poll.queue_labels.is_empty() {
+                tracing::warn!(
+                    "ci-broker has no queue labels configured; no job can ever be eligible"
+                );
+            }
 
             lsbx_broker::reconcile::run_broker(&job_store, &ops, &github, broker_config, None)
                 .await?;
