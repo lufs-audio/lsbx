@@ -58,7 +58,59 @@ stopgap and B documented as the fallback if the preview API moves against us.
 A meets every requirement at once — push-style, no repo list, no REST budget,
 no inbound port — and it fixes the App-key-in-VM problem as a side effect.
 
-## Open decisions
+## Decisions (recorded 2026-11-14, Daniel)
+
+- **P1 → A, runner scale sets.** Webhooks (B) stay specified as the
+  **pinned fallback** (endpoint on calimbra, `danialrami/molimo` registry) if
+  the scale-set API leaves preview badly; no work on B now.
+- **P2 → (a), Go sidecar** `sidecars/lsbx-scaleset/`, `actions/scaleset`
+  `v0.5.0`, driving VMs through the lsbx CLI.
+- **P3 → `lsbx-linux`**, labels **`lsbx-linux, lsbx-default, lsbx-carnyx,
+  self-hosted, Linux, X64`** (+ `lufs` once `lufs-runner`'s ARM64 pin is
+  merged). Spike answer: a scale set matches **only the labels it was created
+  with** and does **not** implicitly carry `self-hosted`/`Linux`/`X64`; with
+  them added explicitly, existing `runs-on: [self-hosted, lsbx-carnyx]`
+  workflows match unchanged. `lsbx-windows` analogous (unit 05).
+- **P4 → `continuo`.**
+
+## Status (2026-11-14)
+
+| unit | state | evidence |
+|---|---|---|
+| 01 poll-dedupe | open (moot once 06 lands) | poller kept for `lsbx-windows` only |
+| 02 scaleset-spike | **done** | `lufs-audio/lmid` runs `43634252712` (3 label forms), `43634593785` (kill mid-job), `43635118229` (cancel) — see `sidecars/lsbx-scaleset/README.md` |
+| 03 jit-runner-golden | **JIT path done**; golden bake open | `scripts/run-jit-runner.sh`; guest upload = `jitconfig` + script + runner tarball, no key (unit test + guest `find`/`grep`). The `ci` golden still lacks `/opt/actions-runner`, so the sidecar stages a host-cached, checksum-verified runner 2.338.2 |
+| 04 scaleset-listener-service | **done, live since 2026-11-14 20:06 UTC** | `lsbx-scaleset@linux` (systemd **user** unit — `carnyx` has no sudo; linger on); poller narrowed to `LSBX_QUEUE_LABEL=lsbx-windows` in `ci-broker.env` (backup `.bak-20261114-prescaleset`), **takes effect when Daniel restarts `lsbx-ci-broker`** |
+| 05 windows-scale-set | open | Windows stays on the poller |
+| 06 retire-polling-and-pem-upload | open (after 05) | PEM upload now only on the Windows path |
+| 07 lsbx-core-orphan-domains | **new, open** | see finding below |
+
+**Finding → unit 07.** Killing `lsbx up` mid-boot (SIGKILL, or a timeout
+cancelling the CLI) leaves a running libvirt domain and its
+`<name>.qcow2`/`<name>-cidata.iso` that `lsbx list` never recorded, so `lsbx
+down` cannot reach them. The polling broker has the same exposure. The sidecar
+sweeps domains under its own name prefix (`LSBX_SS_VIRSH_URI`), but the real
+fix is in `lsbx-lifecycle::create`: persist a `creating` record before the
+domain is defined, and let `reap` clean `creating` records older than the boot
+timeout.
+
+**Measured (production `lsbx-linux`, `lufs-audio/lmid` run `43635862928`, 5
+jobs, max 4):** queued → job running **25–26 s** for jobs that got a slot
+immediately (VM boot 14 s + ~10 s staging/extracting the runner; the job starts
+< 2 s after the runner listens); the job that waited for a slot started at
+49 s. The polling broker's measured pickup was 72 s (`danialrami/molimo`
+`docs/ci.md`). Done criterion 2 (boot + < 5 s) is **not yet met**: baking the
+runner into the `ci` golden (unit 03 remainder) removes most of the ~10 s.
+`lufs-audio/lsbx` CI run `43635704194` (`[self-hosted, lsbx-default]`,
+unchanged workflow) passed on `lsbx-linux`. Observed coexistence: while the
+old poller still held `lsbx-default`/`lsbx-carnyx`, job 5 of that run went to
+the poller's idle duplicate VM — GitHub hands a job to *any* idle matching
+runner, scale set or not (this is why `lufs` waits for the Pi pin). Also:
+two jobs in parallel; listener SIGKILL → GitHub holds the old message session ~60 s
+before a new one opens (the listener retries), queued jobs wait and then run,
+running jobs finish and are reaped after restart.
+
+## Open decisions (as originally posed)
 
 - **P1 — Dispatch model:** A (recommended) vs B. If B, the endpoint lives on
   calimbra (`danialrami/molimo` registry) and that repo gets a unit.
@@ -110,6 +162,7 @@ GitHub Actions service ◀── long-poll (outbound HTTPS) ── lsbx-scaleset
 | 04 | scaleset-listener-service | 02, 03 | P2, P3, P4 |
 | 05 | windows-scale-set | 04 | P3 |
 | 06 | retire-polling-and-pem-upload | 04 (+05) | — |
+| 07 | lsbx-core-orphan-domains | — | — |
 
 Shared-file order: `crates/lsbx-broker/src/poll.rs`: 01 → 06;
 `crates/lsbx-broker/src/reconcile.rs`: 03 → 06; `images.carnyx.json` / goldens:

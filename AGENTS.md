@@ -41,17 +41,30 @@ count against an old baseline.
 GitHub Actions runner labels are conjunctive. Broker-managed jobs must carry
 `self-hosted` plus exactly one placement label:
 
-- `lsbx-default` — the Molimo zero-idle broker, runner group `lsbx-default`.
-  This repo's own workspace CI runs here (`.github/workflows/ci.yml` and
-  `ci/ci.yml`).
-- `lsbx-molimo` — exe.dev / Molimo, runner group `exe`
-- `lsbx-carnyx` — local libvirt / Carnyx, runner group `continuo`
-- `lsbx-windows` — local libvirt / Carnyx, Windows runner jobs (`win11-desktop`), runner group `continuo`
+- `lsbx-carnyx` — Carnyx libvirt, served by the **runner scale set**
+  `lsbx-linux` (`sidecars/lsbx-scaleset`, push dispatch), runner group `continuo`.
+- `lsbx-default` — the default placement; since 2026-11-14 also served by the
+  `lsbx-linux` scale set on Carnyx (Molimo's broker is retired). This repo's
+  own workspace CI runs here (`.github/workflows/ci.yml` and `ci/ci.yml`).
+- `lsbx-windows` — Carnyx libvirt, Windows runner jobs (`win11-desktop`),
+  still served by the polling broker, runner group `continuo`.
+- `lsbx-molimo` — **retired** with the exe.dev runner group `exe`; do not use.
+
+Scale-set matching is exact: a scale set only matches labels it was
+**created** with (it does not implicitly carry `self-hosted`), which is why
+`lsbx-linux` is created with `self-hosted`, `Linux` and `X64` listed
+explicitly. Adding a placement label means changing `LSBX_SS_LABELS`; the
+listener recreates the scale set, and only while nothing is assigned to it.
 
 Never add two placement labels to one `runs-on` list to express "either,"
-and do not route zero-idle broker jobs through the legacy `lufs` label. Use a
-matrix only when intentionally running a job once per host; otherwise select
-one placement through the repository CI variable or workflow input.
+and do not route zero-idle broker jobs through the legacy `lufs` label
+(`lufs` is the Pi fleet's label; it joins `lsbx-linux` only after workflows
+that need ARM say `ARM64` explicitly). Use a matrix only when intentionally
+running a job once per host; otherwise select one placement through the
+repository CI variable or workflow input.
+
+The Go sidecar has its own gate: `cd sidecars/lsbx-scaleset && gofmt -l . &&
+go vet ./... && go test -race ./...`.
 
 > **Reconciled 2026-11-01 (#35).** This section previously listed only
 > `lsbx-molimo`/`lsbx-carnyx` as placement labels and reserved the legacy

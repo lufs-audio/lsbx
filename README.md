@@ -19,6 +19,14 @@ CI broker cut over on Molimo on 2026-08-27 (see
 The libvirt backend provisions both Linux and Windows goldens; macOS/
 Windows-native provisioning doors are follow-ups tracked in the specs below.
 
+**CI dispatch (2026-11-14):** Linux CI jobs on Carnyx are dispatched by
+**push**, not polling: [`sidecars/lsbx-scaleset`](sidecars/lsbx-scaleset/)
+registers the GitHub runner scale set `lsbx-linux` in runner group `continuo`,
+long-polls GitHub's job queue (no repo list, ~0 REST calls) and boots one lsbx
+VM per assigned job with a single-use JIT runner config — the GitHub App key
+never enters a guest. The polling broker (`lsbx ci-broker run`) now serves only
+`lsbx-windows`. See [CI on Carnyx](#ci-on-carnyx).
+
 ## The exe.dev backend
 
 The `lsbx-backend-exedev` crate runs VMs on [exe.dev](https://exe.dev) over
@@ -223,9 +231,37 @@ Why the assets live here rather than in Caddy: the noVNC client and the
 the same release by construction. See
 `crates/lsbx-stream/assets/novnc/PROVENANCE.md` for the pinned upstream release,
 checksum and the re-vendor procedure.
-| `lsbx ci-broker run --backend <libvirt\|exedev>` | Zero-idle CI broker (GitHub App or `gh`-CLI auth) |
+| `lsbx ci-broker run --backend <libvirt\|exedev>` | Zero-idle **polling** CI broker — today only `lsbx-windows` on Carnyx |
+| `lsbx-scaleset run` ([`sidecars/lsbx-scaleset`](sidecars/lsbx-scaleset/)) | Go sidecar: runner scale set listener, push dispatch for Linux CI (`lsbx-linux`) |
 | `lsbx mcp` | stdio MCP server for tool agents |
 | `lsbx reap` | TTL sweep with orphaned-key reconciliation |
+
+## CI on Carnyx
+
+| `runs-on` | served by | runner group | how |
+| --- | --- | --- | --- |
+| `[self-hosted, lsbx-carnyx]` | scale set `lsbx-linux` | `continuo` | `lsbx-scaleset@linux` (systemd user unit), push |
+| `[self-hosted, lsbx-default]` | scale set `lsbx-linux` | `continuo` | same — Molimo's broker is retired |
+| `[self-hosted, lsbx-windows]` | polling broker | `continuo` | `lsbx-ci-broker.service` (`LSBX_QUEUE_LABEL=lsbx-windows`) |
+| `[self-hosted, lufs, ARM64]` | Raspberry Pi runners | `continuo` | not lsbx |
+
+Any repository the `continuo` group allows can use these labels — there is no
+repo list to maintain. Keep the rule from [`AGENTS.md`](AGENTS.md): `self-hosted`
+plus exactly one placement label.
+
+Operating the listener:
+
+```bash
+systemctl --user status lsbx-scaleset@linux          # on carnyx, as user carnyx
+journalctl --user -u lsbx-scaleset@linux -f          # scaling up / job started / runner retired
+set -a; . ~/ISOs/images/scaleset-linux.env; set +a; lsbx-scaleset status   # persisted runner state
+```
+
+Concurrency is `LSBX_SS_MAX_RUNNERS` (4 VMs × 4 vCPU / 8 GB). Each job gets a
+fresh `ci` VM (~14 s boot; queued → running ~25 s, measured over 5 jobs) that is destroyed
+when the job completes; cancelled jobs, listener restarts and leases are
+handled as described in the sidecar's
+[README](sidecars/lsbx-scaleset/README.md).
 
 ## Placement configuration (libvirt)
 
@@ -290,6 +326,9 @@ those three values — it records the measured facts, the failure mode a
 - [`docs/specs/2026-08-27T1854Z_win11-browser-desktop-golden/`](docs/specs/2026-08-27T1854Z_win11-browser-desktop-golden/)
   → the Win11 browser-desktop golden phase (bake-in, streaming, register
   via `lsbx golden`)
+
+- [`docs/specs/2026-11-14T1900Z_ci-broker-push-dispatch/`](docs/specs/2026-11-14T1900Z_ci-broker-push-dispatch/)
+  → push dispatch via runner scale sets (`lsbx-scaleset`), decisions P1–P4 and status
 
 ## License
 
