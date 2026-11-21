@@ -10,7 +10,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)] [string]$Installer,
-    [Parameter(Mandatory = $true)] [switch]$DisposableClone
+    [Parameter(Mandatory = $true)] [switch]$DisposableClone,
+    [ValidateRange(1029, 65514)] [int]$AnchorPort = 47989,
+    [switch]$ReconfigureExisting
 )
 $ErrorActionPreference = 'Stop'
 if (-not $DisposableClone) { throw 'This script must only run in a disposable clone.' }
@@ -27,8 +29,12 @@ if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $sha256 -or
     throw 'Sunshine package failed the pinned SHA256 or Authenticode verification.'
 }
 if ($path -match '["\r\n]') { throw 'Invalid installer path.' }
-if (Get-Service -Name SunshineService -ErrorAction SilentlyContinue) {
-    throw 'Sunshine is already installed. Start with a fresh disposable clone.'
+$service = Get-Service -Name SunshineService -ErrorAction SilentlyContinue
+if ($service -and -not $ReconfigureExisting) {
+    throw 'Sunshine is already installed. Start with a fresh disposable clone or explicitly reconfigure this canary.'
+}
+if (-not $service -and $ReconfigureExisting) {
+    throw 'There is no Sunshine installation to reconfigure.'
 }
 
 # Carnyx's libvirt bridge is the only supported media source for this canary.
@@ -36,16 +42,23 @@ $privateHost = '192.168.122.1'
 $tcpName = 'LSBX disposable Sunshine test TCP'
 $udpName = 'LSBX disposable Sunshine test UDP'
 try {
-    $msi = Start-Process -FilePath msiexec.exe -ArgumentList "/i `"$path`" /qn /norestart" -Wait -PassThru
-    if ($msi.ExitCode -ne 0) { throw "Sunshine MSI returned $($msi.ExitCode); use a fresh clone to retry." }
+    if (-not $ReconfigureExisting) {
+        $msi = Start-Process -FilePath msiexec.exe -ArgumentList "/i `"$path`" /qn /norestart" -Wait -PassThru
+        if ($msi.ExitCode -ne 0) { throw "Sunshine MSI returned $($msi.ExitCode); use a fresh clone to retry." }
+    }
     Stop-Service -Name SunshineService
+    Get-NetFirewallRule -DisplayName $tcpName,$udpName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
     Get-NetFirewallRule | Where-Object {
         $_.DisplayName -match 'Sunshine' -and $_.DisplayName -notin @($tcpName, $udpName)
     } | Disable-NetFirewallRule
 
+    if (Get-NetFirewallProfile | Where-Object { -not $_.Enabled }) {
+        throw 'Windows Defender Firewall must be enabled on all profiles for this canary.'
+    }
     $dir = Join-Path $env:ProgramFiles 'Sunshine\config'
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    @'
+    @"
+port = $AnchorPort
 upnp = off
 origin_web_ui_allowed = pc
 sunshine_name = lsbx-carnyx-canary
@@ -57,12 +70,14 @@ stream_audio = yes
 install_steam_audio_drivers = off
 dd_configuration_option = disabled
 max_bitrate = 20000
-'@ | Set-Content -LiteralPath (Join-Path $dir 'sunshine.conf') -Encoding ascii
+"@ | Set-Content -LiteralPath (Join-Path $dir 'sunshine.conf') -Encoding ascii
 
+    $tcpPorts = @(-5, 0, 21) | ForEach-Object { $_ + $AnchorPort }
+    $udpPorts = @(9, 10, 11, 13, 21) | ForEach-Object { $_ + $AnchorPort }
     New-NetFirewallRule -DisplayName $tcpName -Direction Inbound -Action Allow `
-        -Protocol TCP -LocalPort 47984,47989,48010 -RemoteAddress $privateHost | Out-Null
+        -Protocol TCP -LocalPort $tcpPorts -RemoteAddress $privateHost | Out-Null
     New-NetFirewallRule -DisplayName $udpName -Direction Inbound -Action Allow `
-        -Protocol UDP -LocalPort 47998,47999,48000,48002,48010 -RemoteAddress $privateHost | Out-Null
+        -Protocol UDP -LocalPort $udpPorts -RemoteAddress $privateHost | Out-Null
     Start-Service -Name SunshineService
     Get-Service -Name SunshineService | Select-Object Name, Status
 } catch {

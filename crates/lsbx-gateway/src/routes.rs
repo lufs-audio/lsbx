@@ -137,6 +137,7 @@ pub struct GatewayState {
     /// One global, non-queueing permit for display changes. A second request
     /// receives 409 immediately instead of building an unbounded wait queue.
     pub display_resize_gate: Arc<tokio::sync::Mutex<()>>,
+    pub moonlight: Option<Arc<crate::moonlight::MoonlightManager>>,
 }
 
 /// Narrow trait `auth.rs`'s `FromRequestParts` impl is generic over, so the
@@ -173,7 +174,16 @@ impl HasGatewayConfig for GatewayState {
 /// See [`build_router_for_merge`] for the variant `lib.rs`'s Gap 1 merge
 /// path actually uses.
 pub fn build_router(ops: Arc<LsbxOps>, config: GatewayConfig) -> Router {
-    build_router_inner(ops, config, true)
+    build_router_inner(ops, config, true, None)
+}
+
+/// Builds the authenticated control API with the opt-in Moonlight manager.
+pub fn build_router_with_moonlight(
+    ops: Arc<LsbxOps>,
+    config: GatewayConfig,
+    moonlight: Arc<crate::moonlight::MoonlightManager>,
+) -> Router {
+    build_router_inner(ops, config, true, Some(moonlight))
 }
 
 /// The Gap 1 merge variant: identical to [`build_router`] except it omits
@@ -219,13 +229,22 @@ pub fn build_router(ops: Arc<LsbxOps>, config: GatewayConfig) -> Router {
 /// merged router, alongside every other REST route this crate owns
 /// (`/health`, `/images`, `/sandboxes/*`, etc.).
 pub(crate) fn build_router_for_merge(ops: Arc<LsbxOps>, config: GatewayConfig) -> Router {
-    build_router_inner(ops, config, false)
+    build_router_inner(ops, config, false, None)
+}
+
+pub(crate) fn build_router_for_merge_with_moonlight(
+    ops: Arc<LsbxOps>,
+    config: GatewayConfig,
+    moonlight: Arc<crate::moonlight::MoonlightManager>,
+) -> Router {
+    build_router_inner(ops, config, false, Some(moonlight))
 }
 
 fn build_router_inner(
     ops: Arc<LsbxOps>,
     config: GatewayConfig,
     include_own_console_routes: bool,
+    moonlight: Option<Arc<crate::moonlight::MoonlightManager>>,
 ) -> Router {
     let rate_limiter = Arc::new(TokenBucket::new(config.rate_limit));
     let state = GatewayState {
@@ -234,6 +253,7 @@ fn build_router_inner(
         rate_limiter,
         creation_gate: Arc::new(tokio::sync::Mutex::new(())),
         display_resize_gate: Arc::new(tokio::sync::Mutex::new(())),
+        moonlight,
     };
 
     let mut authenticated_routes = Router::new()
@@ -258,6 +278,13 @@ fn build_router_inner(
         .route("/sandboxes/{id}/info", post(info_sandbox))
         .route("/sandboxes/{id}/renew", post(renew_sandbox))
         .route("/sandboxes/{id}/console", post(console_for_sandbox))
+        .route(
+            "/sandboxes/{id}/moonlight",
+            get(moonlight_status)
+                .post(moonlight_acquire)
+                .delete(moonlight_release),
+        )
+        .route("/moonlight", get(moonlight_list))
         // Short-lived, sandbox-scoped ticket for the browser console's
         // WebSocket handshake — a browser cannot set an Authorization header on
         // a WS upgrade, so the page mints one of these with its bearer token
@@ -723,6 +750,19 @@ async fn delete_sandbox(
     AxumPath(id): AxumPath<String>,
     _auth: AuthedRequest,
 ) -> Response {
+    // Cancel listeners and in-flight relay state before the VM/record can be
+    // destroyed or its slot reused.
+    if let Some(manager) = &state.moonlight {
+        match manager.status(&id).await {
+            Ok(Some(_)) => {
+                if let Err(e) = manager.release(&id).await {
+                    return error_response(e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return error_response(e),
+        }
+    }
     match state.ops.destroy(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => error_response(e),
@@ -1261,4 +1301,62 @@ fn html_escape(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn moonlight_disabled() -> Response {
+    error_response(LsbxError::Usage(
+        "Moonlight media slots are disabled; configure the explicit tailnet bind, client and golden allowlist".to_string(),
+    ))
+}
+
+async fn moonlight_acquire(
+    State(state): State<GatewayState>,
+    AxumPath(id): AxumPath<String>,
+    _auth: AuthedRequest,
+) -> Response {
+    let Some(manager) = &state.moonlight else {
+        return moonlight_disabled();
+    };
+    match manager.acquire(&id).await {
+        Ok(status) => success_response(status),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn moonlight_status(
+    State(state): State<GatewayState>,
+    AxumPath(id): AxumPath<String>,
+    _auth: AuthedRequest,
+) -> Response {
+    let Some(manager) = &state.moonlight else {
+        return moonlight_disabled();
+    };
+    match manager.status(&id).await {
+        Ok(status) => success_response(status),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn moonlight_release(
+    State(state): State<GatewayState>,
+    AxumPath(id): AxumPath<String>,
+    _auth: AuthedRequest,
+) -> Response {
+    let Some(manager) = &state.moonlight else {
+        return moonlight_disabled();
+    };
+    match manager.release(&id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn moonlight_list(State(state): State<GatewayState>, _auth: AuthedRequest) -> Response {
+    let Some(manager) = &state.moonlight else {
+        return moonlight_disabled();
+    };
+    match manager.list().await {
+        Ok(statuses) => success_response(statuses),
+        Err(e) => error_response(e),
+    }
 }

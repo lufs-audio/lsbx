@@ -75,6 +75,18 @@ pub(crate) struct GatewayStatus {
     pub(crate) sandbox_count: usize,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct MoonlightStatus {
+    pub(crate) sandbox_id: String,
+    pub(crate) slot: u8,
+    pub(crate) address: String,
+    pub(crate) host_anchor: u16,
+    pub(crate) guest_ip: std::net::Ipv4Addr,
+    pub(crate) lease_expires_at: String,
+    pub(crate) acquired_at: String,
+    pub(crate) active: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct GatewayExecOutput {
     pub(crate) exit_code: i32,
@@ -283,6 +295,48 @@ impl GatewayClient {
         match console.console_url {
             Some(url) => Ok(Some(self.resolve_reported_url(id, &url)?)),
             None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn moonlight_acquire(&self, id: &str) -> Result<MoonlightStatus, LsbxError> {
+        self.json(
+            Method::POST,
+            self.endpoint(&["sandboxes", id, "moonlight"])?,
+            Some(serde_json::json!({})),
+        )
+        .await
+    }
+
+    pub(crate) async fn moonlight_status(
+        &self,
+        id: &str,
+    ) -> Result<Option<MoonlightStatus>, LsbxError> {
+        self.json(
+            Method::GET,
+            self.endpoint(&["sandboxes", id, "moonlight"])?,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn moonlight_list(&self) -> Result<Vec<MoonlightStatus>, LsbxError> {
+        self.json(Method::GET, self.endpoint(&["moonlight"])?, None)
+            .await
+    }
+
+    pub(crate) async fn moonlight_release(&self, id: &str) -> Result<(), LsbxError> {
+        let response = self
+            .request(
+                Method::DELETE,
+                self.endpoint(&["sandboxes", id, "moonlight"])?,
+            )
+            .send()
+            .await
+            .map_err(transport_error)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(response_error(response).await)
         }
     }
 

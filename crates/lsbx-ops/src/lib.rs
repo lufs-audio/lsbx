@@ -222,6 +222,13 @@ pub struct StatusReport {
     pub sandbox_count: usize,
 }
 
+/// Live, lease-bound destination resolved for the gateway's narrow Moonlight door.
+pub struct ResolvedMoonlightSandbox {
+    pub vm_tag: String,
+    pub guest_ip: String,
+    pub lease_expires_at: String,
+}
+
 /// One manifest golden's reconciliation outcome against the backend's live
 /// VM inventory (see [`LsbxOps::golden_reconcile`]). A plain struct —
 /// doors define their own `Serialize` DTOs (the `StatusReport` /
@@ -475,6 +482,63 @@ impl LsbxOps {
             && golden.os == "windows"
             && golden.streaming == lsbx_golden::registry::StreamingMode::Novnc
             && record.streaming == "novnc")
+    }
+
+    /// Resolves only a live libvirt sandbox on the exact configured Windows/noVNC
+    /// backing golden. The destination always comes from its stored record; no
+    /// caller-provided guest address or port is accepted.
+    pub async fn resolve_moonlight_sandbox(
+        &self,
+        id: &str,
+        exact_backing_golden: &str,
+    ) -> Result<ResolvedMoonlightSandbox, LsbxError> {
+        if self.backend_name != "libvirt" {
+            return Err(LsbxError::Usage(
+                "Moonlight media slots are supported only by the libvirt backend".to_string(),
+            ));
+        }
+        let record = self.sandbox_store.load(id)?;
+        let lease = record.lease_expires_at.clone().ok_or_else(|| {
+            LsbxError::ContractViolated(format!("sandbox {id} has no stored lease"))
+        })?;
+        let expires = chrono::DateTime::parse_from_rfc3339(&lease).map_err(|e| {
+            LsbxError::ContractViolated(format!("sandbox {id} has an invalid stored lease: {e}"))
+        })?;
+        if expires <= chrono::Utc::now() {
+            return Err(LsbxError::NotFound(format!(
+                "sandbox {id} lease has expired"
+            )));
+        }
+        let vm_tag = record.vm_tag.as_deref().ok_or_else(|| {
+            LsbxError::NotFound(format!("sandbox {id} has no stored libvirt domain id"))
+        })?;
+        if !self
+            .backend
+            .list_vms()
+            .await?
+            .iter()
+            .any(|live| live == vm_tag)
+        {
+            return Err(LsbxError::NotFound(format!(
+                "sandbox {id} libvirt domain is not live"
+            )));
+        }
+        let registry = self.registry.read().await;
+        let golden = registry.resolve_golden(&record.profile)?;
+        if golden.base != exact_backing_golden
+            || golden.os != "windows"
+            || golden.streaming != lsbx_golden::registry::StreamingMode::Novnc
+            || record.streaming != "novnc"
+        {
+            return Err(LsbxError::Usage(format!(
+                "sandbox {id} is not on the exact configured Windows/noVNC golden"
+            )));
+        }
+        Ok(ResolvedMoonlightSandbox {
+            vm_tag: vm_tag.to_string(),
+            guest_ip: record.host,
+            lease_expires_at: lease,
+        })
     }
 
     /// **Implemented directly** — no lower-crate function exists.

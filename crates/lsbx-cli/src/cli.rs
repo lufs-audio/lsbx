@@ -111,6 +111,16 @@ pub enum Command {
         #[arg(long)]
         open: bool,
     },
+    /// Acquire, inspect, list, or release an opt-in tailnet Moonlight slot.
+    Moonlight {
+        id: Option<String>,
+        #[arg(long, conflicts_with = "release")]
+        list: bool,
+        #[arg(long, requires = "id")]
+        release: bool,
+        #[arg(long, requires = "id", conflicts_with = "release")]
+        status: bool,
+    },
     Info {
         id: String,
     },

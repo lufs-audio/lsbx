@@ -125,7 +125,12 @@ mod gateway_client;
 /// `unknown` when git metadata is unavailable. The commit is part of the version
 /// string because a stale binary silently outliving `main` is exactly the
 /// failure this makes visible.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("LSBX_GIT_COMMIT"), ")");
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("LSBX_GIT_COMMIT"),
+    ")"
+);
 
 use clap::Parser as _;
 use cli::{BackendChoice, CiBrokerCommand, Cli, Command, GoldenCommand};
@@ -177,17 +182,15 @@ pub async fn run_with_args(args: Cli) -> i32 {
             println!("{}", format::render_error(&error, as_json));
             return error.exit_code() as i32;
         }
-        let client = match gateway_client::GatewayClient::new(
-            gateway,
-            args.token.as_deref(),
-            args.insecure,
-        ) {
-            Ok(client) => client,
-            Err(error) => {
-                println!("{}", format::render_error(&error, as_json));
-                return error.exit_code() as i32;
-            }
-        };
+        let client =
+            match gateway_client::GatewayClient::new(gateway, args.token.as_deref(), args.insecure)
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    println!("{}", format::render_error(&error, as_json));
+                    return error.exit_code() as i32;
+                }
+            };
         return match dispatch_gateway(&client, &args, as_json).await {
             Ok(code) => code,
             Err(error) => {
@@ -865,6 +868,44 @@ async fn dispatch_gateway(
             }
             Ok(0)
         }
+        Some(Command::Moonlight {
+            id,
+            list,
+            release,
+            status,
+        }) => {
+            if *list {
+                println!(
+                    "{}",
+                    format::render(&MoonlightList(client.moonlight_list().await?), as_json)
+                );
+            } else {
+                let id = id.as_deref().ok_or_else(|| {
+                    LsbxError::Usage("moonlight requires <id> or --list".to_string())
+                })?;
+                if *release {
+                    client.moonlight_release(id).await?;
+                    println!("released Moonlight slot for {id}");
+                } else if *status {
+                    println!(
+                        "{}",
+                        format::render(
+                            &MoonlightMaybe(client.moonlight_status(id).await?),
+                            as_json
+                        )
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        format::render(
+                            &MoonlightMaybe(Some(client.moonlight_acquire(id).await?)),
+                            as_json
+                        )
+                    );
+                }
+            }
+            Ok(0)
+        }
         Some(Command::Profiles { full }) => {
             let profiles = client.profiles().await?;
             let keys = profiles
@@ -1124,6 +1165,10 @@ async fn dispatch(
             }
             Ok(0)
         }
+        Some(Command::Moonlight { .. }) => Err(LsbxError::Usage(
+            "moonlight is a gateway-owned operation; pass --gateway and its bearer token"
+                .to_string(),
+        )),
         Some(Command::Info { id }) => {
             let sandbox = ops.info(id).await?;
             println!("{}", format::render(&sandbox, as_json));
@@ -1688,6 +1733,23 @@ async fn dispatch_serve(
     let serve_state_dir = state_dir.clone();
     let reap_ops = std::sync::Arc::new(serve_deps.into_ops());
 
+    // Moonlight remains off unless the bind IP is explicitly configured.
+    // A configured instance binds only its exact tailnet IPv4 and accepts
+    // only the exact configured tailnet client IPv4.
+    let moonlight = match lsbx_gateway::moonlight::MoonlightConfig::from_env()? {
+        Some(config) => {
+            let manager = lsbx_gateway::moonlight::MoonlightManager::new(
+                std::sync::Arc::clone(&reap_ops),
+                SandboxStore::new(state_dir.clone()),
+                config,
+                lsbx_gateway::moonlight::RelayPool::new(),
+            );
+            manager.spawn_reaper();
+            Some(manager)
+        }
+        None => None,
+    };
+
     if !daemon {
         println!("lsbx serve: starting on {host_str}:{gateway_port}");
     }
@@ -1729,7 +1791,13 @@ async fn dispatch_serve(
             state_dir: serve_state_dir,
         };
         let addr = std::net::SocketAddr::new(host_ip, gateway_port);
-        let bound = lsbx_gateway::run_server(deps, gateway_config(), addr).await?;
+        let bound = match moonlight.clone() {
+            Some(manager) => {
+                lsbx_gateway::run_server_with_moonlight(deps, gateway_config(), addr, manager)
+                    .await?
+            }
+            None => lsbx_gateway::run_server(deps, gateway_config(), addr).await?,
+        };
         if !daemon {
             println!(
                 "lsbx serve: listening on {} (gateway + stream, merged)",
@@ -1748,8 +1816,14 @@ async fn dispatch_serve(
         // `dual_listener` above already proved `stream_port` is `Some`.
         let stream_port_value = stream_port.unwrap();
 
-        let gateway_router =
-            lsbx_gateway::build_router(std::sync::Arc::clone(&reap_ops), gateway_config());
+        let gateway_router = match moonlight {
+            Some(manager) => lsbx_gateway::routes::build_router_with_moonlight(
+                std::sync::Arc::clone(&reap_ops),
+                gateway_config(),
+                manager,
+            ),
+            None => lsbx_gateway::build_router(std::sync::Arc::clone(&reap_ops), gateway_config()),
+        };
         let gateway_addr = std::net::SocketAddr::new(host_ip, gateway_port);
         let gateway_listener = tokio::net::TcpListener::bind(gateway_addr)
             .await
@@ -2374,7 +2448,9 @@ impl Formattable for GoldenReconcileDto {
             }
         }
         if lines.is_empty() {
-            lines.push("(no goldens in the manifest and no golden-shaped VMs on the backend)".to_string());
+            lines.push(
+                "(no goldens in the manifest and no golden-shaped VMs on the backend)".to_string(),
+            );
         }
         lines.join("\n")
     }
@@ -2595,5 +2671,50 @@ struct ConfigPathDto;
 impl Formattable for ConfigPathDto {
     fn to_human_table(&self) -> String {
         "no merged crate owns a writable config file path yet".to_string()
+    }
+}
+
+#[derive(Serialize)]
+struct MoonlightMaybe(Option<gateway_client::MoonlightStatus>);
+
+impl Formattable for MoonlightMaybe {
+    fn to_human_table(&self) -> String {
+        match &self.0 {
+            Some(value) => format!(
+                "slot {}: {}\nsandbox  {}\nguest    {}\nactive   {}\nlease    {}",
+                value.slot,
+                value.address,
+                value.sandbox_id,
+                value.guest_ip,
+                value.active,
+                value.lease_expires_at
+            ),
+            None => "(no Moonlight slot)".to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct MoonlightList(Vec<gateway_client::MoonlightStatus>);
+
+impl Formattable for MoonlightList {
+    fn to_human_table(&self) -> String {
+        format::row_table(
+            &["SANDBOX", "SLOT", "ADDRESS", "GUEST", "ACTIVE", "LEASE"],
+            &self
+                .0
+                .iter()
+                .map(|v| {
+                    vec![
+                        v.sandbox_id.clone(),
+                        v.slot.to_string(),
+                        v.address.clone(),
+                        v.guest_ip.to_string(),
+                        v.active.to_string(),
+                        v.lease_expires_at.clone(),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 }
