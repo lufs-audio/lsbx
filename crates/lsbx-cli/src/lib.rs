@@ -1664,6 +1664,9 @@ async fn dispatch_serve(
         allow_local_files: false,
         insecure,
         max_sandboxes,
+        windows_display_resize_golden: std::env::var("LSBX_WINDOWS_DISPLAY_RESIZE_GOLDEN")
+            .ok()
+            .filter(|value| !value.is_empty()),
         rate_limit: lsbx_gateway::RateLimitConfig::default(),
     };
 

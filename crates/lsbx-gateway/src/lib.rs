@@ -266,6 +266,7 @@ mod tests {
             allow_local_files: false,
             insecure,
             max_sandboxes: 8,
+            windows_display_resize_golden: None,
             rate_limit: crate::ratelimit::RateLimitConfig::default(),
         }
     }

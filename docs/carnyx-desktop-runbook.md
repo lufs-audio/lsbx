@@ -32,3 +32,51 @@ The tests below change or start **only operator-approved canaries**. Merging a P
 ## Rollback / disposition
 
 Destroy just the test sandboxes, remove canary profile selection and the audio opt-in, and restore prior config/binary if the test changed them. Retain the old disk and any safe, redacted evidence. Do not toggle IOMMU or move a GPU during this rollout. Park alternate off-tailnet transports (#52) unless an actual client cannot use existing HTTPS or Tailscale. Do not close issues on the basis of code checks alone.
+
+## Windows preset resize (opt-in)
+
+Copy `scripts/set-win11-display.ps1` to `C:\lsbx\set-win11-display.ps1` in an
+approved clone. Confirm that SSH is using the same account as the logged-in
+console desktop. The helper uses a temporary interactive scheduled task rather
+than trying to change the display from Windows SSH session 0.
+
+For a canary gateway only, set `LSBX_WINDOWS_DISPLAY_RESIZE_GOLDEN` to the
+exact Windows backing key used by that clone. Leave it unset to disable the
+feature. After connecting to noVNC, pick a preset and press **apply**. This is
+explicit, not a reaction to every browser viewport change. `GET
+/sandboxes/{id}/display` returns supported presets; `POST` with an authenticated
+JSON body such as `{"preset":"1600x900"}` applies one. A failed change leaves
+noVNC scaling available. Ultrawide 3440×1440 is not supported by the tested QXL
+configuration.
+
+### Carnyx evidence — 2026-11-21
+
+- A fresh Windows clone booted with ICH9 and `audio type='none'`, saw one
+  active Windows render endpoint, and retained the QXL recovery console. Live
+  Chromium found a missing WebSocket `binary` subprotocol response; after the
+  fix, it rendered 2560×1600, delivered keyboard input and reconnected in under
+  one second over the isolated SSH-forwarded gateway. The authenticated browser
+  resize control changed the running framebuffer from 1920×1080 to 1600×900
+  without reconnecting. A separate raw RFB test saw the reverse change via
+  `DesktopSize (-223)`.
+- Pinned Sunshine `v2026.914.233613` (upstream SHA-256 and Windows Authenticode
+  verified), QXL Desktop Duplication, and software H.264 worked with Moonlight
+  Qt `v6.2.0`. Use `scripts/provision-win11-sunshine-canary.ps1` on a fresh clone
+  to reproduce the guest install. Keep the admin UI on guest loopback; pair one
+  client and allow media only from Carnyx's private bridge address.
+- The Carnyx-local Moonlight client paired and recorded 1280×720/30 with
+  non-silent 48 kHz stereo while CI run `44961935114` succeeded on Carnyx. A
+  separate ~90-second 1920×1080/60 test negotiated H.264/60, captured non-silent
+  stereo (the recorded tone was independently measured at 997 Hz in both
+  runs), and did not require a VDD or GPU passthrough. The recording container
+  includes preroll. This establishes capture/playback, not p95 input latency,
+  frame delivery under motion, DAW behavior, or long-run capacity. The 1080p
+  run did not overlap that CI job.
+- The live Linux TigerVNC canary applied 1600×900 and 1024×768 by raw RFB;
+  `xrandr` independently confirmed both modes. Provisioning exposed a service
+  startup race: the revised health check waits for the bind address and RFB
+  greeting rather than assuming the socket is ready at `systemctl restart`.
+- Media was direct over the private libvirt bridge, **not** over the tailnet or
+  an lsbx slot relay. Do not advertise the guest subnet as a shortcut. A
+  tailnet-only relay, two distinct concurrent guests and slot reuse, off-host
+  measurements, and public-edge acceptance still require their own tests.

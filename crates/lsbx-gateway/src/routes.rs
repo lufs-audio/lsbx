@@ -93,6 +93,20 @@ use tokio::io::AsyncReadExt;
 
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
+const DISPLAY_HELPER_PATH: &str = r"C:\lsbx\set-win11-display.ps1";
+const DISPLAY_APPLY_TIMEOUT: Duration = Duration::from_secs(45);
+/// Modes exercised by the in-session QXL helper. Keep this list identical to
+/// the helper's approved preset surface; notably, 3440x1440 is not supported.
+const WINDOWS_DISPLAY_PRESETS: [&str; 8] = [
+    "1024x768",
+    "1280x800",
+    "1440x900",
+    "1600x900",
+    "1920x1080",
+    "2560x1440",
+    "2560x1600",
+    "3840x2160",
+];
 
 /// Gateway-level configuration, per this unit's interface contract.
 #[derive(Debug, Clone)]
@@ -103,6 +117,10 @@ pub struct GatewayConfig {
     /// Maximum number of simultaneously persisted sandboxes. This preserves
     /// the Python gateway's production safety bound.
     pub max_sandboxes: usize,
+    /// Exact manifest `GoldenConfig.base` allowed to use the Windows display
+    /// helper. `None` keeps the feature disabled. Production fills this only
+    /// from `LSBX_WINDOWS_DISPLAY_RESIZE_GOLDEN`.
+    pub windows_display_resize_golden: Option<String>,
     pub rate_limit: crate::ratelimit::RateLimitConfig,
 }
 
@@ -116,6 +134,9 @@ pub struct GatewayState {
     pub config: Arc<GatewayConfig>,
     pub rate_limiter: Arc<TokenBucket>,
     pub creation_gate: Arc<tokio::sync::Mutex<()>>,
+    /// One global, non-queueing permit for display changes. A second request
+    /// receives 409 immediately instead of building an unbounded wait queue.
+    pub display_resize_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Narrow trait `auth.rs`'s `FromRequestParts` impl is generic over, so the
@@ -212,6 +233,7 @@ fn build_router_inner(
         config: Arc::new(config),
         rate_limiter,
         creation_gate: Arc::new(tokio::sync::Mutex::new(())),
+        display_resize_gate: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     let mut authenticated_routes = Router::new()
@@ -226,6 +248,10 @@ fn build_router_inner(
         .route("/sandboxes/{id}/upload", post(upload_to_sandbox))
         .route("/sandboxes/{id}/artifacts", get(download_artifact))
         .route("/sandboxes/{id}/exec", post(exec_in_sandbox))
+        .route(
+            "/sandboxes/{id}/display",
+            get(get_sandbox_display).post(set_sandbox_display),
+        )
         .route("/sandboxes/{id}/put", post(put_local_file))
         .route("/sandboxes/{id}/get", post(get_local_file))
         .route("/sandboxes/{id}/check", post(check_sandbox))
@@ -862,6 +888,126 @@ async fn exec_in_sandbox(
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }),
+        Err(e) => error_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Handlers — opt-in Windows display presets
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct DisplaySupportResponse<'a> {
+    sandbox_id: &'a str,
+    supported: bool,
+    presets: &'static [&'static str],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetDisplayBody {
+    preset: String,
+}
+
+#[derive(Serialize)]
+struct SetDisplayResponse<'a> {
+    sandbox_id: &'a str,
+    preset: &'a str,
+    applied: bool,
+}
+
+fn display_not_supported_response() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "status": "error",
+            "code": 5,
+            "message": "display resize is disabled or this sandbox is not an eligible Windows/noVNC sandbox on the exact configured backing golden",
+        })),
+    )
+        .into_response()
+}
+
+async fn display_is_supported(state: &GatewayState, id: &str) -> Result<bool, LsbxError> {
+    // Resolve first even when the feature is disabled so an unknown sandbox is
+    // still a 404 rather than being hidden behind a deployment-level 501.
+    state.ops.info(id).await?;
+    let Some(exact_backing_golden) = state.config.windows_display_resize_golden.as_deref() else {
+        return Ok(false);
+    };
+    state
+        .ops
+        .sandbox_uses_windows_novnc_golden(id, exact_backing_golden)
+        .await
+}
+
+/// Authenticated capability discovery for the browser's explicit dropdown.
+/// GET never runs a guest command and never changes a window or display mode.
+async fn get_sandbox_display(
+    State(state): State<GatewayState>,
+    AxumPath(id): AxumPath<String>,
+    _auth: AuthedRequest,
+) -> Response {
+    match display_is_supported(&state, &id).await {
+        Ok(supported) => success_response(DisplaySupportResponse {
+            sandbox_id: &id,
+            supported,
+            presets: if supported {
+                &WINDOWS_DISPLAY_PRESETS
+            } else {
+                &[]
+            },
+        }),
+        Err(e) => error_response(e),
+    }
+}
+
+/// Applies one validated preset through the fixed, operator-provided helper.
+/// No request field can alter the executable, helper path, flags, or timeout.
+async fn set_sandbox_display(
+    State(state): State<GatewayState>,
+    AxumPath(id): AxumPath<String>,
+    _auth: AuthedRequest,
+    Json(body): Json<SetDisplayBody>,
+) -> Response {
+    if !WINDOWS_DISPLAY_PRESETS.contains(&body.preset.as_str()) {
+        return error_response(LsbxError::Usage(format!(
+            "unsupported display preset '{}'; expected one of: {}",
+            body.preset,
+            WINDOWS_DISPLAY_PRESETS.join(", ")
+        )));
+    }
+
+    match display_is_supported(&state, &id).await {
+        Ok(true) => {}
+        Ok(false) => return display_not_supported_response(),
+        Err(e) => return error_response(e),
+    }
+
+    let Ok(_permit) = state.display_resize_gate.try_lock() else {
+        return error_response(LsbxError::LockContention(
+            "another display resize request is already in flight; retry after it completes"
+                .to_string(),
+        ));
+    };
+
+    let command_line = format!(
+        "powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {DISPLAY_HELPER_PATH} -Preset {}",
+        body.preset
+    );
+    let command = vec!["cmd".to_string(), "/c".to_string(), command_line];
+    match state.ops.exec(&id, &command, DISPLAY_APPLY_TIMEOUT).await {
+        Ok(output) if output.exit_code == 0 => success_response(SetDisplayResponse {
+            sandbox_id: &id,
+            preset: &body.preset,
+            applied: true,
+        }),
+        Ok(output) => error_response(LsbxError::ContractViolated(format!(
+            "Windows display helper failed for preset {} with exit code {}: {}",
+            body.preset,
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
         Err(e) => error_response(e),
     }
 }

@@ -240,15 +240,33 @@ if [ '$MODE' = '$COMPAT_MODE' ]; then
     curl -fsS --retry 5 --retry-delay 1 --retry-connrefused \\
         http://127.0.0.1:$STREAM_PORT/vnc.html >/dev/null
 else
-    RFB_BIND_ADDRESS=\$(cat /run/lsbx-desktop/rfb-bind-address)
-    python3 - "\$RFB_BIND_ADDRESS" '$STREAM_PORT' <<'PY'
+    # A restart returns once systemd has spawned the launcher, before Xvnc has
+    # necessarily selected its bind address or opened the RFB listener. Retry
+    # the complete readiness condition so provisioning and early-boot checks do
+    # not race /run creation or the socket bind.
+    ready=0
+    for _ in {1..50}; do
+        if [ -s /run/lsbx-desktop/rfb-bind-address ]; then
+            RFB_BIND_ADDRESS=\$(cat /run/lsbx-desktop/rfb-bind-address)
+            if python3 - "\$RFB_BIND_ADDRESS" '$STREAM_PORT' <<'PY'
 import socket, sys
-with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5) as sock:
-    banner = sock.recv(12)
+try:
+    with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=1) as sock:
+        banner = sock.recv(12)
+except OSError:
+    raise SystemExit(1)
 if not banner.startswith(b"RFB "):
-    raise SystemExit(f"unexpected RFB banner: {banner!r}")
+    raise SystemExit(1)
 print(banner.decode("ascii", "replace").strip())
 PY
+            then
+                ready=1
+                break
+            fi
+        fi
+        sleep 0.1
+    done
+    [ "\$ready" -eq 1 ] || { echo 'TigerVNC raw-RFB listener did not become ready' >&2; exit 1; }
     DISPLAY=:$DISPLAY_NUMBER xrandr --query
 fi
 EOF

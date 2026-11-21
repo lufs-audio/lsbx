@@ -47,6 +47,7 @@ fn build_router(state_dir: &std::path::Path) -> Router {
         allow_local_files: false,
         insecure: false,
         max_sandboxes: 8,
+        windows_display_resize_golden: None,
         rate_limit: lsbx_gateway::RateLimitConfig {
             requests_per_minute: 6000,
             burst: 1000,
@@ -117,6 +118,14 @@ async fn console_page_loads_assets_from_its_own_origin_and_names_no_guest_ip() {
     assert!(
         html.contains("/assets/novnc/core/rfb.js"),
         "the page must load the vendored noVNC client from its own origin"
+    );
+    assert!(
+        html.contains("id=\"display-preset\"") && html.contains("id=\"display-apply\""),
+        "eligible guests must be controlled through an explicit preset dropdown and apply button"
+    );
+    assert!(
+        !html.contains("addEventListener('resize'"),
+        "the console must not automatically change the guest when the browser window changes"
     );
     assert!(
         html.contains("id=\"vnc-password\"") && html.contains("credentialsrequired"),

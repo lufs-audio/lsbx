@@ -58,6 +58,7 @@ fn base_config() -> GatewayConfig {
         allow_local_files: false,
         insecure: false,
         max_sandboxes: 8,
+        windows_display_resize_golden: None,
         rate_limit: RateLimitConfig::default(),
     }
 }

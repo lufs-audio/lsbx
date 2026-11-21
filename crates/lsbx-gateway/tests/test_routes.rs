@@ -59,6 +59,7 @@ fn test_config() -> GatewayConfig {
         allow_local_files: false,
         insecure: false,
         max_sandboxes: 8,
+        windows_display_resize_golden: None,
         rate_limit: lsbx_gateway::RateLimitConfig {
             requests_per_minute: 6000,
             burst: 1000,

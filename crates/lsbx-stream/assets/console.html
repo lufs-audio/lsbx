@@ -22,9 +22,14 @@
            font-size: 13px; flex: 0 0 auto; }
   header .id { opacity: .75; font-family: ui-monospace, monospace; }
   header .right { display: flex; gap: 10px; align-items: center; }
-  button { background: #1f2937; color: #e8eef5; border: 1px solid #334155;
-           border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
-  button:hover { background: #273449; }
+  button, select { background: #1f2937; color: #e8eef5; border: 1px solid #334155;
+           border-radius: 6px; padding: 4px 10px; font-size: 12px; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { background: #273449; }
+  button:disabled, select:disabled { opacity: .55; cursor: default; }
+  #display-controls { display: inline-flex; gap: 6px; align-items: center; }
+  #display-note { max-width: 24rem; overflow: hidden; text-overflow: ellipsis;
+                  white-space: nowrap; }
   #screen { flex: 1 1 auto; background: #000; position: relative; overflow: hidden; }
   #screen canvas { display: block; }
   #status { position: absolute; inset: 0; display: flex; align-items: center;
@@ -45,6 +50,13 @@
     <span>lsbx console · <span class="id">%SANDBOX_ID%</span></span>
     <span class="right">
       <span id="state" class="hint">connecting…</span>
+      <span id="display-note" class="hint" aria-live="polite"></span>
+      <span id="display-controls" hidden>
+        <select id="display-preset" aria-label="Windows display resolution">
+          <option value="">resolution…</option>
+        </select>
+        <button id="display-apply" disabled>apply</button>
+      </span>
       <button id="reconnect" hidden>reconnect</button>
       <button id="scale" title="Toggle fit-to-window scaling">fit: on</button>
     </span>
@@ -77,6 +89,7 @@ import RFB from '/assets/novnc/core/rfb.js';
 const SANDBOX_ID = '%SANDBOX_ID%';
 const RESIZE_MODE = '%RESIZE_MODE%';   // "scale" | "remote"
 const TOKEN_ENDPOINT = '/consoles/' + encodeURIComponent(SANDBOX_ID) + '/token';
+const DISPLAY_ENDPOINT = '/sandboxes/' + encodeURIComponent(SANDBOX_ID) + '/display';
 const WS_PATH = 'stream/' + encodeURIComponent(SANDBOX_ID) + '/vnc';
 
 const elScreen = document.getElementById('screen');
@@ -89,15 +102,22 @@ const elTokenInput = document.getElementById('token-input');
 const elCredentialForm = document.getElementById('credential-form');
 const elVncPassword = document.getElementById('vnc-password');
 const elScale = document.getElementById('scale');
+const elDisplayControls = document.getElementById('display-controls');
+const elDisplayPreset = document.getElementById('display-preset');
+const elDisplayApply = document.getElementById('display-apply');
+const elDisplayNote = document.getElementById('display-note');
 
 const TICKET_TIMEOUT_MS = 10000;
 const CONNECT_TIMEOUT_MS = 15000;
+const DISPLAY_TIMEOUT_MS = 50000;
 
 let rfb = null;
 let masterToken = null;
 let credentialTarget = null;
 let ticketAbort = null;
 let connectTimer = null;
+let displayAbort = null;
+let displayRequestInFlight = false;
 let attempt = 0;
 let scaleToWindow = true;
 
@@ -134,6 +154,8 @@ function armConnectTimer(client, thisAttempt) {
 // CLOSE_WAIT (#53). Event handlers below ignore stale objects as a second guard.
 function disconnectCurrent() {
   clearConnectTimer();
+  cancelDisplayRequest();
+  hideDisplayControls();
   credentialTarget = null;
   const previous = rfb;
   rfb = null;
@@ -178,6 +200,95 @@ function applyScale() {
   elScale.textContent = 'fit: ' + (scaleToWindow ? 'on' : 'off');
 }
 
+function cancelDisplayRequest() {
+  if (displayAbort) displayAbort.abort();
+  displayAbort = null;
+  displayRequestInFlight = false;
+}
+
+function hideDisplayControls() {
+  elDisplayControls.hidden = true;
+  elDisplayPreset.disabled = false;
+  elDisplayApply.disabled = true;
+  elDisplayNote.textContent = '';
+}
+
+function setDisplayBusy(busy) {
+  displayRequestInFlight = busy;
+  elDisplayPreset.disabled = busy;
+  elDisplayApply.disabled = busy || !elDisplayPreset.value;
+}
+
+// Capability discovery is authenticated but read-only. It only decides whether
+// to show a fixed preset dropdown; opening or resizing the browser never changes
+// the guest display automatically.
+async function discoverDisplayControls(client, thisAttempt) {
+  if (!masterToken || rfb !== client || thisAttempt !== attempt) return;
+  try {
+    const res = await fetch(DISPLAY_ENDPOINT, {
+      headers: { 'Authorization': 'Bearer ' + masterToken },
+      cache: 'no-store',
+    });
+    if (rfb !== client || thisAttempt !== attempt) return;
+    if (!res.ok) return;
+    const body = await res.json();
+    const data = body.data || body;
+    if (!data.supported || !Array.isArray(data.presets) || data.presets.length === 0) return;
+
+    elDisplayPreset.replaceChildren(new Option('resolution…', ''));
+    for (const preset of data.presets) {
+      if (typeof preset !== 'string') continue;
+      elDisplayPreset.appendChild(new Option(preset.replace('x', ' × '), preset));
+    }
+    elDisplayControls.hidden = false;
+    elDisplayApply.disabled = true;
+  } catch (_) {
+    // Optional control discovery must never interrupt an otherwise healthy
+    // recovery console. Fixed fit-to-window scaling remains enabled.
+  }
+}
+
+async function applyDisplayPreset() {
+  const preset = elDisplayPreset.value;
+  const client = rfb;
+  const thisAttempt = attempt;
+  if (!preset || !masterToken || !client || displayRequestInFlight) return;
+
+  const controller = new AbortController();
+  displayAbort = controller;
+  setDisplayBusy(true);
+  elDisplayNote.textContent = 'applying ' + preset.replace('x', ' × ') + '…';
+  const timeout = window.setTimeout(() => controller.abort(), DISPLAY_TIMEOUT_MS);
+  try {
+    const res = await fetch(DISPLAY_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + masterToken,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ preset }),
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (rfb !== client || thisAttempt !== attempt) return;
+    if (!res.ok) {
+      throw new Error('display endpoint returned HTTP ' + res.status);
+    }
+    elDisplayNote.textContent = preset.replace('x', ' × ') + ' applied';
+  } catch (err) {
+    if (rfb !== client || thisAttempt !== attempt) return;
+    scaleToWindow = true;
+    applyScale();
+    elDisplayNote.textContent = err && err.name === 'AbortError'
+      ? 'display change timed out; fit remains on'
+      : 'display change failed; fit remains on';
+  } finally {
+    window.clearTimeout(timeout);
+    if (displayAbort === controller) displayAbort = null;
+    if (rfb === client && thisAttempt === attempt) setDisplayBusy(false);
+  }
+}
+
 function connectWith(ticket, thisAttempt) {
   if (thisAttempt !== attempt) return;
 
@@ -210,12 +321,15 @@ function connectWith(ticket, thisAttempt) {
     hideStatus();
     setState('connected');
     elReconnect.hidden = true;
+    discoverDisplayControls(client, thisAttempt);
   });
   client.addEventListener('disconnect', (event) => {
     if (rfb !== client || thisAttempt !== attempt) return;
     clearConnectTimer();
     rfb = null;
     credentialTarget = null;
+    cancelDisplayRequest();
+    hideDisplayControls();
     hideForms();
     setState('disconnected');
     elReconnect.hidden = false;
@@ -251,6 +365,10 @@ elScale.addEventListener('click', () => {
   scaleToWindow = !scaleToWindow;
   applyScale();
 });
+elDisplayPreset.addEventListener('change', () => {
+  elDisplayApply.disabled = displayRequestInFlight || !elDisplayPreset.value;
+});
+elDisplayApply.addEventListener('click', () => applyDisplayPreset());
 elReconnect.addEventListener('click', () => start());
 elTokenForm.addEventListener('submit', (event) => {
   event.preventDefault();
