@@ -238,9 +238,14 @@ pub async fn stream_handler(
     // resolve.
     let guest_addr = resolve_destination(&store, &sandbox_id)?;
 
-    Ok(ws.on_upgrade(move |socket| async move {
-        let _ = relay(socket, guest_addr).await;
-    }))
+    // noVNC offers `binary`; browsers reject an upgrade that omits the
+    // selected protocol when one was requested. Client requests without
+    // a subprotocol remain supported.
+    Ok(ws
+        .protocols(["binary"])
+        .on_upgrade(move |socket| async move {
+            let _ = relay(socket, guest_addr).await;
+        }))
 }
 
 /// The actual axum route target `router()` registers for

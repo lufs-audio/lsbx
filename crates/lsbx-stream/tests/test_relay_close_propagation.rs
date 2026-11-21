@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 /// `host` is set to the full `ip:port` of `listener_addr` — see
 /// `test_destination_lookup_security.rs`'s identically-shaped helper for
@@ -119,13 +119,17 @@ async fn client_closes_first_propagates_to_guest_and_leaves_no_half_open_connect
     });
 
     let ws_url = format!("ws://{proxy_addr}/stream/{sandbox_id}/vnc");
-    let (mut ws_stream, response) = tokio_tungstenite::connect_async(&ws_url)
+    let mut request = ws_url.into_client_request().expect("WebSocket request");
+    request.headers_mut().insert("sec-websocket-protocol", "binary".parse().unwrap());
+    let (mut ws_stream, response) = tokio_tungstenite::connect_async(request)
         .await
         .expect("upgrade should succeed for a valid, resolved sandbox id");
     assert_eq!(
         response.status(),
         axum::http::StatusCode::SWITCHING_PROTOCOLS
     );
+
+    assert_eq!(response.headers().get("sec-websocket-protocol").unwrap(), "binary");
 
     // Client closes first.
     ws_stream
