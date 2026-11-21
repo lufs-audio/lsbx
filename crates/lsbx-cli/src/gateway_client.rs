@@ -126,10 +126,10 @@ impl GatewayClient {
                     "plaintext gateway URLs require the explicit --insecure flag".to_string(),
                 ))
             }
-            scheme => {
-                return Err(LsbxError::Usage(format!(
-                    "gateway URL scheme must be https (or http with --insecure), not '{scheme}'"
-                )))
+            _ => {
+                return Err(LsbxError::Usage(
+                    "gateway URL scheme must be https (or http with --insecure)".to_string(),
+                ))
             }
         }
         if !base.username().is_empty() || base.password().is_some() {
@@ -307,6 +307,11 @@ impl GatewayClient {
         destination: &str,
         bytes: Vec<u8>,
     ) -> Result<(), LsbxError> {
+        if bytes.len() > MAX_UPLOAD_BYTES {
+            return Err(LsbxError::Usage(
+                "gateway uploads are limited to 2 MiB".to_string(),
+            ));
+        }
         let mut url = self.endpoint(&["sandboxes", id, "upload"])?;
         url.query_pairs_mut()
             .append_pair("destination", destination);
@@ -525,6 +530,7 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -551,6 +557,17 @@ mod tests {
         let error = result.err().expect("URL credentials must fail");
         assert!(matches!(error, LsbxError::Usage(_)));
         assert!(!error.to_string().contains("another-secret"));
+    }
+
+    #[test]
+    fn malformed_url_error_does_not_echo_possible_secret_material() {
+        let possible_secret = "super-secret-url-material";
+        let gateway = format!("not a url {possible_secret}");
+        let error = GatewayClient::new(&gateway, Some("token"), false)
+            .err()
+            .expect("malformed URL must fail");
+        assert!(matches!(error, LsbxError::Usage(_)));
+        assert!(!error.to_string().contains(possible_secret));
     }
 
     async fn authenticated_list(headers: HeaderMap) -> axum::response::Response {
@@ -581,6 +598,34 @@ mod tests {
         .into_response()
     }
 
+    async fn authenticated_info(headers: HeaderMap) -> axum::response::Response {
+        if headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            != Some("Bearer test-token")
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        Json(serde_json::json!({
+            "status": "success",
+            "data": {
+                "id": "sbx-remote",
+                "name": "remote",
+                "host": "remote.demo.local",
+                "profile": "default",
+                "flavor": "desktop",
+                "streaming": "novnc",
+                "task_id": null,
+                "created_at": "2026-11-21T00:00:00Z",
+                "lease_expires_at": "2026-11-21T01:00:00Z",
+                "console_url": "/console?target=sbx-remote",
+                "cleanup_failed": false,
+                "repository": null
+            }
+        }))
+        .into_response()
+    }
+
     async fn spawn(router: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -595,8 +640,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_preserves_the_local_public_sandbox_json_shape() {
-        let (base, task) = spawn(Router::new().route("/sandboxes", get(authenticated_list))).await;
+    async fn list_and_info_preserve_local_public_sandbox_json_shapes() {
+        let router = Router::new()
+            .route("/sandboxes", get(authenticated_list))
+            .route("/sandboxes/{id}", get(authenticated_info));
+        let (base, task) = spawn(router).await;
         let client = GatewayClient::new(&base, Some("test-token"), true).expect("client");
         let remote = client.list().await.expect("remote list");
 
@@ -623,6 +671,16 @@ mod tests {
             serde_json::to_value(remote_envelope).expect("serialize remote envelope"),
             serde_json::to_value(local_envelope).expect("serialize local envelope")
         );
+
+        let remote_info = client.info("sbx-remote").await.expect("remote info");
+        let remote_info_envelope = lsbx_kernel::envelope::Envelope::Success { data: &remote_info };
+        let local_info_envelope = lsbx_kernel::envelope::Envelope::Success {
+            data: &local_values[0],
+        };
+        assert_eq!(
+            serde_json::to_value(remote_info_envelope).expect("serialize remote info envelope"),
+            serde_json::to_value(local_info_envelope).expect("serialize local info envelope")
+        );
         task.abort();
     }
 
@@ -634,6 +692,106 @@ mod tests {
         let error = client.list().await.expect_err("wrong token must fail");
         assert!(matches!(error, LsbxError::AuthFailed(_)));
         assert!(!error.to_string().contains(secret));
+        task.abort();
+    }
+
+    async fn redirect_health() -> axum::response::Response {
+        (
+            StatusCode::FOUND,
+            [(reqwest::header::LOCATION, "/followed")],
+        )
+            .into_response()
+    }
+
+    async fn followed(State(hits): State<Arc<AtomicUsize>>) -> axum::response::Response {
+        hits.fetch_add(1, Ordering::SeqCst);
+        Json(serde_json::json!({
+            "status": "success",
+            "data": {"backend_name":"wrong","backend_available":true,"sandbox_count":0}
+        }))
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/health", get(redirect_health))
+            .route("/followed", get(followed))
+            .with_state(Arc::clone(&hits));
+        let (base, task) = spawn(router).await;
+        let client = GatewayClient::new(&base, Some("test-token"), true).expect("client");
+        let error = client
+            .status()
+            .await
+            .expect_err("redirect must not be followed");
+        assert!(matches!(error, LsbxError::ContractViolated(_)));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    async fn goldens_response() -> axum::response::Response {
+        Json(serde_json::json!({
+            "status": "success",
+            "data": [{
+                "key": "desktop-v1",
+                "flavor": "desktop",
+                "os": "linux",
+                "base": "desktop-v1",
+                "mode": "copy",
+                "cpu": 2,
+                "memory": "4G",
+                "disk": null,
+                "streaming": "novnc",
+                "capabilities": [],
+                "healthcheck": [],
+                "repo": null,
+                "content_hash": null,
+                "description": "desktop"
+            }]
+        }))
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn golden_list_deserializes_full_golden_configs() {
+        let (base, task) = spawn(Router::new().route("/goldens", get(goldens_response))).await;
+        let client = GatewayClient::new(&base, Some("test-token"), true).expect("client");
+        let goldens = client.goldens().await.expect("goldens");
+        assert_eq!(goldens.len(), 1);
+        assert_eq!(goldens[0].key, "desktop-v1");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_more_than_two_mebibytes_before_sending() {
+        let client = GatewayClient::new("http://127.0.0.1:1", Some("token"), true).expect("client");
+        let error = client
+            .upload(
+                "sbx-transfer",
+                "/guest/destination",
+                vec![0; MAX_UPLOAD_BYTES + 1],
+            )
+            .await
+            .expect_err("oversized upload must fail locally");
+        assert!(matches!(error, LsbxError::Usage(_)));
+    }
+
+    async fn oversized_download() -> axum::response::Response {
+        vec![0_u8; MAX_DOWNLOAD_BYTES + 1].into_response()
+    }
+
+    #[tokio::test]
+    async fn download_rejects_more_than_thirty_two_mebibytes() {
+        let router =
+            Router::new().route("/sandboxes/sbx-transfer/artifacts", get(oversized_download));
+        let (base, task) = spawn(router).await;
+        let client = GatewayClient::new(&base, Some("test-token"), true).expect("client");
+        let error = client
+            .download("sbx-transfer", "/guest/source")
+            .await
+            .expect_err("oversized download must fail");
+        assert!(matches!(error, LsbxError::Usage(_)));
         task.abort();
     }
 
