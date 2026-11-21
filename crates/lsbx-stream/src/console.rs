@@ -15,9 +15,9 @@
 //!   any future transport door, unchanged;
 //! - the browser authenticates with a short-lived, sandbox-scoped ticket minted
 //!   by the gateway, because a WebSocket handshake cannot carry an
-//!   `Authorization` header (canonical-url spec D7). The master token stays in
-//!   the browser's localStorage and is only ever sent as a header to the ticket
-//!   endpoint — never in a URL.
+//!   `Authorization` header (canonical-url spec D7). The master token stays only
+//!   in the page's memory and is sent as a header to the ticket endpoint — never
+//!   persisted and never put in a URL.
 //!
 //! ## `console_password` — an honest gap, not a fabricated value
 //! This unit's acceptance criteria says `/consoles/<id>` must return
@@ -37,11 +37,11 @@
 //! `config_show`'s module doc comment: `console_password` is a real field
 //! on `ConsoleDetail` (per the interface contract's literal shape, so a
 //! caller's deserialization never breaks), populated with `None` today,
-//! with this comment naming exactly why. The day a real backend/mechanism
-//! for console auth lands (most naturally as part of a `Backend`
-//! implementation that actually manages a VNC/websockify password), this
-//! function's body is the only thing that needs to change — its signature
-//! already carries the field.
+//! with this comment naming exactly why. The browser page therefore prompts
+//! explicitly when the RFB server requests credentials; it never guesses a
+//! password or persists one. The day a supported backend-owned credential
+//! mechanism lands, this function's body is the only thing that needs to
+//! change — its signature already carries the field.
 
 use axum::{
     extract::{Path, Query, State},

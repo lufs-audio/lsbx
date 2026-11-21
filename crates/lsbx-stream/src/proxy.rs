@@ -85,6 +85,7 @@ use futures::{SinkExt, StreamExt};
 use lsbx_kernel::error::LsbxError;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -95,6 +96,12 @@ use tokio::net::TcpStream;
 /// reopen exactly the "arbitrary host:port reachable through the proxy"
 /// hole this unit's own acceptance criteria requires closing.
 const GUEST_VNC_PORT: u16 = 8000;
+
+/// A WebSocket upgrade must not turn into an indefinitely connecting relay when
+/// a sandbox record points at a guest that is powered off or filtered. The
+/// browser has its own bounded reconnect UI, so fail this attempt promptly and
+/// let the user request a fresh ticket/connection instead.
+const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maps an `LsbxError` onto an HTTP response for this crate's handlers.
 ///
@@ -258,11 +265,16 @@ pub async fn stream_route_handler(
 /// unreachable) rather than a nonexistent `LsbxError::InternalError` — see
 /// this module's doc comment, point 2.
 async fn relay(ws: WebSocket, guest_addr: SocketAddr) -> Result<(), LsbxError> {
-    let tcp_stream = TcpStream::connect(guest_addr).await.map_err(|e| {
-        LsbxError::BackendUnavailable(format!(
-            "failed to connect to guest at {guest_addr}: {e}"
-        ))
-    })?;
+    let tcp_stream = tokio::time::timeout(GUEST_CONNECT_TIMEOUT, TcpStream::connect(guest_addr))
+        .await
+        .map_err(|_| {
+            LsbxError::BackendUnavailable(format!("timed out connecting to guest at {guest_addr}"))
+        })?
+        .map_err(|e| {
+            LsbxError::BackendUnavailable(format!(
+                "failed to connect to guest at {guest_addr}: {e}"
+            ))
+        })?;
 
     let (mut ws_sender, mut ws_receiver) = ws.split();
     let (mut tcp_reader, mut tcp_writer) = tcp_stream.into_split();
@@ -308,7 +320,11 @@ async fn relay(ws: WebSocket, guest_addr: SocketAddr) -> Result<(), LsbxError> {
                     break;
                 }
                 Ok(n) => {
-                    if ws_sender.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                    if ws_sender
+                        .send(Message::Binary(buf[..n].to_vec().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
