@@ -162,9 +162,17 @@ fn record() -> SandboxRecord {
 }
 
 fn router(configured_golden: Option<&str>) -> (axum::Router, RecordingControl, tempfile::TempDir) {
+    router_with(configured_golden, golden(), record())
+}
+
+fn router_with(
+    configured_golden: Option<&str>,
+    golden: GoldenConfig,
+    record: SandboxRecord,
+) -> (axum::Router, RecordingControl, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let sandbox_store = SandboxStore::new(dir.path().to_path_buf());
-    sandbox_store.save(&record()).expect("save sandbox");
+    sandbox_store.save(&record).expect("save sandbox");
 
     let mut profiles = HashMap::new();
     profiles.insert(
@@ -175,7 +183,7 @@ fn router(configured_golden: Option<&str>) -> (axum::Router, RecordingControl, t
     );
     let registry = ImageRegistry {
         images: vec![],
-        goldens: vec![golden()],
+        goldens: vec![golden],
         profiles,
     };
     let control = RecordingControl::new();
@@ -265,6 +273,35 @@ async fn post_rejects_unlisted_presets_and_ineligible_or_disabled_goldens() {
 
     for configured in [None, Some("some-other-backing")] {
         let (router, control, _dir) = router(configured);
+        let response = router
+            .oneshot(request(
+                "POST",
+                Some(serde_json::json!({"preset":"1920x1080"})),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(control.commands.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn exact_backing_still_requires_windows_and_novnc_in_manifest_and_record() {
+    let mut linux = golden();
+    linux.os = "linux".to_string();
+    let mut manifest_without_novnc = golden();
+    manifest_without_novnc.streaming = StreamingMode::None;
+    let mut record_without_novnc = record();
+    record_without_novnc.streaming = "none".to_string();
+
+    for (candidate_golden, candidate_record) in [
+        (linux, record()),
+        (manifest_without_novnc, record()),
+        (golden(), record_without_novnc),
+    ] {
+        let (router, control, _dir) =
+            router_with(Some(GOLDEN_BASE), candidate_golden, candidate_record);
         let response = router
             .oneshot(request(
                 "POST",
