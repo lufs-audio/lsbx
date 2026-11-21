@@ -17,6 +17,7 @@ use std::time::Duration;
 pub(crate) const MAX_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ERROR_BYTES: usize = 64 * 1024;
 
 pub(crate) struct GatewayClient {
     base: Url,
@@ -280,7 +281,7 @@ impl GatewayClient {
             )
             .await?;
         match console.console_url {
-            Some(url) => Ok(Some(self.resolve_reported_url(&url)?)),
+            Some(url) => Ok(Some(self.resolve_reported_url(id, &url)?)),
             None => Ok(None),
         }
     }
@@ -391,20 +392,23 @@ impl GatewayClient {
         Ok(url)
     }
 
-    fn resolve_reported_url(&self, reported: &str) -> Result<String, LsbxError> {
+    fn resolve_reported_url(&self, id: &str, reported: &str) -> Result<String, LsbxError> {
         let url = self.base.join(reported).map_err(|e| {
             LsbxError::ContractViolated(format!("gateway reported an invalid console URL: {e}"))
         })?;
-        if url.origin() != self.base.origin()
-            || !url.username().is_empty()
-            || url.password().is_some()
+        if url.origin() == self.base.origin()
+            && url.username().is_empty()
+            && url.password().is_none()
         {
-            return Err(LsbxError::ContractViolated(
-                "gateway console URL must stay on the gateway origin; check LSBX_PUBLIC_BASE_URL"
-                    .to_string(),
-            ));
+            return Ok(url.to_string());
         }
-        Ok(url.to_string())
+
+        // Older/current gateways expose the backend's guest-private noVNC URL
+        // from LsbxOps here. A remote client must not navigate to that address;
+        // use the gateway's own public, same-origin console page instead.
+        let mut page = self.endpoint(&["console"])?;
+        page.query_pairs_mut().append_pair("target", id);
+        Ok(page.to_string())
     }
 }
 
@@ -441,10 +445,10 @@ async fn response_error(response: reqwest::Response) -> LsbxError {
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let wire = response
-        .json::<WireEnvelope<serde_json::Value>>()
+    let wire = read_limited(response, MAX_ERROR_BYTES)
         .await
-        .ok();
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<WireEnvelope<serde_json::Value>>(&bytes).ok());
     let code = wire.as_ref().and_then(|value| value.code);
     let message = wire.and_then(|value| value.message);
     error_from_wire(status, code, message, retry_after)
@@ -661,6 +665,16 @@ mod tests {
             .expect("transfer state")
             .clone()
             .into_response()
+    }
+
+    #[test]
+    fn guest_private_console_url_falls_back_to_gateway_page() {
+        let client = GatewayClient::new("https://gateway.example/api", Some("token"), false)
+            .expect("client");
+        let url = client
+            .resolve_reported_url("sbx-one", "https://192.0.2.10/vnc.html")
+            .expect("console URL");
+        assert_eq!(url, "https://gateway.example/api/console?target=sbx-one");
     }
 
     #[tokio::test]

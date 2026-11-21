@@ -25,7 +25,10 @@ fn gateway_and_backend_are_mutually_exclusive() {
     ]);
     assert_eq!(output.status.code(), Some(2));
     let body = String::from_utf8_lossy(&output.stdout);
-    assert!(body.contains("cannot be combined"), "unexpected output: {body}");
+    assert!(
+        body.contains("cannot be combined"),
+        "unexpected output: {body}"
+    );
     assert!(!body.contains("secret"));
 }
 

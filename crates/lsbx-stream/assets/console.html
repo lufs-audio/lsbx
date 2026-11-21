@@ -118,6 +118,16 @@ function clearConnectTimer() {
   if (connectTimer !== null) window.clearTimeout(connectTimer);
   connectTimer = null;
 }
+function armConnectTimer(client, thisAttempt) {
+  clearConnectTimer();
+  connectTimer = window.setTimeout(() => {
+    if (rfb !== client || thisAttempt !== attempt) return;
+    disconnectCurrent();
+    setState('disconnected');
+    elReconnect.hidden = false;
+    showStatus('The desktop did not respond in time. You can reconnect.', true);
+  }, CONNECT_TIMEOUT_MS);
+}
 
 // Tear down the old noVNC object before any reconnect. Merely replacing the
 // variable leaves its WebSocket alive and can strand the guest-side bridge in
@@ -191,14 +201,7 @@ function connectWith(ticket, thisAttempt) {
   // server to resize (needs a server that supports it — see #56).
   client.resizeSession = RESIZE_MODE === 'remote';
   applyScale();
-
-  connectTimer = window.setTimeout(() => {
-    if (rfb !== client || thisAttempt !== attempt) return;
-    disconnectCurrent();
-    setState('disconnected');
-    elReconnect.hidden = false;
-    showStatus('The desktop did not respond in time. You can reconnect.', true);
-  }, CONNECT_TIMEOUT_MS);
+  armConnectTimer(client, thisAttempt);
 
   client.addEventListener('connect', () => {
     if (rfb !== client || thisAttempt !== attempt) return;
@@ -225,6 +228,9 @@ function connectWith(ticket, thisAttempt) {
   });
   client.addEventListener('credentialsrequired', () => {
     if (rfb !== client || thisAttempt !== attempt) return;
+    // A human-entered password has no meaningful network timeout. Pause the
+    // connection watchdog while the prompt is open, then re-arm after submit.
+    clearConnectTimer();
     credentialTarget = client;
     elTokenForm.hidden = true;
     elCredentialForm.hidden = false;
@@ -265,6 +271,7 @@ elCredentialForm.addEventListener('submit', (event) => {
   showStatus('Authenticating with the VNC server…');
   try {
     target.sendCredentials({ password });
+    armConnectTimer(target, attempt);
   } catch (err) {
     elCredentialForm.hidden = false;
     showStatus('Could not send VNC credentials: ' + String(err), true);
