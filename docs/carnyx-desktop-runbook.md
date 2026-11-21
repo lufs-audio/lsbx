@@ -76,6 +76,8 @@ configuration.
   `xrandr` independently confirmed both modes. Provisioning exposed a service
   startup race: the revised health check waits for the bind address and RFB
   greeting rather than assuming the socket is ready at `systemctl restart`.
+  Chromium over the isolated gateway also resized the actual framebuffer from
+  1120×717 to 1450×877 and reconnected in about 1.2 seconds.
 - Media was direct over the private libvirt bridge, **not** over the tailnet or
   an lsbx slot relay. Do not advertise the guest subnet as a shortcut. A
   tailnet-only relay, two distinct concurrent guests and slot reuse, off-host
