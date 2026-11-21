@@ -78,6 +78,8 @@ pub struct DomainXmlParams<'a> {
     /// cannot boot a Windows 11 guest; every other value renders the
     /// Linux-style BIOS domain below.
     pub os: &'a str,
+    /// Expose a playback device without sending guest audio to the host.
+    pub windows_audio: bool,
 }
 
 /// Renders a KVM/QEMU domain XML matching the Python reference
@@ -142,6 +144,7 @@ pub fn render_domain_xml(params: &DomainXmlParams<'_>, pubkey: &str) -> Result<S
             &topology,
             &disk_path,
             &pubkey_escaped,
+            params.windows_audio,
         ));
     }
 
@@ -235,7 +238,14 @@ fn render_windows_domain_xml(
     topology: &str,
     disk_path: &str,
     pubkey_escaped: &str,
+    windows_audio: bool,
 ) -> String {
+    // WASAPI loopback is in the guest; QEMU does not need a host sound sink.
+    let audio = if windows_audio {
+        "\n    <sound model='ich9'>\n      <codec type='output'/>\n      <audio id='1'/>\n    </sound>\n    <audio id='1' type='none'/>"
+    } else {
+        ""
+    };
     format!(
         r#"<domain type='kvm'>
   <name>{name}</name>
@@ -314,7 +324,7 @@ fn render_windows_domain_xml(
     <tpm model='tpm-tis'>
       <backend type='emulator' version='2.0'/>
     </tpm>
-    <graphics type='vnc' port='-1' autoport='yes'/>
+    <graphics type='vnc' port='-1' autoport='yes'/>{audio}
     <!-- vgamem is the framebuffer memory the guest driver can allocate. 16 MiB
          (the old value) holds 1920x1080 (8.3 MB) and 2560x1440 (14.7 MB) but
          NOT 3840x2160 (33.2 MB) — and a running win11 golden was measured at
@@ -398,6 +408,7 @@ mod tests {
             disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-test-vm.qcow2"),
             seed_iso: None,
             os: "linux",
+            windows_audio: false,
         };
         let xml = render_domain_xml(&params, "ssh-ed25519 AAAA... lsbx:test").unwrap();
         assert!(xml.contains("<name>lsbx-test-vm</name>"));
@@ -419,6 +430,7 @@ mod tests {
             disk_path: std::path::Path::new("/tmp/x.qcow2"),
             seed_iso: None,
             os: "linux",
+            windows_audio: false,
         };
         let xml = render_domain_xml(&params, "ssh-ed25519 AAAA\"quote lsbx:test").unwrap();
         assert!(!xml.contains("<name>lsbx-<injected></name>"));
@@ -435,6 +447,7 @@ mod tests {
             disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-test-vm.qcow2"),
             seed_iso: Some(std::path::Path::new("/var/lib/lsbx/vms/lsbx-test-vm-cidata.iso")),
             os: "linux",
+            windows_audio: false,
         };
         let xml = render_domain_xml(&params, "ssh-ed25519 AAAA... test").unwrap();
         assert!(xml.contains("<target dev='hda' bus='ide'/>"));
@@ -451,6 +464,7 @@ mod tests {
             disk_path: std::path::Path::new("/tmp/x.qcow2"),
             seed_iso: None,
             os: "linux",
+            windows_audio: false,
         };
         assert!(render_domain_xml(&params, "irrelevant").is_err());
     }
@@ -462,8 +476,11 @@ mod tests {
             cpu: 4,
             memory: "8GB",
             disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-win-probe.qcow2"),
-            seed_iso: Some(std::path::Path::new("/var/lib/lsbx/vms/lsbx-win-probe-cidata.iso")),
+            seed_iso: Some(std::path::Path::new(
+                "/var/lib/lsbx/vms/lsbx-win-probe-cidata.iso",
+            )),
             os: "windows",
+            windows_audio: false,
         };
         let xml = render_domain_xml(&params, "ssh-ed25519 AAAA... lsbx:win").unwrap();
         assert!(xml.contains("machine='pc-q35-11.0'"));
@@ -498,6 +515,7 @@ mod tests {
             disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-win-mem.qcow2"),
             seed_iso: None,
             os: "windows",
+            windows_audio: false,
         };
         let xml = render_domain_xml(&params, "irrelevant").unwrap();
         assert!(xml.contains("<memory unit='KiB'>8388608</memory>"));
@@ -519,6 +537,7 @@ mod tests {
                 disk_path: std::path::Path::new("/tmp/topo.qcow2"),
                 seed_iso: None,
                 os,
+                windows_audio: false,
             };
             let xml = render_domain_xml(&params, "irrelevant").unwrap();
             assert!(
@@ -546,6 +565,7 @@ mod tests {
                 disk_path: std::path::Path::new("/tmp/cache.qcow2"),
                 seed_iso: None,
                 os,
+                windows_audio: false,
             };
             let xml = render_domain_xml(&params, "irrelevant").unwrap();
             assert!(
@@ -568,6 +588,7 @@ mod tests {
             disk_path: std::path::Path::new("/tmp/vram.qcow2"),
             seed_iso: None,
             os: "windows",
+            windows_audio: false,
         };
         let xml = render_domain_xml(&params, "irrelevant").unwrap();
         assert!(
@@ -581,6 +602,35 @@ mod tests {
     }
 
     #[test]
+    fn audio_is_opt_in_and_windows_only() {
+        let mut params = DomainXmlParams {
+            name: "lsbx-audio",
+            cpu: 8,
+            memory: "32GB",
+            disk_path: std::path::Path::new("/tmp/audio.qcow2"),
+            seed_iso: None,
+            os: "windows",
+            windows_audio: false,
+        };
+        let standard = render_domain_xml(&params, "irrelevant").unwrap();
+        assert!(!standard.contains("<sound"));
+        assert!(!standard.contains("<audio"));
+
+        params.windows_audio = true;
+        let canary = render_domain_xml(&params, "irrelevant").unwrap();
+        assert!(canary
+            .contains("<sound model='ich9'>\n      <codec type='output'/>\n      <audio id='1'/>"));
+        assert!(canary.contains("<audio id='1' type='none'/>"));
+        assert!(canary.contains("<graphics type='vnc'"));
+        assert!(!canary.contains("type='pipewire'"));
+
+        params.os = "linux";
+        let linux = render_domain_xml(&params, "irrelevant").unwrap();
+        assert!(!linux.contains("<sound"));
+        assert!(!linux.contains("<audio"));
+    }
+
+    #[test]
     fn non_windows_os_renders_bios_guest() {
         let params = DomainXmlParams {
             name: "lsbx-freebsd-probe",
@@ -589,6 +639,7 @@ mod tests {
             disk_path: std::path::Path::new("/var/lib/lsbx/vms/lsbx-freebsd-probe.qcow2"),
             seed_iso: None,
             os: "freebsd",
+            windows_audio: false,
         };
         let xml = render_domain_xml(&params, "ignored").unwrap();
         assert!(xml.contains("machine='pc'>"));

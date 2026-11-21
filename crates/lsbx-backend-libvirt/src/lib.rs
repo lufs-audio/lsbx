@@ -96,6 +96,7 @@ pub struct LibvirtBackend {
     vm_disks: VmDiskConfig,
     disk_mode: DiskMode,
     guest_username: String,
+    windows_audio_golden: Option<String>,
     /// In-memory cache of vm_tag → guest IP, populated by
     /// `create_from_golden` (which calls `_wait_for_ip` matching the Python
     /// pattern) and reused by `run` so healthchecks don't block on a fresh
@@ -166,6 +167,7 @@ impl LibvirtBackend {
             },
             disk_mode: DiskMode::default(),
             guest_username: "lsbx".to_string(),
+            windows_audio_golden: std::env::var("LSBX_LIBVIRT_AUDIO_GOLDEN").ok(),
             ip_cache: tokio::sync::RwLock::new(HashMap::new()),
         })
     }
@@ -477,6 +479,7 @@ impl Backend for LibvirtBackend {
                 disk_path: &vm_disk_path,
                 seed_iso: seed_iso_path.as_deref(),
                 os: req.os,
+                windows_audio: self.windows_audio_golden.as_deref() == Some(req.golden.as_str()),
             },
             req.pubkey,
         )?;
