@@ -23,7 +23,9 @@
 #
 # Usage (inside the guest being baked):
 #   sudo ./scripts/provision-linux-desktop-golden.sh
-#   sudo LSBX_LINUX_DESKTOP_MODE=tigervnc-raw-rfb-v1 \
+#   sudo env LSBX_LINUX_DESKTOP_MODE=tigervnc-raw-rfb-v1 \
+#        RFB_PRIVATE_CIDR=192.168.122.0/24 \
+#        VNC_PASSWORD_FILE=/run/lsbx-vnc-password \
 #        ./scripts/provision-linux-desktop-golden.sh
 #
 # Static/test helpers (do not need root):

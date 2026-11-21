@@ -25,6 +25,22 @@ pub struct Cli {
     pub config: Option<std::path::PathBuf>,
     #[arg(long, short = 'b', global = true)]
     pub backend: Option<BackendChoice>,
+    /// Remote `lsbx serve` base URL. Also read from LSBX_GATEWAY_URL.
+    #[arg(long, global = true, env = "LSBX_GATEWAY_URL")]
+    pub gateway: Option<String>,
+    /// Bearer token for remote gateway mode (or server token for `serve`).
+    /// Environment-provided values are never shown in help or diagnostics.
+    #[arg(
+        long,
+        global = true,
+        env = "LSBX_GATEWAY_TOKEN",
+        hide_env_values = true
+    )]
+    pub token: Option<String>,
+    /// Permit a plaintext HTTP gateway URL. HTTPS certificate validation is
+    /// still enforced; this flag does not disable TLS verification.
+    #[arg(long, global = true)]
+    pub insecure: bool,
     #[arg(long, short = 'i', global = true)]
     pub images: Option<std::path::PathBuf>,
     #[arg(long, short = 's', global = true)]
@@ -91,6 +107,9 @@ pub enum Command {
     },
     Console {
         id: String,
+        /// Open the returned console page in the system browser.
+        #[arg(long)]
+        open: bool,
     },
     Info {
         id: String,
@@ -119,11 +138,7 @@ pub enum Command {
         #[arg(long)]
         stream_port: Option<u16>,
         #[arg(long)]
-        token: Option<String>,
-        #[arg(long)]
         reap_ttl: Option<String>,
-        #[arg(long)]
-        insecure: bool,
         #[arg(long)]
         daemon: bool,
     },

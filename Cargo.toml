@@ -58,6 +58,7 @@ crossterm = "0.28"
 
 # Web & Networking
 axum = { version = "0.8", features = ["ws"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 tokio-tungstenite = "0.26"
 octocrab = "0.43"
 # Direct dependency (transitively pulled in via octocrab already, at a

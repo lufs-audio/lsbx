@@ -89,6 +89,10 @@ use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
+
+const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
 
 /// Gateway-level configuration, per this unit's interface contract.
 #[derive(Debug, Clone)]
@@ -213,6 +217,7 @@ fn build_router_inner(
     let mut authenticated_routes = Router::new()
         .route("/health", get(health))
         .route("/images", get(images))
+        .route("/goldens", get(goldens))
         .route("/profiles", get(profiles))
         .route("/capabilities", get(capabilities))
         .route("/consoles", get(consoles))
@@ -387,9 +392,17 @@ async fn audit_log_middleware(request: axum::extract::Request, next: Next) -> Re
     }
 
     let (parts, body) = request.into_parts();
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b,
-        Err(_) => Bytes::new(),
+    let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let too_large = std::error::Error::source(&error)
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+            return if too_large {
+                (StatusCode::PAYLOAD_TOO_LARGE, "request exceeds 2 MiB").into_response()
+            } else {
+                (StatusCode::BAD_REQUEST, "could not read request body").into_response()
+            };
+        }
     };
 
     let mut hasher = Sha256::new();
@@ -497,6 +510,13 @@ async fn images(State(state): State<GatewayState>, _auth: AuthedRequest) -> Resp
                 .cloned()
                 .unwrap_or(serde_json::json!({})),
         ),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn goldens(State(state): State<GatewayState>, _auth: AuthedRequest) -> Response {
+    match state.ops.golden_list().await {
+        Ok(goldens) => success_response(serde_json::json!(goldens)),
         Err(e) => error_response(e),
     }
 }
@@ -745,8 +765,7 @@ struct SourceQuery {
 /// `GET /sandboxes/<id>/artifacts?source=` -> `LsbxOps::get(id, source:
 /// &str, destination: &Path)`. The real `get` writes to a filesystem
 /// path, not a byte buffer, so this calls it against a server-side temp
-/// file and then streams that temp file's bytes back as the HTTP response
-/// body.
+/// file and returns its bytes with a cap on the buffered response.
 async fn download_artifact(
     State(state): State<GatewayState>,
     AxumPath(id): AxumPath<String>,
@@ -767,7 +786,20 @@ async fn download_artifact(
         return error_response(e);
     }
 
-    match tokio::fs::read(&temp_path).await {
+    let read = async {
+        let file = tokio::fs::File::open(&temp_path).await?;
+        let mut bytes = Vec::new();
+        file.take((MAX_DOWNLOAD_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok::<_, std::io::Error>(bytes)
+    };
+    match read.await {
+        Ok(bytes) if bytes.len() > MAX_DOWNLOAD_BYTES => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "artifact exceeds the 32 MiB gateway response limit",
+        )
+            .into_response(),
         Ok(bytes) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -987,7 +1019,7 @@ async fn console_for_sandbox(
 ///
 /// Bearer-authenticated like every other route: the escaping credential is the
 /// *ticket*, never the master token, which is why the browser keeps the master
-/// token in localStorage and exchanges it here instead of putting it in a URL.
+/// token in page memory and exchanges it here instead of putting it in a URL.
 ///
 /// The sandbox is resolved first, so a ticket is never minted for an id this
 /// gateway cannot see — an unknown id is a `404`, exactly like `GET

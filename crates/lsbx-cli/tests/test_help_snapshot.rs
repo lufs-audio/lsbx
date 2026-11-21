@@ -66,6 +66,9 @@ fn top_level_help_lists_every_global_flag() {
             "-c",
             "--backend",
             "-b",
+            "--gateway",
+            "--token",
+            "--insecure",
             "--images",
             "-i",
             "--state-dir",
@@ -298,4 +301,10 @@ fn ci_broker_run_help_lists_its_flags() {
         &["--backend", "--queue-label"],
         "`lsbx ci-broker run --help`",
     );
+}
+
+#[test]
+fn console_help_lists_open_flag() {
+    let help = run_help(&["console"]);
+    assert_contains_all(&help, &["--open"], "console --help");
 }

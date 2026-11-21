@@ -359,6 +359,21 @@ async fn upload_stages_http_body_and_calls_real_put() {
 }
 
 #[tokio::test]
+async fn upload_rejects_a_body_larger_than_the_gateway_limit() {
+    let (ops, _dir) = build_test_ops();
+    let router = build_router(ops, test_config());
+    let (header_name, header_value) = auth_header();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/sandboxes/not-created/upload?destination=example")
+        .header(header_name, header_value)
+        .body(Body::from(vec![0; 2 * 1024 * 1024 + 1]))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn console_by_id_returns_real_console_url_for_novnc_sandbox() {
     let (ops, _dir) = build_test_ops();
     let router = build_router(ops.clone(), test_config());
