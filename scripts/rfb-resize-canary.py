@@ -67,7 +67,10 @@ def vnc_response(password: str, challenge: bytes) -> bytes:
         raise RuntimeError("install python3-cryptography to use this probe") from error
     key = password.encode("ascii")[:8].ljust(8, b"\0")
     reversed_key = bytes(bit_reverse(value) for value in key)
-    encryptor = Cipher(TripleDES(reversed_key), modes.ECB()).encryptor()
+    # Spell the single-DES-equivalent EDE key as K1=K2=K3. Newer
+    # cryptography releases deprecate the 8-byte TripleDES shorthand, while
+    # the 24-byte repeated form preserves VNC authentication semantics.
+    encryptor = Cipher(TripleDES(reversed_key * 3), modes.ECB()).encryptor()
     return encryptor.update(challenge) + encryptor.finalize()
 
 
