@@ -189,7 +189,8 @@ fn moonlight_config(slots: u8) -> MoonlightConfig {
 struct TestHarness {
     router: axum::Router,
     relay: MockRelay,
-    _live_vms: Arc<Mutex<Vec<String>>>,
+    live_vms: Arc<Mutex<Vec<String>>>,
+    manager: Option<Arc<MoonlightManager>>,
     _dir: tempfile::TempDir,
 }
 
@@ -256,22 +257,26 @@ fn build_harness(slots: u8, enable_moonlight: bool) -> TestHarness {
     ));
 
     let relay = MockRelay::default();
-    let router = if enable_moonlight {
+    let (router, manager) = if enable_moonlight {
         let manager = MoonlightManager::new(
             Arc::clone(&ops),
             sandbox_store,
             moonlight_config(slots),
             Arc::new(relay.clone()),
         );
-        build_router_with_moonlight(ops, gateway_config(), manager)
+        (
+            build_router_with_moonlight(ops, gateway_config(), Arc::clone(&manager)),
+            Some(manager),
+        )
     } else {
-        build_router(ops, gateway_config())
+        (build_router(ops, gateway_config()), None)
     };
 
     TestHarness {
         router,
         relay,
-        _live_vms: live_vms,
+        live_vms,
+        manager,
         _dir: dir,
     }
 }
@@ -616,4 +621,36 @@ async fn moonlight_slot_released_on_sandbox_delete() {
     // Verify relay deactivation was called on delete
     let deactivated = harness.relay.deactivated.lock().unwrap().clone();
     assert!(deactivated.contains(&"sbx-win-del".to_string()));
+}
+
+#[tokio::test]
+async fn moonlight_reaper_sweeps_terminated_vm() {
+    let harness = build_harness(1, true);
+    let store = SandboxStore::new(harness._dir.path().to_path_buf());
+
+    let rec = make_record("sbx-win-reap", "vm-tag-1", "192.168.122.51", "win11-audio");
+    store.save(&rec).unwrap();
+
+    let req = Request::builder()
+        .uri("/sandboxes/sbx-win-reap/moonlight")
+        .method("POST")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = harness.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // VM is terminated in backend
+    harness.live_vms.lock().unwrap().retain(|tag| tag != "vm-tag-1");
+
+    // Run reaper sweep
+    harness.manager.as_ref().unwrap().reap_once().await;
+
+    // Verify relay was deactivated
+    let deactivated = harness.relay.deactivated.lock().unwrap().clone();
+    assert!(deactivated.contains(&"sbx-win-reap".to_string()));
+
+    // Verify record extra is cleaned up in store
+    let record = store.load("sbx-win-reap").unwrap();
+    assert!(!record.extra.contains_key("moonlight"));
 }
