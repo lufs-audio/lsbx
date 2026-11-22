@@ -75,6 +75,8 @@ lsbx status
 lsbx list --json
 lsbx up win11 --lease 30m
 lsbx console <id> --open
+lsbx moonlight <id>          # acquire an opt-in tailnet Moonlight media slot
+lsbx moonlight <id> --status # inspect active slot and tailnet port assignment
 lsbx down <id>
 ```
 

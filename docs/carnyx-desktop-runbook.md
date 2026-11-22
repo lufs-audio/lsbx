@@ -49,6 +49,50 @@ JSON body such as `{"preset":"1600x900"}` applies one. A failed change leaves
 noVNC scaling available. Ultrawide 3440×1440 is not supported by the tested QXL
 configuration.
 
+## Tailnet Moonlight media relay and allocator (opt-in)
+
+The gateway optionally manages bounded TCP/UDP media slots for Moonlight streaming
+directly over Tailscale, avoiding public port exposure or guest subnet publication.
+
+### Configuration
+
+Set on the gateway host (`lsbx serve`):
+
+- `LSBX_MOONLIGHT_BIND_IP`: Exact Tailscale IPv4 address of the gateway (e.g. `100.125.210.60`). Must be within `100.64.0.0/10` and non-wildcard.
+- `LSBX_MOONLIGHT_CLIENT_IP`: Exact Tailscale IPv4 address of the authorized streaming client. All unauthorized datagrams and connections are dropped before allocation.
+- `LSBX_MOONLIGHT_GOLDEN`: Exact backing golden key required (e.g. `win11-desktop-audio-canary`). Rejects non-matching, non-Windows, or non-noVNC guests.
+- `LSBX_MOONLIGHT_SLOTS`: Number of concurrent media slots (1 or 2, default 1).
+- `LSBX_MOONLIGHT_HOST_ANCHOR`: Base host port for slot 0 (default `50005`). Slots stride by +100 (slot 0 at 50005, slot 1 at 50105).
+- `LSBX_MOONLIGHT_WATCH_MS`: Reaper polling interval in milliseconds (default 2000 ms, bounds 250–10000 ms).
+
+### Port architecture
+
+Sunshine base anchor is port 47989 inside the guest. For each allocated slot:
+
+- **TCP listeners:** offsets `-5` (47984 HTTPS/control), `0` (47989 HTTP), `+21` (48010 RTSP).
+- **UDP listeners:** offsets `+9` (47998 audio), `+10` (47999 video), `+11` (48000 control), `+13` (48002 wake), `+21` (48010 RTSP).
+- **Admin UI exclusion:** Sunshine admin port at offset `+1` (47990 / 50006) is **intentionally omitted** from public relay listeners and remains loopback-only within the guest.
+
+### Operations and CLI
+
+Drive via the authenticated gateway CLI:
+
+```bash
+# Acquire a media slot for a live canary
+lsbx --gateway https://100.125.210.60:8243 --token "$TOKEN" moonlight <id>
+
+# Check slot assignment and active status
+lsbx --gateway https://100.125.210.60:8243 --token "$TOKEN" moonlight <id> --status
+
+# List all occupied slots across sandboxes
+lsbx --gateway https://100.125.210.60:8243 --token "$TOKEN" moonlight --list
+
+# Explicitly release a slot
+lsbx --gateway https://100.125.210.60:8243 --token "$TOKEN" moonlight <id> --release
+```
+
+Lifecycle guarantee: Calling `lsbx down <id>`, deleting the sandbox via `DELETE /sandboxes/{id}`, guest shutdown, or lease expiry automatically stops relay listeners, cancels in-flight UDP flows, and releases the slot.
+
 ### Carnyx evidence — 2026-11-21
 
 - A fresh Windows clone booted with ICH9 and `audio type='none'`, saw one
