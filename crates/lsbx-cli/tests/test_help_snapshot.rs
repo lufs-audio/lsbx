@@ -106,6 +106,7 @@ fn top_level_help_lists_every_subcommand() {
             "logs",
             "mcp",
             "ci-broker",
+            "moonlight",
         ],
         "top-level --help subcommand list",
     );
@@ -307,4 +308,14 @@ fn ci_broker_run_help_lists_its_flags() {
 fn console_help_lists_open_flag() {
     let help = run_help(&["console"]);
     assert_contains_all(&help, &["--open"], "console --help");
+}
+
+#[test]
+fn moonlight_help_lists_its_flags() {
+    let help = run_help(&["moonlight"]);
+    assert_contains_all(
+        &help,
+        &["--list", "--release", "--status"],
+        "`lsbx moonlight --help`",
+    );
 }
