@@ -913,4 +913,91 @@ mod tests {
         assert_eq!(downloaded, payload);
         task.abort();
     }
+
+    #[tokio::test]
+    async fn moonlight_client_round_trip() {
+        use axum::extract::Path as AxumPath;
+
+        async fn mock_acquire(AxumPath(id): AxumPath<String>) -> axum::response::Response {
+            Json(serde_json::json!({
+                "status": "success",
+                "data": {
+                    "sandbox_id": id,
+                    "slot": 0,
+                    "address": "100.125.210.60:50005",
+                    "host_anchor": 50005,
+                    "guest_ip": "192.168.122.50",
+                    "lease_expires_at": "2026-11-22T04:00:00Z",
+                    "acquired_at": "2026-11-22T02:00:00Z",
+                    "active": true
+                }
+            }))
+            .into_response()
+        }
+
+        async fn mock_status(AxumPath(id): AxumPath<String>) -> axum::response::Response {
+            Json(serde_json::json!({
+                "status": "success",
+                "data": {
+                    "sandbox_id": id,
+                    "slot": 0,
+                    "address": "100.125.210.60:50005",
+                    "host_anchor": 50005,
+                    "guest_ip": "192.168.122.50",
+                    "lease_expires_at": "2026-11-22T04:00:00Z",
+                    "acquired_at": "2026-11-22T02:00:00Z",
+                    "active": true
+                }
+            }))
+            .into_response()
+        }
+
+        async fn mock_list() -> axum::response::Response {
+            Json(serde_json::json!({
+                "status": "success",
+                "data": [{
+                    "sandbox_id": "sbx-1",
+                    "slot": 0,
+                    "address": "100.125.210.60:50005",
+                    "host_anchor": 50005,
+                    "guest_ip": "192.168.122.50",
+                    "lease_expires_at": "2026-11-22T04:00:00Z",
+                    "acquired_at": "2026-11-22T02:00:00Z",
+                    "active": true
+                }]
+            }))
+            .into_response()
+        }
+
+        async fn mock_release() -> axum::response::Response {
+            StatusCode::NO_CONTENT.into_response()
+        }
+
+        let router = Router::new()
+            .route(
+                "/sandboxes/{id}/moonlight",
+                post(mock_acquire).get(mock_status).delete(mock_release),
+            )
+            .route("/moonlight", get(mock_list));
+        let (base, task) = spawn(router).await;
+        let client = GatewayClient::new(&base, Some("test-token"), true).expect("client");
+
+        let acquired = client.moonlight_acquire("sbx-1").await.expect("acquire");
+        assert_eq!(acquired.sandbox_id, "sbx-1");
+        assert_eq!(acquired.slot, 0);
+        assert_eq!(acquired.host_anchor, 50005);
+        assert_eq!(acquired.guest_ip, std::net::Ipv4Addr::new(192, 168, 122, 50));
+        assert!(acquired.active);
+
+        let status = client.moonlight_status("sbx-1").await.expect("status");
+        assert!(status.is_some());
+        assert_eq!(status.unwrap().slot, 0);
+
+        let list = client.moonlight_list().await.expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].sandbox_id, "sbx-1");
+
+        client.moonlight_release("sbx-1").await.expect("release");
+        task.abort();
+    }
 }
