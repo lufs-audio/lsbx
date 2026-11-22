@@ -12,6 +12,7 @@ lsbx-store = { workspace = true }
 lsbx-golden = { workspace = true }
 lsbx-lifecycle = { workspace = true }
 tokio = { workspace = true }
+chrono = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

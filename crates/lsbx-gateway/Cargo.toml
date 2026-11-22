@@ -12,9 +12,11 @@ lsbx-golden = { workspace = true }
 lsbx-lifecycle = { workspace = true }
 lsbx-ops = { workspace = true }
 axum = { workspace = true }
+http-body-util = "0.1"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
 sha2 = { workspace = true }
 hex = "0.4"
 tracing = { workspace = true }
@@ -37,7 +39,6 @@ lsbx-store = { workspace = true }
 # Arc::new(LsbxOps) unit value.
 lsbx-backend-demo = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
 
 [lints]
 workspace = true

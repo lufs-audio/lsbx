@@ -26,9 +26,9 @@ use lsbx_kernel::types::SandboxRecord;
 use lsbx_store::sandbox_store::SandboxStore;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 /// `host` is set to the full `ip:port` of `listener_addr` — see
 /// `test_destination_lookup_security.rs`'s identically-shaped helper for
@@ -108,15 +108,28 @@ async fn client_closes_first_propagates_to_guest_and_leaves_no_half_open_connect
     let guest_handle = tokio::spawn(async move {
         let (mut stream, _) = guest_listener.accept().await.expect("accept");
         let mut buf = [0u8; 16];
-        let n = stream.read(&mut buf).await.expect("read after client close");
-        assert_eq!(n, 0, "guest side should observe EOF once the client closes first");
+        let n = stream
+            .read(&mut buf)
+            .await
+            .expect("read after client close");
+        assert_eq!(
+            n, 0,
+            "guest side should observe EOF once the client closes first"
+        );
     });
 
     let ws_url = format!("ws://{proxy_addr}/stream/{sandbox_id}/vnc");
-    let (mut ws_stream, response) = tokio_tungstenite::connect_async(&ws_url)
+    let mut request = ws_url.into_client_request().expect("WebSocket request");
+    request.headers_mut().insert("sec-websocket-protocol", "binary".parse().unwrap());
+    let (mut ws_stream, response) = tokio_tungstenite::connect_async(request)
         .await
         .expect("upgrade should succeed for a valid, resolved sandbox id");
-    assert_eq!(response.status(), axum::http::StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SWITCHING_PROTOCOLS
+    );
+
+    assert_eq!(response.headers().get("sec-websocket-protocol").unwrap(), "binary");
 
     // Client closes first.
     ws_stream
@@ -157,7 +170,10 @@ async fn guest_closes_first_propagates_to_client_and_leaves_no_half_open_connect
     let (mut ws_stream, response) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .expect("upgrade should succeed for a valid, resolved sandbox id");
-    assert_eq!(response.status(), axum::http::StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SWITCHING_PROTOCOLS
+    );
 
     guest_handle.await.expect("guest task should not panic");
 
@@ -183,4 +199,83 @@ async fn guest_closes_first_propagates_to_client_and_leaves_no_half_open_connect
         observed_close,
         "client side should observe a clean close once the guest closes first"
     );
+}
+
+#[tokio::test]
+async fn abandoned_client_is_reaped_before_a_reconnect_uses_a_fresh_guest_socket() {
+    let guest_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind guest listener");
+    let guest_addr = guest_listener.local_addr().expect("local_addr");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(SandboxStore::new(dir.path().to_path_buf()));
+    let sandbox_id = "sbx-abandon-then-reconnect";
+    store
+        .save(&sample_record(sandbox_id, guest_addr))
+        .expect("seed record");
+
+    let proxy_addr = start_proxy(store).await;
+
+    // A browser tab can vanish without sending a WebSocket Close frame. The
+    // first guest socket must still observe EOF, and the relay must accept a
+    // second independent session rather than leaving the destination wedged.
+    let guest_handle = tokio::spawn(async move {
+        let (mut first, _) = guest_listener.accept().await.expect("accept first relay");
+        let mut byte = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), first.read(&mut byte))
+            .await
+            .expect("abandoned first relay should be reaped promptly")
+            .expect("read first relay");
+        assert_eq!(
+            n, 0,
+            "guest should observe EOF after an abandoned browser client"
+        );
+
+        let (mut second, _) = guest_listener
+            .accept()
+            .await
+            .expect("accept reconnect relay");
+        second
+            .write_all(b"RFB 003.008\n")
+            .await
+            .expect("write RFB greeting to reconnect");
+    });
+
+    let ws_url = format!("ws://{proxy_addr}/stream/{sandbox_id}/vnc");
+    let (first_client, first_response) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("first upgrade");
+    assert_eq!(
+        first_response.status(),
+        axum::http::StatusCode::SWITCHING_PROTOCOLS
+    );
+
+    // No `.close()`: dropping the transport models a tab/process disappearing.
+    drop(first_client);
+
+    let (mut second_client, second_response) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(&ws_url),
+    )
+    .await
+    .expect("reconnect should not hang behind the abandoned client")
+    .expect("second upgrade");
+    assert_eq!(
+        second_response.status(),
+        axum::http::StatusCode::SWITCHING_PROTOCOLS
+    );
+
+    let greeting = tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::StreamExt::next(&mut second_client),
+    )
+    .await
+    .expect("reconnect should receive the guest greeting promptly")
+    .expect("reconnect stream should remain open")
+    .expect("reconnect frame should be valid");
+    assert_eq!(greeting.into_data(), b"RFB 003.008\n".as_slice());
+
+    second_client.close(None).await.expect("close reconnect");
+    guest_handle.await.expect("guest task should not panic");
 }

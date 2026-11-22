@@ -117,6 +117,7 @@
 
 pub mod cli;
 pub mod format;
+mod gateway_client;
 
 /// Binary version including the git commit it was built from.
 ///
@@ -124,7 +125,12 @@ pub mod format;
 /// `unknown` when git metadata is unavailable. The commit is part of the version
 /// string because a stale binary silently outliving `main` is exactly the
 /// failure this makes visible.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("LSBX_GIT_COMMIT"), ")");
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("LSBX_GIT_COMMIT"),
+    ")"
+);
 
 use clap::Parser as _;
 use cli::{BackendChoice, CiBrokerCommand, Cli, Command, GoldenCommand};
@@ -166,6 +172,33 @@ pub async fn run() -> i32 {
 /// binary's* JSON output end to end).
 pub async fn run_with_args(args: Cli) -> i32 {
     let as_json = args.json;
+
+    if let Some(gateway) = args.gateway.as_deref() {
+        if args.backend.is_some() {
+            let error = LsbxError::Usage(
+                "--gateway cannot be combined with --backend; remote mode uses the gateway's backend"
+                    .to_string(),
+            );
+            println!("{}", format::render_error(&error, as_json));
+            return error.exit_code() as i32;
+        }
+        let client =
+            match gateway_client::GatewayClient::new(gateway, args.token.as_deref(), args.insecure)
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    println!("{}", format::render_error(&error, as_json));
+                    return error.exit_code() as i32;
+                }
+            };
+        return match dispatch_gateway(&client, &args, as_json).await {
+            Ok(code) => code,
+            Err(error) => {
+                println!("{}", format::render_error(&error, as_json));
+                error.exit_code() as i32
+            }
+        };
+    }
 
     let deps = match build_deps(&args, None).await {
         Ok(deps) => deps,
@@ -625,6 +658,341 @@ fn generate_pubkey_for(
 /// stores were built from, which `LsbxOps` itself has no accessor for (its
 /// `sandbox_store`/`ci_job_store` fields are private by design — see
 /// `lsbx-ops`'s own module doc comment).
+async fn dispatch_gateway(
+    client: &gateway_client::GatewayClient,
+    args: &Cli,
+    as_json: bool,
+) -> Result<i32, LsbxError> {
+    match &args.command {
+        None | Some(Command::Status) => {
+            let status = client.status().await?;
+            let dto = StatusReportDto {
+                backend_name: status.backend_name,
+                backend_available: status.backend_available,
+                sandbox_count: status.sandbox_count,
+            };
+            println!("{}", format::render(&dto, as_json));
+            Ok(0)
+        }
+        Some(Command::Up {
+            profile,
+            count,
+            name,
+            task_id,
+            lease,
+            no_verify,
+            ready_timeout,
+        }) => {
+            let lease = lease
+                .as_deref()
+                .map(parse_duration)
+                .transpose()?
+                .unwrap_or(DEFAULT_LEASE);
+            let ready_timeout = ready_timeout
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_READY_TIMEOUT);
+            let count = count.unwrap_or(1).max(1);
+            let mut exit_code = 0;
+            for index in 0..count {
+                let instance_name = match (name, count) {
+                    (Some(base), n) if n > 1 => Some(format!("{base}-{index}")),
+                    (Some(base), _) => Some(base.clone()),
+                    (None, _) => None,
+                };
+                match client
+                    .create(
+                        profile,
+                        instance_name.as_deref(),
+                        task_id.as_deref(),
+                        lease,
+                        ready_timeout,
+                        !no_verify,
+                    )
+                    .await
+                {
+                    Ok(sandbox) => println!("{}", format::render(&sandbox, as_json)),
+                    Err(error) => {
+                        println!("{}", format::render_error(&error, as_json));
+                        exit_code = error.exit_code() as i32;
+                    }
+                }
+            }
+            Ok(exit_code)
+        }
+        Some(Command::Down { ids, all }) => {
+            let targets = if *all {
+                client
+                    .list()
+                    .await?
+                    .into_iter()
+                    .map(|sandbox| sandbox.id)
+                    .collect::<Vec<_>>()
+            } else {
+                ids.clone()
+            };
+            if targets.is_empty() {
+                println!("{}", format::render(&EmptyList::default(), as_json));
+                return Ok(0);
+            }
+            let mut exit_code = 0;
+            for id in targets {
+                match client.destroy(&id).await {
+                    Ok(()) => println!("{}", format::render(&DestroyedId(id), as_json)),
+                    Err(error) => {
+                        println!("{}", format::render_error(&error, as_json));
+                        exit_code = error.exit_code() as i32;
+                    }
+                }
+            }
+            Ok(exit_code)
+        }
+        Some(Command::List { profile, expired }) => {
+            let mut sandboxes = client.list().await?;
+            if let Some(profile) = profile {
+                sandboxes.retain(|sandbox| &sandbox.profile == profile);
+            }
+            if *expired {
+                let now = std::time::SystemTime::now();
+                sandboxes.retain(|sandbox| is_expired_public(sandbox, now));
+            }
+            println!("{}", format::render(&SandboxList(sandboxes), as_json));
+            Ok(0)
+        }
+        Some(Command::Info { id }) => {
+            let sandbox = client.info(id).await?;
+            println!("{}", format::render(&sandbox, as_json));
+            Ok(0)
+        }
+        Some(Command::Exec {
+            id,
+            timeout,
+            command,
+        }) => {
+            let output = client
+                .exec(
+                    id,
+                    command,
+                    timeout
+                        .map(Duration::from_secs)
+                        .unwrap_or(DEFAULT_EXEC_TIMEOUT),
+                )
+                .await?;
+            let dto = CommandOutputDto {
+                exit_code: output.exit_code,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            };
+            println!("{}", format::render(&dto, as_json));
+            Ok(dto.exit_code)
+        }
+        Some(Command::Put {
+            id,
+            source,
+            destination,
+        }) => {
+            use tokio::io::AsyncReadExt;
+            let file = tokio::fs::File::open(source).await.map_err(|error| {
+                LsbxError::NotFound(format!(
+                    "could not open upload source {}: {error}",
+                    source.display()
+                ))
+            })?;
+            let mut bytes = Vec::new();
+            file.take((gateway_client::MAX_UPLOAD_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| {
+                    LsbxError::BackendUnavailable(format!(
+                        "could not read upload source {}: {error}",
+                        source.display()
+                    ))
+                })?;
+            if bytes.len() > gateway_client::MAX_UPLOAD_BYTES {
+                return Err(LsbxError::Usage(
+                    "gateway uploads are limited to 2 MiB".to_string(),
+                ));
+            }
+            client.upload(id, destination, bytes).await?;
+            println!(
+                "{}",
+                format::render(&PutGetResult { id: id.clone() }, as_json)
+            );
+            Ok(0)
+        }
+        Some(Command::Get {
+            id,
+            source,
+            destination,
+        }) => {
+            let bytes = client.download(id, source).await?;
+            let destination = destination.clone();
+            tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let parent = destination
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+                temp.write_all(&bytes)?;
+                temp.persist(&destination).map_err(|error| error.error)?;
+                Ok::<_, std::io::Error>(())
+            })
+            .await
+            .map_err(|error| {
+                LsbxError::BackendUnavailable(format!("download write task failed: {error}"))
+            })?
+            .map_err(|error| {
+                LsbxError::BackendUnavailable(format!(
+                    "could not write download destination: {error}"
+                ))
+            })?;
+            println!(
+                "{}",
+                format::render(&PutGetResult { id: id.clone() }, as_json)
+            );
+            Ok(0)
+        }
+        Some(Command::Renew { id, duration }) => {
+            let sandbox = client.renew(id, parse_duration(duration)?).await?;
+            println!("{}", format::render(&sandbox, as_json));
+            Ok(0)
+        }
+        Some(Command::Console { id, open }) => {
+            let url = client.console_url(id).await?;
+            println!("{}", format::render(&ConsoleUrlDto(url.clone()), as_json));
+            if *open {
+                let url = url.ok_or_else(|| {
+                    LsbxError::NotFound(format!("sandbox '{id}' has no console URL"))
+                })?;
+                open_browser(&url)?;
+            }
+            Ok(0)
+        }
+        Some(Command::Moonlight {
+            id,
+            list,
+            release,
+            status,
+        }) => {
+            if *list {
+                println!(
+                    "{}",
+                    format::render(&MoonlightList(client.moonlight_list().await?), as_json)
+                );
+            } else {
+                let id = id.as_deref().ok_or_else(|| {
+                    LsbxError::Usage("moonlight requires <id> or --list".to_string())
+                })?;
+                if *release {
+                    client.moonlight_release(id).await?;
+                    println!("released Moonlight slot for {id}");
+                } else if *status {
+                    println!(
+                        "{}",
+                        format::render(
+                            &MoonlightMaybe(client.moonlight_status(id).await?),
+                            as_json
+                        )
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        format::render(
+                            &MoonlightMaybe(Some(client.moonlight_acquire(id).await?)),
+                            as_json
+                        )
+                    );
+                }
+            }
+            Ok(0)
+        }
+        Some(Command::Profiles { full }) => {
+            let profiles = client.profiles().await?;
+            let keys = profiles
+                .get("keys")
+                .cloned()
+                .unwrap_or(serde_json::json!([]));
+            println!(
+                "{}",
+                format::render(
+                    &ProfilesDto {
+                        profiles: keys,
+                        full: *full,
+                    },
+                    as_json,
+                )
+            );
+            Ok(0)
+        }
+        Some(Command::Images) => {
+            let images = client.images().await?;
+            let keys = images.get("keys").cloned().unwrap_or(serde_json::json!([]));
+            println!("{}", format::render(&ImagesDto(keys), as_json));
+            Ok(0)
+        }
+        Some(Command::Golden {
+            action: GoldenCommand::List,
+        }) => {
+            let goldens = client.goldens().await?;
+            println!("{}", format::render(&GoldenList(goldens), as_json));
+            Ok(0)
+        }
+        Some(Command::Golden { .. }) => Err(remote_unsupported(
+            "golden mutation",
+            "the current gateway exposes no golden mutation endpoints",
+        )),
+        Some(Command::Dashboard) => Err(remote_unsupported(
+            "dashboard",
+            "the TUI requires a local LsbxOps instance",
+        )),
+        Some(Command::Reap { .. })
+        | Some(Command::Serve { .. })
+        | Some(Command::Bootstrap { .. })
+        | Some(Command::Config { .. })
+        | Some(Command::Logs { .. })
+        | Some(Command::Mcp)
+        | Some(Command::CiBroker { .. }) => Err(remote_unsupported(
+            "this command",
+            "the current gateway does not expose a corresponding endpoint",
+        )),
+    }
+}
+
+fn remote_unsupported(command: &str, reason: &str) -> LsbxError {
+    LsbxError::Usage(format!(
+        "'{command}' is not available in --gateway mode: {reason}"
+    ))
+}
+
+fn open_browser(url: &str) -> Result<(), LsbxError> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler").arg(url);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    #[cfg(not(any(unix, target_os = "windows")))]
+    return Err(LsbxError::Usage(
+        "--open is not supported on this operating system".to_string(),
+    ));
+
+    command.spawn().map(|_| ()).map_err(|error| {
+        LsbxError::BackendUnavailable(format!("failed to open console in a browser: {error}"))
+    })
+}
+
 async fn dispatch(
     ops: &LsbxOps,
     state_dir: PathBuf,
@@ -786,11 +1154,21 @@ async fn dispatch(
             println!("{}", format::render(&sandbox, as_json));
             Ok(0)
         }
-        Some(Command::Console { id }) => {
+        Some(Command::Console { id, open }) => {
             let url = ops.console_url(id).await?;
-            println!("{}", format::render(&ConsoleUrlDto(url), as_json));
+            println!("{}", format::render(&ConsoleUrlDto(url.clone()), as_json));
+            if *open {
+                let url = url.ok_or_else(|| {
+                    LsbxError::NotFound(format!("sandbox '{id}' has no console URL"))
+                })?;
+                open_browser(&url)?;
+            }
             Ok(0)
         }
+        Some(Command::Moonlight { .. }) => Err(LsbxError::Usage(
+            "moonlight is a gateway-owned operation; pass --gateway and its bearer token"
+                .to_string(),
+        )),
         Some(Command::Info { id }) => {
             let sandbox = ops.info(id).await?;
             println!("{}", format::render(&sandbox, as_json));
@@ -852,9 +1230,7 @@ async fn dispatch(
             port,
             stream_port,
             max_sandboxes,
-            token,
             reap_ttl,
-            insecure,
             daemon,
         }) => {
             dispatch_serve(
@@ -864,9 +1240,9 @@ async fn dispatch(
                 *port,
                 *stream_port,
                 *max_sandboxes,
-                token.clone(),
+                args.token.clone(),
                 reap_ttl.as_deref(),
-                *insecure,
+                args.insecure,
                 *daemon,
             )
             .await
@@ -1333,6 +1709,9 @@ async fn dispatch_serve(
         allow_local_files: false,
         insecure,
         max_sandboxes,
+        windows_display_resize_golden: std::env::var("LSBX_WINDOWS_DISPLAY_RESIZE_GOLDEN")
+            .ok()
+            .filter(|value| !value.is_empty()),
         rate_limit: lsbx_gateway::RateLimitConfig::default(),
     };
 
@@ -1353,6 +1732,23 @@ async fn dispatch_serve(
     let serve_deps = build_deps(args, None).await?;
     let serve_state_dir = state_dir.clone();
     let reap_ops = std::sync::Arc::new(serve_deps.into_ops());
+
+    // Moonlight remains off unless the bind IP is explicitly configured.
+    // A configured instance binds only its exact tailnet IPv4 and accepts
+    // only the exact configured tailnet client IPv4.
+    let moonlight = match lsbx_gateway::moonlight::MoonlightConfig::from_env()? {
+        Some(config) => {
+            let manager = lsbx_gateway::moonlight::MoonlightManager::new(
+                std::sync::Arc::clone(&reap_ops),
+                SandboxStore::new(state_dir.clone()),
+                config,
+                lsbx_gateway::moonlight::RelayPool::new(),
+            );
+            manager.spawn_reaper();
+            Some(manager)
+        }
+        None => None,
+    };
 
     if !daemon {
         println!("lsbx serve: starting on {host_str}:{gateway_port}");
@@ -1395,7 +1791,13 @@ async fn dispatch_serve(
             state_dir: serve_state_dir,
         };
         let addr = std::net::SocketAddr::new(host_ip, gateway_port);
-        let bound = lsbx_gateway::run_server(deps, gateway_config(), addr).await?;
+        let bound = match moonlight.clone() {
+            Some(manager) => {
+                lsbx_gateway::run_server_with_moonlight(deps, gateway_config(), addr, manager)
+                    .await?
+            }
+            None => lsbx_gateway::run_server(deps, gateway_config(), addr).await?,
+        };
         if !daemon {
             println!(
                 "lsbx serve: listening on {} (gateway + stream, merged)",
@@ -1414,8 +1816,14 @@ async fn dispatch_serve(
         // `dual_listener` above already proved `stream_port` is `Some`.
         let stream_port_value = stream_port.unwrap();
 
-        let gateway_router =
-            lsbx_gateway::build_router(std::sync::Arc::clone(&reap_ops), gateway_config());
+        let gateway_router = match moonlight {
+            Some(manager) => lsbx_gateway::routes::build_router_with_moonlight(
+                std::sync::Arc::clone(&reap_ops),
+                gateway_config(),
+                manager,
+            ),
+            None => lsbx_gateway::build_router(std::sync::Arc::clone(&reap_ops), gateway_config()),
+        };
         let gateway_addr = std::net::SocketAddr::new(host_ip, gateway_port);
         let gateway_listener = tokio::net::TcpListener::bind(gateway_addr)
             .await
@@ -2040,7 +2448,9 @@ impl Formattable for GoldenReconcileDto {
             }
         }
         if lines.is_empty() {
-            lines.push("(no goldens in the manifest and no golden-shaped VMs on the backend)".to_string());
+            lines.push(
+                "(no goldens in the manifest and no golden-shaped VMs on the backend)".to_string(),
+            );
         }
         lines.join("\n")
     }
@@ -2261,5 +2671,50 @@ struct ConfigPathDto;
 impl Formattable for ConfigPathDto {
     fn to_human_table(&self) -> String {
         "no merged crate owns a writable config file path yet".to_string()
+    }
+}
+
+#[derive(Serialize)]
+struct MoonlightMaybe(Option<gateway_client::MoonlightStatus>);
+
+impl Formattable for MoonlightMaybe {
+    fn to_human_table(&self) -> String {
+        match &self.0 {
+            Some(value) => format!(
+                "slot {}: {}\nsandbox  {}\nguest    {}\nactive   {}\nlease    {}",
+                value.slot,
+                value.address,
+                value.sandbox_id,
+                value.guest_ip,
+                value.active,
+                value.lease_expires_at
+            ),
+            None => "(no Moonlight slot)".to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct MoonlightList(Vec<gateway_client::MoonlightStatus>);
+
+impl Formattable for MoonlightList {
+    fn to_human_table(&self) -> String {
+        format::row_table(
+            &["SANDBOX", "SLOT", "ADDRESS", "GUEST", "ACTIVE", "LEASE"],
+            &self
+                .0
+                .iter()
+                .map(|v| {
+                    vec![
+                        v.sandbox_id.clone(),
+                        v.slot.to_string(),
+                        v.address.clone(),
+                        v.guest_ip.to_string(),
+                        v.active.to_string(),
+                        v.lease_expires_at.clone(),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 }

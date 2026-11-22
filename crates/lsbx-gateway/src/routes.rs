@@ -89,6 +89,24 @@ use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
+
+const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
+const DISPLAY_HELPER_PATH: &str = r"C:\lsbx\set-win11-display.ps1";
+const DISPLAY_APPLY_TIMEOUT: Duration = Duration::from_secs(45);
+/// Modes exercised by the in-session QXL helper. Keep this list identical to
+/// the helper's approved preset surface; notably, 3440x1440 is not supported.
+const WINDOWS_DISPLAY_PRESETS: [&str; 8] = [
+    "1024x768",
+    "1280x800",
+    "1440x900",
+    "1600x900",
+    "1920x1080",
+    "2560x1440",
+    "2560x1600",
+    "3840x2160",
+];
 
 /// Gateway-level configuration, per this unit's interface contract.
 #[derive(Debug, Clone)]
@@ -99,6 +117,10 @@ pub struct GatewayConfig {
     /// Maximum number of simultaneously persisted sandboxes. This preserves
     /// the Python gateway's production safety bound.
     pub max_sandboxes: usize,
+    /// Exact manifest `GoldenConfig.base` allowed to use the Windows display
+    /// helper. `None` keeps the feature disabled. Production fills this only
+    /// from `LSBX_WINDOWS_DISPLAY_RESIZE_GOLDEN`.
+    pub windows_display_resize_golden: Option<String>,
     pub rate_limit: crate::ratelimit::RateLimitConfig,
 }
 
@@ -112,6 +134,10 @@ pub struct GatewayState {
     pub config: Arc<GatewayConfig>,
     pub rate_limiter: Arc<TokenBucket>,
     pub creation_gate: Arc<tokio::sync::Mutex<()>>,
+    /// One global, non-queueing permit for display changes. A second request
+    /// receives 409 immediately instead of building an unbounded wait queue.
+    pub display_resize_gate: Arc<tokio::sync::Mutex<()>>,
+    pub moonlight: Option<Arc<crate::moonlight::MoonlightManager>>,
 }
 
 /// Narrow trait `auth.rs`'s `FromRequestParts` impl is generic over, so the
@@ -148,7 +174,16 @@ impl HasGatewayConfig for GatewayState {
 /// See [`build_router_for_merge`] for the variant `lib.rs`'s Gap 1 merge
 /// path actually uses.
 pub fn build_router(ops: Arc<LsbxOps>, config: GatewayConfig) -> Router {
-    build_router_inner(ops, config, true)
+    build_router_inner(ops, config, true, None)
+}
+
+/// Builds the authenticated control API with the opt-in Moonlight manager.
+pub fn build_router_with_moonlight(
+    ops: Arc<LsbxOps>,
+    config: GatewayConfig,
+    moonlight: Arc<crate::moonlight::MoonlightManager>,
+) -> Router {
+    build_router_inner(ops, config, true, Some(moonlight))
 }
 
 /// The Gap 1 merge variant: identical to [`build_router`] except it omits
@@ -194,13 +229,22 @@ pub fn build_router(ops: Arc<LsbxOps>, config: GatewayConfig) -> Router {
 /// merged router, alongside every other REST route this crate owns
 /// (`/health`, `/images`, `/sandboxes/*`, etc.).
 pub(crate) fn build_router_for_merge(ops: Arc<LsbxOps>, config: GatewayConfig) -> Router {
-    build_router_inner(ops, config, false)
+    build_router_inner(ops, config, false, None)
+}
+
+pub(crate) fn build_router_for_merge_with_moonlight(
+    ops: Arc<LsbxOps>,
+    config: GatewayConfig,
+    moonlight: Arc<crate::moonlight::MoonlightManager>,
+) -> Router {
+    build_router_inner(ops, config, false, Some(moonlight))
 }
 
 fn build_router_inner(
     ops: Arc<LsbxOps>,
     config: GatewayConfig,
     include_own_console_routes: bool,
+    moonlight: Option<Arc<crate::moonlight::MoonlightManager>>,
 ) -> Router {
     let rate_limiter = Arc::new(TokenBucket::new(config.rate_limit));
     let state = GatewayState {
@@ -208,11 +252,14 @@ fn build_router_inner(
         config: Arc::new(config),
         rate_limiter,
         creation_gate: Arc::new(tokio::sync::Mutex::new(())),
+        display_resize_gate: Arc::new(tokio::sync::Mutex::new(())),
+        moonlight,
     };
 
     let mut authenticated_routes = Router::new()
         .route("/health", get(health))
         .route("/images", get(images))
+        .route("/goldens", get(goldens))
         .route("/profiles", get(profiles))
         .route("/capabilities", get(capabilities))
         .route("/consoles", get(consoles))
@@ -221,12 +268,23 @@ fn build_router_inner(
         .route("/sandboxes/{id}/upload", post(upload_to_sandbox))
         .route("/sandboxes/{id}/artifacts", get(download_artifact))
         .route("/sandboxes/{id}/exec", post(exec_in_sandbox))
+        .route(
+            "/sandboxes/{id}/display",
+            get(get_sandbox_display).post(set_sandbox_display),
+        )
         .route("/sandboxes/{id}/put", post(put_local_file))
         .route("/sandboxes/{id}/get", post(get_local_file))
         .route("/sandboxes/{id}/check", post(check_sandbox))
         .route("/sandboxes/{id}/info", post(info_sandbox))
         .route("/sandboxes/{id}/renew", post(renew_sandbox))
         .route("/sandboxes/{id}/console", post(console_for_sandbox))
+        .route(
+            "/sandboxes/{id}/moonlight",
+            get(moonlight_status)
+                .post(moonlight_acquire)
+                .delete(moonlight_release),
+        )
+        .route("/moonlight", get(moonlight_list))
         // Short-lived, sandbox-scoped ticket for the browser console's
         // WebSocket handshake — a browser cannot set an Authorization header on
         // a WS upgrade, so the page mints one of these with its bearer token
@@ -387,9 +445,17 @@ async fn audit_log_middleware(request: axum::extract::Request, next: Next) -> Re
     }
 
     let (parts, body) = request.into_parts();
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b,
-        Err(_) => Bytes::new(),
+    let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let too_large = std::error::Error::source(&error)
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+            return if too_large {
+                (StatusCode::PAYLOAD_TOO_LARGE, "request exceeds 2 MiB").into_response()
+            } else {
+                (StatusCode::BAD_REQUEST, "could not read request body").into_response()
+            };
+        }
     };
 
     let mut hasher = Sha256::new();
@@ -497,6 +563,13 @@ async fn images(State(state): State<GatewayState>, _auth: AuthedRequest) -> Resp
                 .cloned()
                 .unwrap_or(serde_json::json!({})),
         ),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn goldens(State(state): State<GatewayState>, _auth: AuthedRequest) -> Response {
+    match state.ops.golden_list().await {
+        Ok(goldens) => success_response(serde_json::json!(goldens)),
         Err(e) => error_response(e),
     }
 }
@@ -677,6 +750,19 @@ async fn delete_sandbox(
     AxumPath(id): AxumPath<String>,
     _auth: AuthedRequest,
 ) -> Response {
+    // Cancel listeners and in-flight relay state before the VM/record can be
+    // destroyed or its slot reused.
+    if let Some(manager) = &state.moonlight {
+        match manager.status(&id).await {
+            Ok(Some(_)) => {
+                if let Err(e) = manager.release(&id).await {
+                    return error_response(e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return error_response(e),
+        }
+    }
     match state.ops.destroy(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => error_response(e),
@@ -745,8 +831,7 @@ struct SourceQuery {
 /// `GET /sandboxes/<id>/artifacts?source=` -> `LsbxOps::get(id, source:
 /// &str, destination: &Path)`. The real `get` writes to a filesystem
 /// path, not a byte buffer, so this calls it against a server-side temp
-/// file and then streams that temp file's bytes back as the HTTP response
-/// body.
+/// file and returns its bytes with a cap on the buffered response.
 async fn download_artifact(
     State(state): State<GatewayState>,
     AxumPath(id): AxumPath<String>,
@@ -767,7 +852,20 @@ async fn download_artifact(
         return error_response(e);
     }
 
-    match tokio::fs::read(&temp_path).await {
+    let read = async {
+        let file = tokio::fs::File::open(&temp_path).await?;
+        let mut bytes = Vec::new();
+        file.take((MAX_DOWNLOAD_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok::<_, std::io::Error>(bytes)
+    };
+    match read.await {
+        Ok(bytes) if bytes.len() > MAX_DOWNLOAD_BYTES => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "artifact exceeds the 32 MiB gateway response limit",
+        )
+            .into_response(),
         Ok(bytes) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -830,6 +928,126 @@ async fn exec_in_sandbox(
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }),
+        Err(e) => error_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Handlers — opt-in Windows display presets
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct DisplaySupportResponse<'a> {
+    sandbox_id: &'a str,
+    supported: bool,
+    presets: &'static [&'static str],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetDisplayBody {
+    preset: String,
+}
+
+#[derive(Serialize)]
+struct SetDisplayResponse<'a> {
+    sandbox_id: &'a str,
+    preset: &'a str,
+    applied: bool,
+}
+
+fn display_not_supported_response() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "status": "error",
+            "code": 5,
+            "message": "display resize is disabled or this sandbox is not an eligible Windows/noVNC sandbox on the exact configured backing golden",
+        })),
+    )
+        .into_response()
+}
+
+async fn display_is_supported(state: &GatewayState, id: &str) -> Result<bool, LsbxError> {
+    // Resolve first even when the feature is disabled so an unknown sandbox is
+    // still a 404 rather than being hidden behind a deployment-level 501.
+    state.ops.info(id).await?;
+    let Some(exact_backing_golden) = state.config.windows_display_resize_golden.as_deref() else {
+        return Ok(false);
+    };
+    state
+        .ops
+        .sandbox_uses_windows_novnc_golden(id, exact_backing_golden)
+        .await
+}
+
+/// Authenticated capability discovery for the browser's explicit dropdown.
+/// GET never runs a guest command and never changes a window or display mode.
+async fn get_sandbox_display(
+    State(state): State<GatewayState>,
+    AxumPath(id): AxumPath<String>,
+    _auth: AuthedRequest,
+) -> Response {
+    match display_is_supported(&state, &id).await {
+        Ok(supported) => success_response(DisplaySupportResponse {
+            sandbox_id: &id,
+            supported,
+            presets: if supported {
+                &WINDOWS_DISPLAY_PRESETS
+            } else {
+                &[]
+            },
+        }),
+        Err(e) => error_response(e),
+    }
+}
+
+/// Applies one validated preset through the fixed, operator-provided helper.
+/// No request field can alter the executable, helper path, flags, or timeout.
+async fn set_sandbox_display(
+    State(state): State<GatewayState>,
+    AxumPath(id): AxumPath<String>,
+    _auth: AuthedRequest,
+    Json(body): Json<SetDisplayBody>,
+) -> Response {
+    if !WINDOWS_DISPLAY_PRESETS.contains(&body.preset.as_str()) {
+        return error_response(LsbxError::Usage(format!(
+            "unsupported display preset '{}'; expected one of: {}",
+            body.preset,
+            WINDOWS_DISPLAY_PRESETS.join(", ")
+        )));
+    }
+
+    match display_is_supported(&state, &id).await {
+        Ok(true) => {}
+        Ok(false) => return display_not_supported_response(),
+        Err(e) => return error_response(e),
+    }
+
+    let Ok(_permit) = state.display_resize_gate.try_lock() else {
+        return error_response(LsbxError::LockContention(
+            "another display resize request is already in flight; retry after it completes"
+                .to_string(),
+        ));
+    };
+
+    let command_line = format!(
+        "powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {DISPLAY_HELPER_PATH} -Preset {}",
+        body.preset
+    );
+    let command = vec!["cmd".to_string(), "/c".to_string(), command_line];
+    match state.ops.exec(&id, &command, DISPLAY_APPLY_TIMEOUT).await {
+        Ok(output) if output.exit_code == 0 => success_response(SetDisplayResponse {
+            sandbox_id: &id,
+            preset: &body.preset,
+            applied: true,
+        }),
+        Ok(output) => error_response(LsbxError::ContractViolated(format!(
+            "Windows display helper failed for preset {} with exit code {}: {}",
+            body.preset,
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
         Err(e) => error_response(e),
     }
 }
@@ -987,7 +1205,7 @@ async fn console_for_sandbox(
 ///
 /// Bearer-authenticated like every other route: the escaping credential is the
 /// *ticket*, never the master token, which is why the browser keeps the master
-/// token in localStorage and exchanges it here instead of putting it in a URL.
+/// token in page memory and exchanges it here instead of putting it in a URL.
 ///
 /// The sandbox is resolved first, so a ticket is never minted for an id this
 /// gateway cannot see — an unknown id is a `404`, exactly like `GET
@@ -1083,4 +1301,62 @@ fn html_escape(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn moonlight_disabled() -> Response {
+    error_response(LsbxError::Usage(
+        "Moonlight media slots are disabled; configure the explicit tailnet bind, client and golden allowlist".to_string(),
+    ))
+}
+
+async fn moonlight_acquire(
+    State(state): State<GatewayState>,
+    AxumPath(id): AxumPath<String>,
+    _auth: AuthedRequest,
+) -> Response {
+    let Some(manager) = &state.moonlight else {
+        return moonlight_disabled();
+    };
+    match manager.acquire(&id).await {
+        Ok(status) => success_response(status),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn moonlight_status(
+    State(state): State<GatewayState>,
+    AxumPath(id): AxumPath<String>,
+    _auth: AuthedRequest,
+) -> Response {
+    let Some(manager) = &state.moonlight else {
+        return moonlight_disabled();
+    };
+    match manager.status(&id).await {
+        Ok(status) => success_response(status),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn moonlight_release(
+    State(state): State<GatewayState>,
+    AxumPath(id): AxumPath<String>,
+    _auth: AuthedRequest,
+) -> Response {
+    let Some(manager) = &state.moonlight else {
+        return moonlight_disabled();
+    };
+    match manager.release(&id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn moonlight_list(State(state): State<GatewayState>, _auth: AuthedRequest) -> Response {
+    let Some(manager) = &state.moonlight else {
+        return moonlight_disabled();
+    };
+    match manager.list().await {
+        Ok(statuses) => success_response(statuses),
+        Err(e) => error_response(e),
+    }
 }

@@ -59,8 +59,35 @@ for hosts without `lsbx` installed.
   broker ops, safety rails)
 - [`SPEC.md`](SPEC.md) → the authoritative spec pointer (root rewrite spec +
   the Win11 browser-desktop golden phase spec)
+- [Carnyx desktop rollout](docs/carnyx-desktop-runbook.md) → browser recovery, Linux resize canary, and Windows audio/streaming gates
 - [`CHANGELOG.md`](CHANGELOG.md) → what changed and when
 - Or jump straight to the command reference below.
+
+## Remote CLI over the gateway
+
+Point the client at the same gateway you use for the browser console. Set
+`LSBX_GATEWAY_TOKEN` in the environment from your secret manager (prefer that
+instead of passing credentials on the command line).
+
+```bash
+export LSBX_GATEWAY_URL=https://lsbx.lufshq.com
+lsbx status
+lsbx list --json
+lsbx up win11 --lease 30m
+lsbx console <id> --open
+lsbx moonlight <id>          # acquire an opt-in tailnet Moonlight media slot
+lsbx moonlight <id> --status # inspect active slot and tailnet port assignment
+lsbx down <id>
+```
+
+`--gateway <url>` is the flag form; don't combine it with `--backend`. Normal
+HTTPS certificate validation stays on. `--insecure` explicitly allows a
+plaintext gateway URL for local development only. Discovery and lifecycle run
+on the gateway, not through remote libvirt. `put`/`get` transfer bytes (up to
+2 MiB per upload and 32 MiB per download); larger artifacts need another approved
+transfer path. Remote clients don't need server-side local-file access. Golden
+mutations, service management, and the TUI remain local-only. Configure
+`LSBX_PUBLIC_BASE_URL` on Carnyx so published console links use the gateway.
 
 ## Building and verifying
 
@@ -128,7 +155,7 @@ persist straight back to the manifest the CLI loaded (see
 - Healthchecks execute under the guest's `cmd.exe` session (the transport
   reconstructs `cmd /c …` argv with cmd.exe quoting), not `sh -c`, so
   healthchecks like `echo lsbx-windows-ok` and
-  `curl -fsS http://127.0.0.1:8000/vnc.html -o NUL` work verbatim.
+  `powershell -NoProfile -File C:\lsbx\rfb-check.ps1` work verbatim.
 
 The verified Win11 desktop golden on Carnyx (`win11-desktop`, `os: windows`,
 `streaming: novnc`, aliased to profile `win11`) runs with 8 vCPUs, 32 GB RAM,
@@ -137,7 +164,7 @@ and 256 GB virtual disk, exposing its console as noVNC:
 ```bash
 LSBX_LIBVIRT_USER=lsbx lsbx golden verify win11-desktop
 LSBX_LIBVIRT_USER=lsbx lsbx up win11
-# → prints console_url: http://<guest-ip>:8000/vnc.html (VNC password `lsbx`)
+# With LSBX_PUBLIC_BASE_URL configured, the console URL uses the gateway.
 lsbx console <id>   # prints the active console URL
 ```
 
@@ -152,6 +179,58 @@ And reproducible builds from scripts support `--os windows`:
 ```bash
 lsbx golden build win11-desktop --from win11 --script scripts/provision-win11-golden.ps1 --flavor desktop --cpu 8 --memory 32GB --os windows --streaming novnc
 ```
+
+### Linux desktop golden recipe and resize canary
+
+`scripts/provision-linux-desktop-golden.sh` is the in-repo recipe for the XFCE
+`agent-web` stack. The legacy repository named by #58 was unavailable through the
+attached read-only integration when this recipe was added, so its provenance is
+stated precisely in the script: `compat-xvfb-websockify-v1` is reconstructed from
+the command/package excerpts archived in this repository, not claimed as an
+exact copy. The legacy repository remains read-only and was not modified.
+
+The default compatibility mode preserves the old fixed-resolution
+Xvfb → x11vnc → websockify shape. It exists for reproducibility, not as a new
+production recommendation: the current gateway relay expects **raw RFB** on guest
+`:8000`, while this compatibility stack exposes an HTTP/WebSocket bridge there.
+
+The #51 experiment is an explicit, versioned canary. It uses TigerVNC `Xvnc` as
+both the RANDR-capable X server and raw-RFB server; no manifest or profile opts
+into it by default:
+
+```bash
+# Inside an approved disposable Linux guest, stage an operator-chosen, exactly
+# eight-character password in a root-owned mode-0600 tmpfs file. Canary mode has
+# no password default.
+sudo env RFB_PRIVATE_CIDR=192.168.122.0/24 \
+  VNC_PASSWORD_FILE=/run/lsbx-vnc-password \
+  ./scripts/provision-linux-desktop-golden.sh --mode tigervnc-raw-rfb-v1
+sudo rm -f /run/lsbx-vnc-password
+
+# On Carnyx, using the guest's private address. The probe has no default and
+# prompts without echo; automation may use LSBX_VNC_PASSWORD instead.
+scripts/rfb-resize-canary.py --host <guest-private-ip> --port 8000 \
+  --width 1600 --height 900
+
+# Enable native resize for this browser session only:
+# /console?target=<id>&resize=remote
+```
+
+The canary resolves a boot-time address inside `RFB_PRIVATE_CIDR` and passes it
+to TigerVNC's `-interface`; it never intentionally listens on a wildcard. This
+selects the local interface but is **not a source ACL**: the operator must ensure
+the private bridge/firewall allows only the authorized gateway path.
+
+Do not replace the `agent-web` manifest entry until a fresh canary clone passes
+the raw-RFB banner check, `xrandr`, the RFB resize canary, XFCE reflow inspection,
+and fallback/reconnect testing. Provision/flatten into a new backing key. The
+encoded VNC credential is retained in that image, is reversible legacy VNC
+material, and is consequently shared by every clone; use a canary-only password,
+keep the image private, and rotate/re-bake before promotion. See the
+[runbook](docs/carnyx-desktop-runbook.md) for password and network handling. The
+script supports Ubuntu/Debian package names and an Arch path; it checks actual
+package/binary availability instead of silently downloading an unversioned VNC
+or websockify build.
 
 ### Working rules for desktop goldens (read before customizing one)
 
@@ -175,11 +254,9 @@ These come from real sessions on carnyx; each one cost debugging time.
 
 **Reaching the guest**
 
-- Console: `lsbx console <id>` prints the console URL; VNC password is `lsbx`. The
-  guest's own bridge listens on `:8000` (websockify → `127.0.0.1:5900`).
-- From another machine on the tailnet, a plain TCP forward is enough:
-  `socat TCP-LISTEN:8008,bind=<carnyx-tailnet-ip>,fork TCP:<guest-ip>:8000` then
-  browse `http://<carnyx-tailnet-ip>:8008/vnc.html`. (Proper doors are #52/#55.)
+- Console: `lsbx console <id>` prints the console URL. Use the gateway-hosted
+  page from a client; the Windows guest's private port `8000` speaks raw RFB,
+  not browser HTTP. A plain TCP forward to it doesn't serve noVNC.
 - Management is SSH as user `lsbx` with `~/.ssh/lsbx_guest_key`, which **lands in
   session 0**. Anything that needs the interactive desktop — display mode changes
   above all — cannot run from there; see
@@ -191,8 +268,8 @@ These come from real sessions on carnyx; each one cost debugging time.
 
 `scripts/rfb-desktopsize-probe.py` speaks RFB 3.8 to a guest's VNC port and prints
 whatever pseudo-rects the server sends — including `DesktopSize`, which is how a
-framebuffer change is detected. Tunnel `5900` first (`ssh -f -N -L
-15900:127.0.0.1:5900 …`) because VNC is loopback-only in every desktop golden.
+framebuffer change is detected. Run the probe on Carnyx against the private
+raw-RFB listener for the test guest; do not expose that port publicly.
 
 ### Services
 
@@ -216,15 +293,15 @@ Usage:
 
 1. `lsbx console <id>` prints the console URL (or open `/console` with no target
    for an index of running sandboxes).
-2. The page asks for your **gateway token** once; the browser keeps it in
-   `localStorage` and exchanges it for a 60-second, sandbox-scoped ticket.
+2. The page asks for your **gateway token**, keeps it only in that tab's memory,
+   and exchanges it for a 60-second, sandbox-scoped ticket.
 3. The WebSocket then carries `?t=<ticket>`, because a browser cannot set an
    `Authorization` header on a WS handshake. Tickets are HMAC-SHA256 over a key
    derived from the gateway token, scoped to one sandbox id, and never cached
    (`Cache-Control: no-store`). The master token never appears in a URL, a log,
    or the served page.
-4. The guest's own VNC password (`lsbx` on desktop goldens) is still required by
-   the RFB server — the ticket only authorises the relay.
+4. If the RFB server requires a guest VNC password, the page prompts for it
+   separately. The ticket only authorizes the relay.
 
 Why the assets live here rather than in Caddy: the noVNC client and the
 `/stream/*` protocol are one version contract, so vendoring keeps them pinned to

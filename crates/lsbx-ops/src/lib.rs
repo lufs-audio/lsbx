@@ -4,6 +4,10 @@
 //! unit's own contract (`create, destroy, list, exec, put, get, renew,
 //! console_url, info, status, reap, golden_build, golden_verify,
 //! golden_register, golden_delete, golden_list, config_show, logs_query`).
+//! A narrow `sandbox_uses_windows_novnc_golden` eligibility query is also
+//! exposed for the opt-in display-resize gateway: it keeps manifest/profile
+//! resolution inside this façade instead of making an HTTP door reach around
+//! `LsbxOps` into `ImageRegistry`.
 //! This crate is the waist of the architecture diagram in SPEC.md §3: every
 //! door built in Layer 6 (`lsbx-cli`, `lsbx-tui`, `lsbx-gateway`,
 //! `lsbx-stream`, `lsbx-mcp`) depends on this crate and *only* this crate —
@@ -70,6 +74,7 @@
 //! | `renew` | Delegates to `lsbx_lifecycle::create::renew(sandbox_store, clock, id, duration)`. |
 //! | `console_url` | **Implemented directly**: `SandboxStore::load(id)` mapped through `.public().console_url`. No lower-crate function exists. |
 //! | `info` | **Implemented directly**: `SandboxStore::load(id)` mapped through `.public()`. No `lsbx-lifecycle::info` exists. |
+//! | `sandbox_uses_windows_novnc_golden` | **Implemented directly**: loads the sandbox record, resolves its persisted profile through the current registry, and requires an exact golden `base`, `os == "windows"`, and both manifest/runtime `streaming == "novnc"`. This is an eligibility query only; it executes nothing. |
 //! | `status` | **Implemented directly**: probes `Backend::list_vms()` to determine `backend_available` (see the "reconciling `StatusReport`" note below for why there is no `Backend::name()`/`available()` to call), and reports `SandboxStore::list().len()` as `sandbox_count`. |
 //! | `reap` | Delegates to `lsbx_lifecycle::reap::reap(backend, sandbox_store, clock, &allowed_goldens, ttl, dry_run)`, where `allowed_goldens` comes from `ImageRegistry::allowed_goldens()`. |
 //! | `golden_build` | Delegates to `lsbx_golden::build::golden_build(backend, req, flattener)`. `flattener` is `None` (Unit 19 has not landed — see the "reconciling `golden_build`" note below); the real function's `Ok` type is `GoldenBuildOutcome { config, build_vm_tag }`, not a bare `GoldenConfig`. |
@@ -215,6 +220,13 @@ pub struct StatusReport {
     pub backend_name: String,
     pub backend_available: bool,
     pub sandbox_count: usize,
+}
+
+/// Live, lease-bound destination resolved for the gateway's narrow Moonlight door.
+pub struct ResolvedMoonlightSandbox {
+    pub vm_tag: String,
+    pub guest_ip: String,
+    pub lease_expires_at: String,
 }
 
 /// One manifest golden's reconciliation outcome against the backend's live
@@ -444,6 +456,89 @@ impl LsbxOps {
     pub async fn info(&self, id: &str) -> Result<PublicSandbox, LsbxError> {
         let record = self.sandbox_store.load(id)?;
         Ok(record.public())
+    }
+
+    /// Returns whether a persisted sandbox is eligible for the deliberately
+    /// narrow Windows display-resize path.
+    ///
+    /// `exact_backing_golden` is compared to the resolved manifest golden's
+    /// `base` field (the exact value passed to `Backend::create_from_golden`),
+    /// not to a profile name, flavor, prefix, or OS-only wildcard. The sandbox
+    /// must additionally resolve to `os == "windows"`, declare noVNC in the
+    /// manifest, and have persisted `streaming == "novnc"` at runtime.
+    ///
+    /// This method only answers eligibility. It never constructs or runs a
+    /// guest command; the gateway's display endpoint owns its one fixed helper
+    /// invocation after validating a preset.
+    pub async fn sandbox_uses_windows_novnc_golden(
+        &self,
+        id: &str,
+        exact_backing_golden: &str,
+    ) -> Result<bool, LsbxError> {
+        let record = self.sandbox_store.load(id)?;
+        let registry = self.registry.read().await;
+        let golden = registry.resolve_golden(&record.profile)?;
+        Ok(golden.base == exact_backing_golden
+            && golden.os == "windows"
+            && golden.streaming == lsbx_golden::registry::StreamingMode::Novnc
+            && record.streaming == "novnc")
+    }
+
+    /// Resolves only a live libvirt sandbox on the exact configured Windows/noVNC
+    /// backing golden. The destination always comes from its stored record; no
+    /// caller-provided guest address or port is accepted.
+    pub async fn resolve_moonlight_sandbox(
+        &self,
+        id: &str,
+        exact_backing_golden: &str,
+    ) -> Result<ResolvedMoonlightSandbox, LsbxError> {
+        if self.backend_name != "libvirt" {
+            return Err(LsbxError::Usage(
+                "Moonlight media slots are supported only by the libvirt backend".to_string(),
+            ));
+        }
+        let record = self.sandbox_store.load(id)?;
+        let lease = record.lease_expires_at.clone().ok_or_else(|| {
+            LsbxError::ContractViolated(format!("sandbox {id} has no stored lease"))
+        })?;
+        let expires = chrono::DateTime::parse_from_rfc3339(&lease).map_err(|e| {
+            LsbxError::ContractViolated(format!("sandbox {id} has an invalid stored lease: {e}"))
+        })?;
+        if expires <= chrono::Utc::now() {
+            return Err(LsbxError::NotFound(format!(
+                "sandbox {id} lease has expired"
+            )));
+        }
+        let vm_tag = record.vm_tag.as_deref().ok_or_else(|| {
+            LsbxError::NotFound(format!("sandbox {id} has no stored libvirt domain id"))
+        })?;
+        if !self
+            .backend
+            .list_vms()
+            .await?
+            .iter()
+            .any(|live| live == vm_tag)
+        {
+            return Err(LsbxError::NotFound(format!(
+                "sandbox {id} libvirt domain is not live"
+            )));
+        }
+        let registry = self.registry.read().await;
+        let golden = registry.resolve_golden(&record.profile)?;
+        if golden.base != exact_backing_golden
+            || golden.os != "windows"
+            || golden.streaming != lsbx_golden::registry::StreamingMode::Novnc
+            || record.streaming != "novnc"
+        {
+            return Err(LsbxError::Usage(format!(
+                "sandbox {id} is not on the exact configured Windows/noVNC golden"
+            )));
+        }
+        Ok(ResolvedMoonlightSandbox {
+            vm_tag: vm_tag.to_string(),
+            guest_ip: record.host,
+            lease_expires_at: lease,
+        })
     }
 
     /// **Implemented directly** — no lower-crate function exists.

@@ -22,9 +22,14 @@
            font-size: 13px; flex: 0 0 auto; }
   header .id { opacity: .75; font-family: ui-monospace, monospace; }
   header .right { display: flex; gap: 10px; align-items: center; }
-  button { background: #1f2937; color: #e8eef5; border: 1px solid #334155;
-           border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
-  button:hover { background: #273449; }
+  button, select { background: #1f2937; color: #e8eef5; border: 1px solid #334155;
+           border-radius: 6px; padding: 4px 10px; font-size: 12px; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { background: #273449; }
+  button:disabled, select:disabled { opacity: .55; cursor: default; }
+  #display-controls { display: inline-flex; gap: 6px; align-items: center; }
+  #display-note { max-width: 24rem; overflow: hidden; text-overflow: ellipsis;
+                  white-space: nowrap; }
   #screen { flex: 1 1 auto; background: #000; position: relative; overflow: hidden; }
   #screen canvas { display: block; }
   #status { position: absolute; inset: 0; display: flex; align-items: center;
@@ -45,6 +50,13 @@
     <span>lsbx console · <span class="id">%SANDBOX_ID%</span></span>
     <span class="right">
       <span id="state" class="hint">connecting…</span>
+      <span id="display-note" class="hint" aria-live="polite"></span>
+      <span id="display-controls" hidden>
+        <select id="display-preset" aria-label="Windows display resolution">
+          <option value="">resolution…</option>
+        </select>
+        <button id="display-apply" disabled>apply</button>
+      </span>
       <button id="reconnect" hidden>reconnect</button>
       <button id="scale" title="Toggle fit-to-window scaling">fit: on</button>
     </span>
@@ -52,13 +64,21 @@
   <div id="screen">
     <div id="status"><div class="box">
       <div id="status-text">Loading noVNC…</div>
-      <div id="token-form" hidden>
-        <p class="hint">This console needs your lsbx gateway token. It is kept in
-          this browser's localStorage and exchanged for a short-lived,
-          sandbox-scoped ticket — the master token never goes in a URL.</p>
+      <form id="token-form" hidden>
+        <p class="hint">This console needs your lsbx gateway token. It is kept
+          only in this page's memory and exchanged for a short-lived,
+          sandbox-scoped ticket — the master token is never persisted or put in
+          a URL.</p>
         <input id="token-input" type="password" placeholder="gateway token" autocomplete="off">
-        <button id="token-save">connect</button>
-      </div>
+        <button type="submit">connect</button>
+      </form>
+      <form id="credential-form" hidden>
+        <p class="hint">The guest VNC server requires its own password. This is
+          separate from the gateway token and is kept only long enough to send
+          it to the current RFB connection.</p>
+        <input id="vnc-password" type="password" placeholder="VNC password" autocomplete="off">
+        <button type="submit">authenticate</button>
+      </form>
     </div></div>
   </div>
 </div>
@@ -68,8 +88,8 @@ import RFB from '/assets/novnc/core/rfb.js';
 
 const SANDBOX_ID = '%SANDBOX_ID%';
 const RESIZE_MODE = '%RESIZE_MODE%';   // "scale" | "remote"
-const TOKEN_KEY = 'lsbx_gateway_token';
 const TOKEN_ENDPOINT = '/consoles/' + encodeURIComponent(SANDBOX_ID) + '/token';
+const DISPLAY_ENDPOINT = '/sandboxes/' + encodeURIComponent(SANDBOX_ID) + '/display';
 const WS_PATH = 'stream/' + encodeURIComponent(SANDBOX_ID) + '/vnc';
 
 const elScreen = document.getElementById('screen');
@@ -79,30 +99,87 @@ const elState = document.getElementById('state');
 const elReconnect = document.getElementById('reconnect');
 const elTokenForm = document.getElementById('token-form');
 const elTokenInput = document.getElementById('token-input');
-const elTokenSave = document.getElementById('token-save');
+const elCredentialForm = document.getElementById('credential-form');
+const elVncPassword = document.getElementById('vnc-password');
 const elScale = document.getElementById('scale');
+const elDisplayControls = document.getElementById('display-controls');
+const elDisplayPreset = document.getElementById('display-preset');
+const elDisplayApply = document.getElementById('display-apply');
+const elDisplayNote = document.getElementById('display-note');
+
+const TICKET_TIMEOUT_MS = 10000;
+const CONNECT_TIMEOUT_MS = 15000;
+const DISPLAY_TIMEOUT_MS = 50000;
 
 let rfb = null;
+let masterToken = null;
+let credentialTarget = null;
+let ticketAbort = null;
+let connectTimer = null;
+let displayAbort = null;
+let displayRequestInFlight = false;
+let attempt = 0;
 let scaleToWindow = true;
 
-function showStatus(html, isError) {
+function showStatus(message, isError = false) {
   elStatus.classList.remove('hidden');
-  elStatusText.innerHTML = html;
+  // Status text can include network error text. Use textContent so neither a
+  // response nor a guest-controlled value can become markup in this page.
+  elStatusText.textContent = message;
   elStatusText.className = isError ? 'err' : '';
 }
 function hideStatus() { elStatus.classList.add('hidden'); }
-
+function hideForms() {
+  elTokenForm.hidden = true;
+  elCredentialForm.hidden = true;
+}
 function setState(text) { elState.textContent = text; }
+function clearConnectTimer() {
+  if (connectTimer !== null) window.clearTimeout(connectTimer);
+  connectTimer = null;
+}
+function armConnectTimer(client, thisAttempt) {
+  clearConnectTimer();
+  connectTimer = window.setTimeout(() => {
+    if (rfb !== client || thisAttempt !== attempt) return;
+    disconnectCurrent();
+    setState('disconnected');
+    elReconnect.hidden = false;
+    showStatus('The desktop did not respond in time. You can reconnect.', true);
+  }, CONNECT_TIMEOUT_MS);
+}
 
-// The gateway mints a single-use-ish ticket scoped to this sandbox; the WS
+// Tear down the old noVNC object before any reconnect. Merely replacing the
+// variable leaves its WebSocket alive and can strand the guest-side bridge in
+// CLOSE_WAIT (#53). Event handlers below ignore stale objects as a second guard.
+function disconnectCurrent() {
+  clearConnectTimer();
+  cancelDisplayRequest();
+  hideDisplayControls();
+  credentialTarget = null;
+  const previous = rfb;
+  rfb = null;
+  if (previous) {
+    try { previous.disconnect(); } catch (_) { /* already closed */ }
+  }
+}
+
+function cancelTicketRequest() {
+  if (ticketAbort) ticketAbort.abort();
+  ticketAbort = null;
+}
+
+// The gateway mints a short-lived ticket scoped to this sandbox; the WS
 // handshake cannot carry an Authorization header, which is exactly why the
 // ticket exists (canonical-url spec D7).
-async function mintTicket(masterToken) {
+async function mintTicket(token, signal) {
   const res = await fetch(TOKEN_ENDPOINT, {
     method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + masterToken },
+    headers: { 'Authorization': 'Bearer ' + token },
+    cache: 'no-store',
+    signal,
   });
-  if (res.status === 401) throw new Error('token rejected');
+  if (res.status === 401) throw new Error('gateway token rejected');
   if (!res.ok) throw new Error('ticket endpoint returned HTTP ' + res.status);
   const body = await res.json();
   const ticket = (body.data && body.data.t) || body.t;
@@ -116,72 +193,266 @@ function wsUrl(ticket) {
 }
 
 function applyScale() {
-  if (!rfb) return;
-  rfb.scaleViewport = scaleToWindow;
-  rfb.clipViewport = false;
+  if (rfb) {
+    rfb.scaleViewport = scaleToWindow;
+    rfb.clipViewport = false;
+  }
   elScale.textContent = 'fit: ' + (scaleToWindow ? 'on' : 'off');
 }
 
-function connectWith(ticket) {
+function cancelDisplayRequest() {
+  if (displayAbort) displayAbort.abort();
+  displayAbort = null;
+  displayRequestInFlight = false;
+}
+
+function hideDisplayControls() {
+  elDisplayControls.hidden = true;
+  elDisplayPreset.disabled = false;
+  elDisplayApply.disabled = true;
+  elDisplayNote.textContent = '';
+}
+
+function setDisplayBusy(busy) {
+  displayRequestInFlight = busy;
+  elDisplayPreset.disabled = busy;
+  elDisplayApply.disabled = busy || !elDisplayPreset.value;
+}
+
+// Capability discovery is authenticated but read-only. It only decides whether
+// to show a fixed preset dropdown; opening or resizing the browser never changes
+// the guest display automatically.
+async function discoverDisplayControls(client, thisAttempt) {
+  if (!masterToken || rfb !== client || thisAttempt !== attempt) return;
+  try {
+    const res = await fetch(DISPLAY_ENDPOINT, {
+      headers: { 'Authorization': 'Bearer ' + masterToken },
+      cache: 'no-store',
+    });
+    if (rfb !== client || thisAttempt !== attempt) return;
+    if (!res.ok) return;
+    const body = await res.json();
+    const data = body.data || body;
+    if (!data.supported || !Array.isArray(data.presets) || data.presets.length === 0) return;
+
+    elDisplayPreset.replaceChildren(new Option('resolution…', ''));
+    for (const preset of data.presets) {
+      if (typeof preset !== 'string') continue;
+      elDisplayPreset.appendChild(new Option(preset.replace('x', ' × '), preset));
+    }
+    elDisplayControls.hidden = false;
+    elDisplayApply.disabled = true;
+  } catch (_) {
+    // Optional control discovery must never interrupt an otherwise healthy
+    // recovery console. Fixed fit-to-window scaling remains enabled.
+  }
+}
+
+async function applyDisplayPreset() {
+  const preset = elDisplayPreset.value;
+  const client = rfb;
+  const thisAttempt = attempt;
+  if (!preset || !masterToken || !client || displayRequestInFlight) return;
+
+  const controller = new AbortController();
+  displayAbort = controller;
+  setDisplayBusy(true);
+  elDisplayNote.textContent = 'applying ' + preset.replace('x', ' × ') + '…';
+  const timeout = window.setTimeout(() => controller.abort(), DISPLAY_TIMEOUT_MS);
+  try {
+    const res = await fetch(DISPLAY_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + masterToken,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ preset }),
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (rfb !== client || thisAttempt !== attempt) return;
+    if (!res.ok) {
+      throw new Error('display endpoint returned HTTP ' + res.status);
+    }
+    elDisplayNote.textContent = preset.replace('x', ' × ') + ' applied';
+  } catch (err) {
+    if (rfb !== client || thisAttempt !== attempt) return;
+    scaleToWindow = true;
+    applyScale();
+    elDisplayNote.textContent = err && err.name === 'AbortError'
+      ? 'display change timed out; fit remains on'
+      : 'display change failed; fit remains on';
+  } finally {
+    window.clearTimeout(timeout);
+    if (displayAbort === controller) displayAbort = null;
+    if (rfb === client && thisAttempt === attempt) setDisplayBusy(false);
+  }
+}
+
+function connectWith(ticket, thisAttempt) {
+  if (thisAttempt !== attempt) return;
+
   setState('connecting…');
   showStatus('Connecting to the desktop…');
-  rfb = new RFB(elScreen, wsUrl(ticket), { shared: true, wsProtocols: ['binary'] });
+  hideForms();
+
+  let client;
+  let securityFailed = false;
+  try {
+    client = new RFB(elScreen, wsUrl(ticket), { shared: true, wsProtocols: ['binary'] });
+  } catch (err) {
+    setState('disconnected');
+    elReconnect.hidden = false;
+    showStatus('Could not start the desktop connection: ' + String(err), true);
+    return;
+  }
+  rfb = client;
+
   // `scale` keeps the fixed guest framebuffer usable today; `remote` asks the
   // server to resize (needs a server that supports it — see #56).
-  rfb.resizeSession = RESIZE_MODE === 'remote';
+  client.resizeSession = RESIZE_MODE === 'remote';
   applyScale();
+  armConnectTimer(client, thisAttempt);
 
-  rfb.addEventListener('connect', () => {
+  client.addEventListener('connect', () => {
+    if (rfb !== client || thisAttempt !== attempt) return;
+    clearConnectTimer();
+    hideForms();
     hideStatus();
     setState('connected');
     elReconnect.hidden = true;
+    discoverDisplayControls(client, thisAttempt);
   });
-  rfb.addEventListener('disconnect', (e) => {
+  client.addEventListener('disconnect', (event) => {
+    if (rfb !== client || thisAttempt !== attempt) return;
+    clearConnectTimer();
+    rfb = null;
+    credentialTarget = null;
+    cancelDisplayRequest();
+    hideDisplayControls();
+    hideForms();
     setState('disconnected');
     elReconnect.hidden = false;
-    showStatus('Disconnected' + (e.detail && e.detail.clean ? '' : ' unexpectedly') + '.',
-               !(e.detail && e.detail.clean));
-    rfb = null;
+    const clean = Boolean(event.detail && event.detail.clean);
+    if (securityFailed) {
+      showStatus('The VNC server rejected those credentials. Reconnect to try again.', true);
+    } else {
+      showStatus('Disconnected' + (clean ? '.' : ' unexpectedly.'), !clean);
+    }
   });
-  rfb.addEventListener('credentialsrequired', () => {
-    // Desktop goldens use the shared 'lsbx' VNC password; it is not a secret
-    // worth a prompt (the guest is disposable and the tunnel is authenticated).
-    rfb.sendCredentials({ password: 'lsbx' });
+  client.addEventListener('credentialsrequired', () => {
+    if (rfb !== client || thisAttempt !== attempt) return;
+    // A human-entered password has no meaningful network timeout. Pause the
+    // connection watchdog while the prompt is open, then re-arm after submit.
+    clearConnectTimer();
+    credentialTarget = client;
+    elTokenForm.hidden = true;
+    elCredentialForm.hidden = false;
+    showStatus('VNC authentication required.');
+    elVncPassword.focus();
   });
-  rfb.addEventListener('desktopname', () => { /* keep the sandbox id in the header */ });
+  client.addEventListener('securityfailure', () => {
+    if (rfb !== client || thisAttempt !== attempt) return;
+    securityFailed = true;
+    credentialTarget = null;
+    elCredentialForm.hidden = true;
+    showStatus('The VNC server rejected those credentials. Reconnect to try again.', true);
+  });
+  client.addEventListener('desktopname', () => { /* keep the sandbox id in the header */ });
 }
 
-elScale.addEventListener('click', () => { scaleToWindow = !scaleToWindow; applyScale(); });
+elScale.addEventListener('click', () => {
+  scaleToWindow = !scaleToWindow;
+  applyScale();
+});
+elDisplayPreset.addEventListener('change', () => {
+  elDisplayApply.disabled = displayRequestInFlight || !elDisplayPreset.value;
+});
+elDisplayApply.addEventListener('click', () => applyDisplayPreset());
 elReconnect.addEventListener('click', () => start());
-elTokenSave.addEventListener('click', () => {
+elTokenForm.addEventListener('submit', (event) => {
+  event.preventDefault();
   const value = elTokenInput.value.trim();
+  elTokenInput.value = '';
   if (!value) return;
-  localStorage.setItem(TOKEN_KEY, value);
-  elTokenForm.hidden = true;
+  masterToken = value;
   start();
+});
+elCredentialForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const password = elVncPassword.value;
+  elVncPassword.value = '';
+  const target = credentialTarget;
+  credentialTarget = null;
+  if (!password || !target || target !== rfb) return;
+  elCredentialForm.hidden = true;
+  showStatus('Authenticating with the VNC server…');
+  try {
+    target.sendCredentials({ password });
+    armConnectTimer(target, attempt);
+  } catch (err) {
+    elCredentialForm.hidden = false;
+    showStatus('Could not send VNC credentials: ' + String(err), true);
+  }
 });
 
 async function start() {
+  const thisAttempt = ++attempt;
+  cancelTicketRequest();
+  disconnectCurrent();
+  hideForms();
   elReconnect.hidden = true;
-  const master = localStorage.getItem(TOKEN_KEY);
-  if (!master) {
-    showStatus('Authentication required.', false);
+
+  if (!masterToken) {
+    setState('authentication required');
+    showStatus('Gateway authentication required.');
     elTokenForm.hidden = false;
     elTokenInput.focus();
     return;
   }
+
+  setState('authorizing…');
+  showStatus('Authorizing this console…');
+  const controller = new AbortController();
+  ticketAbort = controller;
+  const timeout = window.setTimeout(() => controller.abort(), TICKET_TIMEOUT_MS);
   try {
-    const ticket = await mintTicket(master);
-    connectWith(ticket);
+    const ticket = await mintTicket(masterToken, controller.signal);
+    if (thisAttempt !== attempt) return;
+    ticketAbort = null;
+    connectWith(ticket, thisAttempt);
   } catch (err) {
-    if (String(err.message).includes('token rejected')) {
-      localStorage.removeItem(TOKEN_KEY);
+    if (thisAttempt !== attempt) return;
+    ticketAbort = null;
+    setState('disconnected');
+    elReconnect.hidden = false;
+    if (String(err && err.message).includes('gateway token rejected')) {
+      masterToken = null;
+      showStatus('The gateway token was rejected.', true);
+      elTokenForm.hidden = false;
+      elTokenInput.focus();
+    } else if (err && err.name === 'AbortError') {
+      showStatus('Gateway authentication timed out. You can reconnect.', true);
+    } else {
+      showStatus('Could not authenticate with the gateway: ' + String(err), true);
     }
-    showStatus('Could not authenticate: ' + err.message, true);
-    elTokenForm.hidden = false;
+  } finally {
+    window.clearTimeout(timeout);
   }
 }
 
+// Browser navigation and tab closure should actively release both sides of the
+// relay rather than waiting for TCP keepalive to discover an abandoned client.
+window.addEventListener('pagehide', () => {
+  ++attempt;
+  cancelTicketRequest();
+  disconnectCurrent();
+  masterToken = null;
+  elVncPassword.value = '';
+  elTokenInput.value = '';
+});
+
+applyScale();
 start();
 </script>
 </body>

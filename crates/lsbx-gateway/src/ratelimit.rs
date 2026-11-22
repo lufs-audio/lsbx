@@ -85,14 +85,19 @@ impl TokenBucket {
         let refill_per_sec = f64::from(self.config.requests_per_minute) / 60.0;
         let capacity = f64::from(self.config.burst.max(1));
 
-        #[allow(clippy::unwrap_used)] // Poisoning would mean an earlier panic inside this same lock; there is no meaningful recovery for a rate limiter beyond surfacing that panic, and this crate's own workspace lints already warn (not deny) unwrap_used for exactly this class of "a poisoned lock is itself the bug report" situation.
+        #[allow(clippy::unwrap_used)]
+        // Poisoning would mean an earlier panic inside this same lock; there is no meaningful recovery for a rate limiter beyond surfacing that panic, and this crate's own workspace lints already warn (not deny) unwrap_used for exactly this class of "a poisoned lock is itself the bug report" situation.
         let mut buckets = self.buckets.lock().unwrap();
-        let state = buckets.entry(key.to_string()).or_insert_with(|| BucketState {
-            tokens: capacity,
-            last_refill: now,
-        });
+        let state = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| BucketState {
+                tokens: capacity,
+                last_refill: now,
+            });
 
-        let elapsed = now.saturating_duration_since(state.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(state.last_refill)
+            .as_secs_f64();
         state.tokens = (state.tokens + elapsed * refill_per_sec).min(capacity);
         state.last_refill = now;
 
@@ -173,7 +178,10 @@ mod tests {
             burst: 1,
         });
         assert_eq!(bucket.check("key-f"), RateLimitDecision::Allow);
-        assert!(matches!(bucket.check("key-f"), RateLimitDecision::Deny { .. }));
+        assert!(matches!(
+            bucket.check("key-f"),
+            RateLimitDecision::Deny { .. }
+        ));
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(bucket.check("key-f"), RateLimitDecision::Allow);
     }

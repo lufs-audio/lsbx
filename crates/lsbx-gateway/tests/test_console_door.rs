@@ -15,7 +15,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use lsbx_backend_demo::DemoBackend;
-use lsbx_gateway::{GatewayDeps, GatewayConfig};
+use lsbx_gateway::{GatewayConfig, GatewayDeps};
 use lsbx_golden::registry::ImageRegistry;
 use lsbx_kernel::clock::SystemClock;
 use lsbx_ops::LsbxOps;
@@ -47,6 +47,7 @@ fn build_router(state_dir: &std::path::Path) -> Router {
         allow_local_files: false,
         insecure: false,
         max_sandboxes: 8,
+        windows_display_resize_golden: None,
         rate_limit: lsbx_gateway::RateLimitConfig {
             requests_per_minute: 6000,
             burst: 1000,
@@ -105,14 +106,38 @@ async fn console_page_loads_assets_from_its_own_origin_and_names_no_guest_ip() {
         "the console page must never mention a guest-private address — that was the \
          dead-iframe bug (#55). Got:\n{html}"
     );
-    assert!(!html.contains(TOKEN), "the master token must not reach the page");
     assert!(
-        html.contains(&format!("stream/{id}/vnc")) || html.contains("stream/' + encodeURIComponent"),
+        !html.contains(TOKEN),
+        "the master token must not reach the page"
+    );
+    assert!(
+        html.contains(&format!("stream/{id}/vnc"))
+            || html.contains("stream/' + encodeURIComponent"),
         "the page must open the gateway's stream route for this sandbox"
     );
     assert!(
         html.contains("/assets/novnc/core/rfb.js"),
         "the page must load the vendored noVNC client from its own origin"
+    );
+    assert!(
+        html.contains("id=\"display-preset\"") && html.contains("id=\"display-apply\""),
+        "eligible guests must be controlled through an explicit preset dropdown and apply button"
+    );
+    assert!(
+        !html.contains("addEventListener('resize'"),
+        "the console must not automatically change the guest when the browser window changes"
+    );
+    assert!(
+        html.contains("id=\"vnc-password\"") && html.contains("credentialsrequired"),
+        "the page must explicitly prompt when the guest requests VNC credentials"
+    );
+    assert!(
+        !html.contains("password: 'lsbx'") && !html.contains("password: \"lsbx\""),
+        "a guest credential must never be hardcoded into the browser bundle"
+    );
+    assert!(
+        !html.contains("localStorage") && html.contains("previous.disconnect()"),
+        "credentials must stay in memory and reconnect must tear down the prior RFB object"
     );
 }
 
@@ -219,9 +244,15 @@ async fn console_ticket_grants_the_stream_upgrade_without_an_auth_header() {
         .await
         .expect("body");
     let minted_json: serde_json::Value = serde_json::from_slice(&minted_body).expect("json");
-    let ticket = minted_json["data"]["t"].as_str().expect("ticket").to_string();
+    let ticket = minted_json["data"]["t"]
+        .as_str()
+        .expect("ticket")
+        .to_string();
     assert!(!ticket.is_empty());
-    assert!(!ticket.contains(TOKEN), "ticket must not embed the master token");
+    assert!(
+        !ticket.contains(TOKEN),
+        "ticket must not embed the master token"
+    );
 
     // 3. A forged ticket is refused at the upgrade, not relayed.
     let forged = router

@@ -81,10 +81,11 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use lsbx_kernel::error::LsbxError;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -95,6 +96,24 @@ use tokio::net::TcpStream;
 /// reopen exactly the "arbitrary host:port reachable through the proxy"
 /// hole this unit's own acceptance criteria requires closing.
 const GUEST_VNC_PORT: u16 = 8000;
+
+/// A WebSocket upgrade must not turn into an indefinitely connecting relay when
+/// a sandbox record points at a guest that is powered off or filtered. The
+/// browser has its own bounded reconnect UI, so fail this attempt promptly and
+/// let the user request a fresh ticket/connection instead.
+const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// WebSocket ping cadence and the maximum time the relay will tolerate without
+/// receiving any client frame (including the browser's automatic Pong). This
+/// catches silent network loss where neither EOF nor a WebSocket Close frame is
+/// delivered; relying on kernel TCP keepalive alone can leave the guest socket
+/// half-open for hours.
+const CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const CLIENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// A peer that stops reading must not block the relay loop forever and prevent
+/// its heartbeat/cleanup path from running.
+const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maps an `LsbxError` onto an HTTP response for this crate's handlers.
 ///
@@ -219,9 +238,14 @@ pub async fn stream_handler(
     // resolve.
     let guest_addr = resolve_destination(&store, &sandbox_id)?;
 
-    Ok(ws.on_upgrade(move |socket| async move {
-        let _ = relay(socket, guest_addr).await;
-    }))
+    // noVNC offers `binary`; browsers reject an upgrade that omits the
+    // selected protocol when one was requested. Client requests without
+    // a subprotocol remain supported.
+    Ok(ws
+        .protocols(["binary"])
+        .on_upgrade(move |socket| async move {
+            let _ = relay(socket, guest_addr).await;
+        }))
 }
 
 /// The actual axum route target `router()` registers for
@@ -243,92 +267,143 @@ pub async fn stream_route_handler(
 /// Bidirectionally relays bytes between `ws` and a fresh `TcpStream`
 /// connected to `guest_addr`.
 ///
-/// Kept close to the original draft's `tokio::select!` structure (sound
-/// logic, worth preserving): two concurrent futures, one per direction,
-/// racing via `select!` so whichever direction closes or errors first ends
-/// the whole relay — this is what "correctly propagates connection close
-/// in both directions... with no half-open connection leak" (this unit's
-/// acceptance criteria) actually means in practice: neither half of the
-/// connection is left dangling once the other half has gone away, because
-/// both `TcpStream` halves and the `WebSocket` are all dropped together
-/// when this function returns.
-///
-/// The one real fix from the original draft: a `TcpStream::connect`
-/// failure now maps to `LsbxError::BackendUnavailable` (the guest is
-/// unreachable) rather than a nonexistent `LsbxError::InternalError` — see
-/// this module's doc comment, point 2.
-async fn relay(ws: WebSocket, guest_addr: SocketAddr) -> Result<(), LsbxError> {
-    let tcp_stream = TcpStream::connect(guest_addr).await.map_err(|e| {
-        LsbxError::BackendUnavailable(format!(
-            "failed to connect to guest at {guest_addr}: {e}"
-        ))
-    })?;
+/// One event loop owns both sockets so it can also send WebSocket Ping frames
+/// and observe Pong/other client activity. EOF and explicit Close frames still
+/// tear down immediately; a silently vanished browser is reaped after
+/// [`CLIENT_HEARTBEAT_TIMEOUT`] instead of waiting for the host's much longer
+/// TCP keepalive defaults. Every write is bounded too, because a send blocked on
+/// a peer that stopped reading would otherwise prevent the heartbeat branch
+/// from running.
+async fn relay(mut ws: WebSocket, guest_addr: SocketAddr) -> Result<(), LsbxError> {
+    let mut tcp_stream =
+        tokio::time::timeout(GUEST_CONNECT_TIMEOUT, TcpStream::connect(guest_addr))
+            .await
+            .map_err(|_| {
+                LsbxError::BackendUnavailable(format!(
+                    "timed out connecting to guest at {guest_addr}"
+                ))
+            })?
+            .map_err(|e| {
+                LsbxError::BackendUnavailable(format!(
+                    "failed to connect to guest at {guest_addr}: {e}"
+                ))
+            })?;
 
-    let (mut ws_sender, mut ws_receiver) = ws.split();
-    let (mut tcp_reader, mut tcp_writer) = tcp_stream.into_split();
+    let mut buf = vec![0u8; 8192];
+    let mut last_client_activity = tokio::time::Instant::now();
+    let first_heartbeat = last_client_activity + CLIENT_HEARTBEAT_INTERVAL;
+    let mut heartbeat = tokio::time::interval_at(first_heartbeat, CLIENT_HEARTBEAT_INTERVAL);
 
-    let ws_to_tcp = async {
-        while let Some(msg_result) = ws_receiver.next().await {
-            match msg_result {
-                Ok(Message::Binary(data)) => {
-                    if tcp_writer.write_all(&data).await.is_err() {
+    loop {
+        tokio::select! {
+            message = ws.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                let Ok(message) = message else {
+                    break;
+                };
+                last_client_activity = tokio::time::Instant::now();
+
+                match message {
+                    Message::Binary(data) => {
+                        if timed_tcp_write(&mut tcp_stream, &data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Text(data) => {
+                        if timed_tcp_write(&mut tcp_stream, data.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        if !timed_ws_send(&mut ws, Message::Pong(payload)).await {
+                            break;
+                        }
+                    }
+                    Message::Pong(_) => {}
+                    Message::Close(_) => {
+                        let _ = timed_ws_send(&mut ws, Message::Close(None)).await;
                         break;
                     }
                 }
-                Ok(Message::Text(data)) => {
-                    if tcp_writer.write_all(data.as_bytes()).await.is_err() {
-                        break;
-                    }
-                }
-                // Client-closes-first: the client sent an explicit Close
-                // frame. Stop reading from the WS side; the tcp_to_ws
-                // future (still running concurrently below) will observe
-                // whatever the guest does next on its own.
-                Ok(Message::Close(_)) => break,
-                Err(_) => break,
-                _ => continue,
             }
-        }
-        // Shut down the write half so the guest observes EOF on its read
-        // side promptly, rather than only when the whole TcpStream is
-        // eventually dropped at function return.
-        let _ = tcp_writer.shutdown().await;
-    };
-
-    let tcp_to_ws = async {
-        let mut buf = vec![0u8; 8192];
-        loop {
-            match tcp_reader.read(&mut buf).await {
-                // Guest-closes-first: a 0-byte read is TCP EOF from the
-                // guest side. Stop relaying tcp->ws; send a Close frame so
-                // the client's WebSocket sees a clean close rather than an
-                // abrupt disconnect.
-                Ok(0) => {
-                    let _ = ws_sender.send(Message::Close(None)).await;
+            read_result = tcp_stream.read(&mut buf) => {
+                match read_result {
+                    Ok(0) => {
+                        let _ = timed_ws_send(&mut ws, Message::Close(None)).await;
+                        break;
+                    }
+                    Ok(n) => {
+                        if !timed_ws_send(
+                            &mut ws,
+                            Message::Binary(buf[..n].to_vec().into()),
+                        ).await {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = timed_ws_send(&mut ws, Message::Close(None)).await;
+                        break;
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                if client_heartbeat_expired(last_client_activity, tokio::time::Instant::now()) {
+                    let _ = timed_ws_send(&mut ws, Message::Close(None)).await;
                     break;
                 }
-                Ok(n) => {
-                    if ws_sender.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
-                        break;
-                    }
+                if !timed_ws_send(&mut ws, Message::Ping(b"lsbx".to_vec().into())).await {
+                    break;
                 }
-                Err(_) => break,
             }
         }
-    };
-
-    // Run both directions concurrently. Whichever one finishes first (due
-    // to a close or an error) ends the relay for both — this is the
-    // "no half-open connection leak" guarantee: once select! returns, this
-    // function returns, and every handle it owns (the TcpStream halves via
-    // `tcp_reader`/`tcp_writer`, the WebSocket halves via `ws_sender`/
-    // `ws_receiver`) is dropped, actually closing both sides of the
-    // relayed connection rather than leaving one half open indefinitely
-    // waiting on a peer that already went away.
-    tokio::select! {
-        _ = ws_to_tcp => {}
-        _ = tcp_to_ws => {}
     }
 
+    // Make the guest observe EOF promptly in every exit path, including a
+    // heartbeat timeout where the browser-side TCP connection never closed.
+    let _ = tcp_stream.shutdown().await;
     Ok(())
+}
+
+async fn timed_tcp_write(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
+    match tokio::time::timeout(RELAY_WRITE_TIMEOUT, stream.write_all(data)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "guest write timed out",
+        )),
+    }
+}
+
+async fn timed_ws_send(ws: &mut WebSocket, message: Message) -> bool {
+    matches!(
+        tokio::time::timeout(RELAY_WRITE_TIMEOUT, ws.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
+fn client_heartbeat_expired(
+    last_activity: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> bool {
+    now.saturating_duration_since(last_activity) >= CLIENT_HEARTBEAT_TIMEOUT
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_only_expires_after_the_full_silence_window() {
+        let start = tokio::time::Instant::now();
+        assert!(!client_heartbeat_expired(
+            start,
+            start + CLIENT_HEARTBEAT_TIMEOUT - Duration::from_millis(1),
+        ));
+        assert!(client_heartbeat_expired(
+            start,
+            start + CLIENT_HEARTBEAT_TIMEOUT,
+        ));
+    }
 }

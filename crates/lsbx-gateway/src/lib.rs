@@ -80,9 +80,11 @@
 //! non-colliding `GET /consoles` list endpoint) is unaffected.
 
 pub mod auth;
+pub mod moonlight;
+mod moonlight_relay;
 pub mod ratelimit;
-pub mod ticket;
 pub mod routes;
+pub mod ticket;
 
 pub use ratelimit::RateLimitConfig;
 pub use routes::{build_router, GatewayConfig};
@@ -125,8 +127,31 @@ impl GatewayDeps {
     /// `routes::build_router` already needed, and it exists solely to
     /// satisfy `lsbx-stream`'s own documented `StreamState` shape.
     pub fn build_router(self, config: GatewayConfig) -> axum::Router {
+        self.build_router_inner(config, None)
+    }
+
+    pub fn build_router_with_moonlight(
+        self,
+        config: GatewayConfig,
+        moonlight: Arc<moonlight::MoonlightManager>,
+    ) -> axum::Router {
+        self.build_router_inner(config, Some(moonlight))
+    }
+
+    fn build_router_inner(
+        self,
+        config: GatewayConfig,
+        moonlight: Option<Arc<moonlight::MoonlightManager>>,
+    ) -> axum::Router {
         let stream_auth_config = Arc::new(config.clone());
-        let rest_router = routes::build_router_for_merge(Arc::clone(&self.ops), config);
+        let rest_router = match moonlight {
+            Some(manager) => routes::build_router_for_merge_with_moonlight(
+                Arc::clone(&self.ops),
+                config,
+                manager,
+            ),
+            None => routes::build_router_for_merge(Arc::clone(&self.ops), config),
+        };
 
         let stream_store = Arc::new(lsbx_store::sandbox_store::SandboxStore::new(
             self.state_dir.clone(),
@@ -194,9 +219,30 @@ pub async fn run_server(
     config: GatewayConfig,
     addr: SocketAddr,
 ) -> Result<BoundServer, LsbxError> {
+    run_server_inner(deps, config, addr, None).await
+}
+
+pub async fn run_server_with_moonlight(
+    deps: GatewayDeps,
+    config: GatewayConfig,
+    addr: SocketAddr,
+    moonlight: Arc<moonlight::MoonlightManager>,
+) -> Result<BoundServer, LsbxError> {
+    run_server_inner(deps, config, addr, Some(moonlight)).await
+}
+
+async fn run_server_inner(
+    deps: GatewayDeps,
+    config: GatewayConfig,
+    addr: SocketAddr,
+    moonlight: Option<Arc<moonlight::MoonlightManager>>,
+) -> Result<BoundServer, LsbxError> {
     enforce_fail_closed_bind(&config, addr.ip())?;
 
-    let router = deps.build_router(config);
+    let router = match moonlight {
+        Some(manager) => deps.build_router_with_moonlight(config, manager),
+        None => deps.build_router(config),
+    };
 
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         LsbxError::ContractViolated(format!("failed to bind gateway listener on {addr}: {e}"))
@@ -266,6 +312,7 @@ mod tests {
             allow_local_files: false,
             insecure,
             max_sandboxes: 8,
+            windows_display_resize_golden: None,
             rate_limit: crate::ratelimit::RateLimitConfig::default(),
         }
     }

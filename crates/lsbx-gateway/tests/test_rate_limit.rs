@@ -48,6 +48,7 @@ fn tightly_limited_config() -> GatewayConfig {
         allow_local_files: false,
         insecure: false,
         max_sandboxes: 8,
+        windows_display_resize_golden: None,
         // A burst of 2 means the 3rd request within the same key in quick
         // succession must be denied — small enough to exhaust
         // deterministically within a single test without any sleeping.
